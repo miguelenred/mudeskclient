@@ -4,6 +4,16 @@ Cliente de escritorio remoto (RDP) que funciona en el navegador. El navegador so
 
 [Read in English](README.md)
 
+## Capturas
+
+![Conexiones de un usuario, en grupos](docs/images/es/connections.png)
+
+| Conectar: contraseña y opciones | Administración | Modo oscuro |
+|---|---|---|
+| ![Diálogo de conexión con las opciones de la sesión](docs/images/es/connect.png) | ![Administración: usuarios](docs/images/es/admin.png) | ![Conexiones en modo oscuro](docs/images/es/connections-dark.png) |
+
+Datos de demostración: nombres inventados y direcciones de documentación.
+
 ## Funciones
 
 - Compresión RDP (MPPC, NCRUSH, XCRUSH) de extremo a extremo y órdenes de dibujo con caché de mapas de bits: los dos tramos llevan datos comprimidos.
@@ -123,6 +133,7 @@ public/assets/     navegador: rdpgfx.js (canal gráfico), rfx.js (RemoteFX), gfx
                    mic.js y mic-worklet.js (micrófono), screen-watch.js (las ventanas de las otras pantallas)…
 data/              almacenamiento JSON (se crea al usarse)
 tools/check.php    diagnóstico del hosting
+docs/              manuales (docs/es/: en español) y las capturas de esta página (docs/images/es/)
 tests/             pruebas unitarias y de extremo a extremo
 ```
 

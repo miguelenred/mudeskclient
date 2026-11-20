@@ -4,6 +4,7 @@
 
 - **PHP's temporary folder.** When PHP cannot write to its temporary folder it drops anything over 16 KB sent to the server, before the application runs: an uploaded file was then saved empty and the upload said it was done (a file pasted into a session reached the remote computer empty). Now such a request is refused with "PHP cannot write to its temporary folder", an upload stops with that message, and the server error log names the folder.
 - **Documentation:** the installation manual lists the folders that need write permission: `data/`, the only one of the project, and PHP's temporary folder, which hostings, XAMPP and Linux already allow.
+- **README:** screenshots of the application (connections, connecting, administration, dark mode), in English and in Spanish, with invented demo data.
 
 ## 1.0.2 — 2026-11-20
 

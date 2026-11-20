@@ -4,6 +4,16 @@ Remote desktop (RDP) client that runs in the browser. The browser only uses HTML
 
 [Leer en español](README.es.md)
 
+## Screenshots
+
+![Connections of a user, in groups](docs/images/connections.png)
+
+| Connecting: password and options | Administration | Dark mode |
+|---|---|---|
+| ![Connect dialog with the options of the session](docs/images/connect.png) | ![Administration: users](docs/images/admin.png) | ![Connections in dark mode](docs/images/connections-dark.png) |
+
+Demo data: invented names and documentation addresses.
+
 ## Features
 
 - Bulk compression (MPPC, NCRUSH, XCRUSH) end to end and drawing orders with the bitmap cache: both links carry compressed data.
@@ -123,6 +133,7 @@ public/assets/     browser: rdpgfx.js (graphics pipeline), rfx.js (RemoteFX), gf
                    mic.js and mic-worklet.js (microphone), screen-watch.js (the other screens' windows)…
 data/              JSON storage (created at runtime)
 tools/check.php    hosting diagnostics
+docs/              manuals (docs/es/: in Spanish) and the screenshots of this page (docs/images/)
 tests/             unit tests and end-to-end tests
 ```
 

@@ -2862,15 +2862,17 @@ check('error page: every error in both languages; "try again" only where reloadi
 // body: an uploaded file was saved empty and answered as done. A small body still goes (PHP keeps it in memory).
 // display_startup_errors off: when on (XAMPP, or PHP 8 without it in php.ini) PHP itself prints that warning, headers and
 // all, before any script runs; nothing can take it back, and the page reads that answer as a failed upload anyway.
-// dropped.php raises PHP's warning by hand, so the answer to it is checked everywhere: on GitHub's Windows runners PHP
-// still found a temporary folder, and the dropped body itself is said not checkable there.
+// dropped.php raises PHP's warning by hand, so the answer to it is checked everywhere; where PHP still finds a temporary
+// folder, the dropped body itself is said not checkable, with the settings the server saw.
 file_put_contents("$papp/ok/public/dropped.php", '<?php @trigger_error("PHP Request Startup: POST data can\'t be buffered; all data discarded", E_USER_WARNING);'
     . ' require __DIR__ . "/../src/bootstrap.php"; echo "went on";');
 file_put_contents("$papp/ok/public/tmpini.php", '<?php echo json_encode([ini_get("upload_tmp_dir"), ini_get("sys_temp_dir"), sys_get_temp_dir(), ini_get("display_startup_errors")]);');
 $probe = stream_socket_server('tcp://127.0.0.1:0');
 $tport = (int)substr((string)strrchr((string)stream_socket_get_name($probe, false), ':'), 1);
 fclose($probe);
-$tweb = proc_open([PHP_BINARY, '-d', "upload_tmp_dir=$papp/no-such-folder", '-d', "sys_temp_dir=$papp/no-such-folder", '-d', 'display_errors=1', '-d', 'display_startup_errors=0',
+// (the paths quoted: unquoted, a short Windows name like RUNNER~1 is read as the ~ operator of php.ini values, which cut the
+// path and dropped the settings after it at GitHub)
+$tweb = proc_open([PHP_BINARY, '-d', "upload_tmp_dir=\"$papp/no-such-folder\"", '-d', "sys_temp_dir=\"$papp/no-such-folder\"", '-d', 'display_errors=1', '-d', 'display_startup_errors=0',
     '-d', 'error_reporting=-1', '-d', 'log_errors=0', '-S', "127.0.0.1:$tport", '-t', $papp], [1 => ['file', $nul, 'w'], 2 => ['file', "$papp/tmp-server.log", 'w']], $tpipes);
 for ($i = 0; $i < 100 && !($ws = @fsockopen('127.0.0.1', $tport)); $i++) {
     usleep(50000);

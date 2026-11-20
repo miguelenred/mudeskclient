@@ -2862,6 +2862,11 @@ check('error page: every error in both languages; "try again" only where reloadi
 // body: an uploaded file was saved empty and answered as done. A small body still goes (PHP keeps it in memory).
 // display_startup_errors off: when on (XAMPP, or PHP 8 without it in php.ini) PHP itself prints that warning, headers and
 // all, before any script runs; nothing can take it back, and the page reads that answer as a failed upload anyway.
+// dropped.php raises PHP's warning by hand, so the answer to it is checked everywhere: on GitHub's Windows runners PHP
+// still found a temporary folder, and the dropped body itself is said not checkable there.
+file_put_contents("$papp/ok/public/dropped.php", '<?php @trigger_error("PHP Request Startup: POST data can\'t be buffered; all data discarded", E_USER_WARNING);'
+    . ' require __DIR__ . "/../src/bootstrap.php"; echo "went on";');
+file_put_contents("$papp/ok/public/tmpini.php", '<?php echo json_encode([ini_get("upload_tmp_dir"), ini_get("sys_temp_dir"), sys_get_temp_dir(), ini_get("display_startup_errors")]);');
 $probe = stream_socket_server('tcp://127.0.0.1:0');
 $tport = (int)substr((string)strrchr((string)stream_socket_get_name($probe, false), ':'), 1);
 fclose($probe);
@@ -2871,9 +2876,9 @@ for ($i = 0; $i < 100 && !($ws = @fsockopen('127.0.0.1', $tport)); $i++) {
     usleep(50000);
 }
 fclose($ws);
-$tpost = static function (string $body) use ($tport): array {   // [status, body]
+$tpost = static function (string $body, string $path = 'ok/public/api.php') use ($tport): array {   // [status, body]
     $s = fsockopen('127.0.0.1', $tport, $en, $es, 5);
-    fwrite($s, "POST /ok/public/api.php HTTP/1.0\r\nHost: 127.0.0.1\r\nAccept: */*\r\nContent-Type: application/json\r\nContent-Length: "
+    fwrite($s, "POST /$path HTTP/1.0\r\nHost: 127.0.0.1\r\nAccept: */*\r\nContent-Type: application/json\r\nContent-Length: "
         . strlen($body) . "\r\n\r\n$body");
     $r = (string)stream_get_contents($s);
     fclose($s);
@@ -2881,12 +2886,19 @@ $tpost = static function (string $body) use ($tport): array {   // [status, body
 };
 [$ts1, $tb1] = $tpost('{"action":"state","pad":"' . str_repeat('x', 20000) . '"}');
 [$ts2, $tb2] = $tpost('{"action":"state"}');
+[$ts3, $tb3] = $tpost(str_repeat('x', 100), 'ok/public/dropped.php');
+[, $tini]    = $tpost('', 'ok/public/tmpini.php');
 proc_terminate($tweb);
 proc_close($tweb);
-$tlog = (string)file_get_contents("$papp/tmp-server.log");
+$tlog    = (string)file_get_contents("$papp/tmp-server.log");
+$dropped = !str_contains($tb1, '"build"');
+if (!$dropped) {
+    echo "NOTE body dropped by PHP not checkable here: it found a temporary folder anyway (upload_tmp_dir, sys_temp_dir, system, display_startup_errors: $tini)\n";
+}
 check('PHP without a writable temporary folder: a body over 16 KB it dropped is refused with tmp_dir (and logged), a small one goes',
-    [$ts1, $tb1, str_contains($tlog, 'cannot write to its temporary folder'), $ts2, isset(json_decode($tb2, true)['build'])],
-    [500, '{"error":"tmp_dir"}', true, 200, true]);
+    [$dropped ? $ts1 : 500, $dropped ? $tb1 : '{"error":"tmp_dir"}', $ts3, $tb3, str_contains($tlog, 'cannot write to its temporary folder'), $ts2,
+        isset(json_decode($tb2, true)['build'])],
+    [500, '{"error":"tmp_dir"}', 500, '{"error":"tmp_dir"}', true, 200, true]);
 
 // connection reset by the server while sending: TLS writes then return 0 and the socket stays writable (send() used to spin forever on Windows)
 $key = openssl_pkey_new(['private_key_type' => OPENSSL_KEYTYPE_EC, 'curve_name' => 'prime256v1', 'config' => $cnf]);

@@ -439,6 +439,15 @@ final class Auth
                 $u   = Users::get($u['id']);
                 $dek = Crypto::unwrapKey($password, $u['dek'], $u['id']);
             }
+            if (Crypto::needsRewrap($u['dek'])) {
+                // wrapped with fewer rounds than new keys get (200,000 up to 1.0.0): wrapped again now that the password is
+                // known, once (under the users' lock, only if no password change replaced it meanwhile)
+                Users::update($u['id'], static function (array &$x) use ($u, $dek, $password): void {
+                    if (($x['dek'] ?? null) === $u['dek']) {
+                        $x['dek'] = Crypto::wrapKey($password, $dek, $u['id']);
+                    }
+                });
+            }
             if (password_needs_rehash($u['pass'], PASSWORD_BCRYPT, Users::HASH)) {
                 Users::update($u['id'], static fn(array &$x) => $x['pass'] = Users::hash($password));
             }

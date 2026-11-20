@@ -81,7 +81,7 @@ Otras ideas: tarjetas inteligentes, RD Gateway, redirección del agente de conex
 | Un monitor remoto solo mientras su ventana está abierta | Si no, los programas se abren en una pantalla que nadie ve |
 | Órdenes de dibujo activadas por defecto | Validadas con xrdp y Windows 11: imagen idéntica, sin restos al repintar, 2,5 veces menos tráfico al mover ventanas |
 | Compresión descomprimida dos veces (pasarela y navegador) | La pasarela necesita el historial común para leer las PDU lentas; reenviar los bytes comprimidos mantiene pequeño también el tramo del navegador. Coste medido con Windows 11: 6–15 % de un núcleo con texto o ventanas y 35–52 % con animación a pantalla completa (con el canal gráfico, 0,4–2 %) |
-| Toda respuesta de acceso tarda 1 s (la de una IP bloqueada, al momento) | Oculta qué paso falló y si el usuario existe (bcrypt 12 + PBKDF2 tardan ≈0,55 s en la máquina de pruebas) |
+| Toda respuesta de acceso tarda 1 s (la de una IP bloqueada, al momento) | Oculta qué paso falló y si el usuario existe (bcrypt 12 + PBKDF2 tardan ≈0,78 s en la máquina de pruebas) |
 | Las passkeys sustituyen a la contraseña solo con PRF | Las contraseñas RDP guardadas van cifradas con una clave que necesita un secreto del usuario: la contraseña o la salida PRF de la passkey |
 | Los navegadores conocidos se libran de los bloqueos por usuario y global, no del de IP | Un atacante no puede dejar fuera al dueño, y una sola IP sigue frenada |
 | XCRUSH ofrecido primero, MPPC se mantiene | XCRUSH da el menor tráfico con menos CPU en la pasarela que MPPC; los servidores que solo conocen MPPC (xrdp) lo siguen usando |

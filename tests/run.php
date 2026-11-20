@@ -322,6 +322,26 @@ $klost = [$try('keylost', $pk_), array_column(MuDesk\Audit::search(['event' => '
     str_contains((string)@file_get_contents("$tmp/key-errors.log"), 'keylost')];
 ini_set('error_log', (string)$elog);
 check('sign-in: a data key the right password cannot open is replaced, and that is audited and logged', $klost, ['ok', ['key_unreadable'], true]);
+// a data key wrapped as up to 1.0.0 (hash_pbkdf2, 200,000 rounds): still opened (OpenSSL gives the same key), wrapped again
+// with 400,000 at the next sign-in, once, with the same data key inside (the saved RDP passwords stay readable); a wrong
+// password changes nothing; a damaged round count is no minutes of work
+$po  = 'Old-wrap-' . bin2hex(random_bytes(6));
+$uo  = MuDesk\Users::create('oldwrap', $po, 'user', false);
+$dek0 = random_bytes(32);
+$salt0 = random_bytes(16);
+$old0 = ['salt' => base64_encode($salt0), 'iter' => 200000,
+    'key' => MuDesk\Crypto::encrypt(hash_pbkdf2('sha256', $po, $salt0, 200000, 32, true), $dek0, 'dek:' . $uo['id'])];
+MuDesk\Users::update($uo['id'], static fn(array &$x) => $x['dek'] = $old0);
+$_SERVER['REMOTE_ADDR'] = '10.22.2.1';
+$wrongOld = [$try('oldwrap', $po . 'x'), MuDesk\Users::get($uo['id'])['dek'] === $old0];
+$okOld    = $try('oldwrap', $po);
+$new0     = MuDesk\Users::get($uo['id'])['dek'];
+$okAgain  = $try('oldwrap', $po);
+check('sign-in: a data key of 200,000 rounds opened and wrapped again with 400,000, once, the same key inside', [
+    $wrongOld, $okOld, $new0['iter'], MuDesk\Crypto::unwrapKey($po, $new0, $uo['id']) === $dek0, MuDesk\Crypto::needsRewrap($new0),
+    $okAgain, MuDesk\Users::get($uo['id'])['dek'] === $new0, MuDesk\Crypto::unwrapKey($po, ['iter' => 2000000000] + $new0, $uo['id']),
+    MuDesk\Crypto::needsRewrap(MuDesk\Crypto::wrapKey('Another-pass-1', $dek0, 'u'))],
+    [['invalid', true], 'ok', 400000, true, false, 'ok', true, null, false]);
 // the rule counts characters, not bytes: three equal emojis are 12 bytes with 4 different ones; twelve accented letters, of
 // 24 bytes, are 12 characters; text that is not UTF-8 is refused
 check('password rule: characters, not bytes',

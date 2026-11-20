@@ -81,7 +81,7 @@ Other ideas: smart cards, RD Gateway, connection broker redirection, Kerberos, p
 | A remote monitor only while its window is open | Otherwise programs open on a screen nobody sees |
 | Drawing orders on by default | Validated with xrdp and Windows 11: identical picture, no leftovers on repaint, 2.5 times less traffic when dragging windows |
 | Compression decoded twice (gateway and browser) | The gateway needs the shared history to read slow-path PDUs; forwarding the compressed bytes keeps the browser link small too. Cost measured with Windows 11: 6–15 % of a core with text or windows and 35–52 % with full-screen animation (with the graphics pipeline, 0.4–2 %) |
-| Every sign-in answer takes 1 s (a locked IP's, at once) | Hides which step failed and whether the user exists (bcrypt 12 + PBKDF2 take ≈0.55 s on the test machine) |
+| Every sign-in answer takes 1 s (a locked IP's, at once) | Hides which step failed and whether the user exists (bcrypt 12 + PBKDF2 take ≈0.78 s on the test machine) |
 | Passkeys replace the password only with PRF | The saved RDP passwords are encrypted with a key that needs a secret from the user: the password, or the passkey's PRF output |
 | Known browsers exempt from user and global locks, not from the IP lock | An attacker cannot lock the owner out, and a single IP is still stopped |
 | XCRUSH offered first, MPPC kept | XCRUSH gives the least traffic with less gateway CPU than MPPC; servers that only know MPPC (xrdp) keep using it |

@@ -1,8 +1,13 @@
 # Changelog
 
+## 1.0.1 — 2026-11-20
+
+- **Saved RDP passwords: a stronger key.** The key that wraps each user's data key is now derived with 400,000 rounds of PBKDF2-SHA256 instead of 200,000, twice the work for anyone trying passwords against a copy of the data folder. It is computed by OpenSSL, which gives the same key as before in 30 % less time, so signing in still takes its fixed second (0.78 s of work on the test machine, 0.61 s before). A key wrapped as up to 1.0.0 still opens, and is wrapped again with the new count at the user's next sign-in with the password (about 0.46 s more, once); the saved passwords stay readable. A damaged round count in the users file is refused instead of computed.
+- **Wording**: the reports reviewed before 1.0.0 are called what they were, independent code reviews, not audits.
+
 ## 1.0.0 — 2026-11-20
 
-First stable version. It gathers everything below since 0.1.0. Before it was released, three external audits, their second passes and a full review of our own (with the most weight on speed: the best picture with the smoothest motion) were checked against the code: what was real is fixed with a test that fails without the fix (checked by putting the old code back), what was not is said in [SECURITY](SECURITY.md) or left as it was, with the reason. The microphone came with it.
+First stable version. It gathers everything below since 0.1.0. Before it was released, three independent code reviews, their second passes and a full review of our own (with the most weight on speed: the best picture with the smoothest motion) were checked against the code: what was real is fixed with a test that fails without the fix (checked by putting the old code back), what was not is said in [SECURITY](SECURITY.md) or left as it was, with the reason. The microphone came with it.
 
 ### Microphone
 - **This computer's microphone on the remote one**: one more box of the connection and of the connect dialog, **off by default**. Windows shows it in the session as *Remote Audio* and opens it only while a program there records (a call, a dictation): the browser then asks once for the microphone and records until Windows closes it. Read and written in `.rdp` files (`audiocapturemode`). The remote Windows must allow audio recording redirection (Windows 10/11 and current Windows Server allow it unless a policy forbids it; Windows Server also needs its Windows Audio service): how to check it or turn it on, in [HOSTING](docs/HOSTING.md#remote-computers). Browsers only give the microphone to pages opened with `https://`; a refusal, no microphone or an `http://` page is said once on the page and the session goes on without it.
@@ -169,7 +174,7 @@ First stable version. It gathers everything below since 0.1.0. Before it was rel
 ### Texts
 - `tests/ui_unit.mjs` checks that every text key appears once in each language and in both: a key written twice keeps only the last text, with no error.
 
-### Security audit
+### Security review
 A full review, before this version, of the gateway (the PHP side that talks to the remote computers) and of the page. Nearly every fix below has a test that fails without it: each was undone in a copy of the project and its test checked to fail there (41 checks).
 - **Remote sessions end with the web session.** Signing out, or the session expiring or being closed by the gateway, now ends the remote sessions opened from it; before, they went on, with nobody signed in, until their own idle limit. A password change ends the remote sessions of your other sign-ins (they say so), not those of the window where you changed it. Signing out in one tab also ends the other tabs of that browser, and each says so. Every 15 s a remote session also checks that its account still exists and is enabled.
 - **The password asked again** (to add a passkey or an authenticator app, change the password or remove a second factor): five wrong ones close the session. Before, whoever had the session open could guess it without limit.
@@ -301,8 +306,8 @@ A full review, before this version, of the gateway (the PHP side that talks to t
 - No measurable cost. On Apache with XAMPP's PHP 8.2, the page took 4.4–5.0 ms before and 4.6–5.6 ms after, and the state request 7.2–9.0 ms before and 6.9–8.6 ms after; both ranges are within the noise between runs. The calls added to each request take under 0.5 µs.
 - HOSTING explains how to give the *Modify* permission on Windows (XAMPP, IIS).
 
-### Second review (external audit report, pending fixes, random-data tests)
-An external audit report of the web application, the fixes left from the first review and new tests with random data; every fix has a test that fails without it.
+### Second review (an independent review report, pending fixes, random-data tests)
+An independent review report of the web application, the fixes left from the first review and new tests with random data; every fix has a test that fails without it.
 - Sign-in: each remembered browser has its own attempt count and lock; once locked, the normal locks apply. The 20 used most recently are kept and each new one is audited (`device_add`). A TOTP code already used, such as the one that enabled it, is refused with "wait for the next code". To require 2FA the administrator must have it first (`totp_required_self` otherwise); users without it sign in and only see their profile until they add TOTP or a passkey. The page is served in the browser's language before the interface loads.
 - Targets: with "Allow all", the server itself (127.0.0.0/8, ::1), link-local addresses (169.254.0.0/16, with cloud metadata, and fe80::/10) and 0.0.0.0/8 or :: are never reached, nor their ::ffff:… forms; list them to reach them. Administration warns while it is set. Names are still resolved by the system resolver, with its time-out: one of its own would break the `hosts` file, search domains and Windows name resolution, and the session limit below bounds how many processes can wait (see HOSTING).
 - API and shared folder: 400 `invalid_input` when a field carries a list or object, 404 `not_found` for what does not exist; file and folder names over 255 bytes are refused (400 `invalid_path`).

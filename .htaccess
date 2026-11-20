@@ -1,0 +1,20 @@
+# Only public/ is served when the whole project is copied under the web root.
+# Every other folder also has its own .htaccess that denies access.
+Options -Indexes
+DirectoryIndex index.php
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^(?!public/)(.*)$ public/$1 [L]
+</IfModule>
+
+# without mod_rewrite: at least the files of this folder are not served
+<FilesMatch "^(config(\.sample)?\.php|web\.config|.+\.(md|json|txt|lock|log)|LICENSE|NOTICE|\.git.*)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>

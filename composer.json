@@ -1,0 +1,42 @@
+{
+    "name": "miguelenred/mudeskclient",
+    "description": "Remote Desktop (RDP) client in the browser, written in PHP with no dependencies: it runs on ordinary shared hosting, with no WebSockets or background processes.",
+    "type": "project",
+    "keywords": [
+        "rdp",
+        "remote-desktop",
+        "rdp-client",
+        "html5",
+        "web-client",
+        "gateway",
+        "shared-hosting",
+        "remoteapp"
+    ],
+    "homepage": "https://miguelenred.es/mudeskclient",
+    "license": "Apache-2.0",
+    "authors": [
+        {
+            "name": "Miguel Sánchez",
+            "homepage": "https://miguelenred.es/mudeskclient",
+            "role": "Author"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/miguelenred/mudeskclient/issues",
+        "source": "https://github.com/miguelenred/mudeskclient",
+        "docs": "https://github.com/miguelenred/mudeskclient/tree/main/docs",
+        "security": "https://github.com/miguelenred/mudeskclient/blob/main/SECURITY.md"
+    },
+    "require": {
+        "php": ">=8.1 <8.6",
+        "ext-openssl": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "MuDesk\\": "src/"
+        }
+    },
+    "config": {
+        "sort-packages": true
+    }
+}

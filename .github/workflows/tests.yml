@@ -1,0 +1,65 @@
+# MuDeskClient - https://miguelenred.es/mudeskclient - Apache License 2.0
+# Unit and fuzz tests on Linux and Windows (no RDP server needed): the gateway with every supported PHP version, where
+# any PHP warning, notice or deprecation fails the run; the browser code with the current and the previous Node LTS.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  php:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        php: ['8.1', '8.2', '8.3', '8.4', '8.5']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: openssl
+          ini-values: error_reporting=-1, display_errors=On, display_startup_errors=On, log_errors=Off
+          coverage: none
+      - name: Unit tests (protocol, security, audit, clipboard, typed text)
+        run: php tests/run.php 2>&1 | tee php.log
+      - name: Fuzz tests (random and mutated PDUs against the RDP core and the channels)
+        run: php tests/fuzz.php --strict 2>&1 | tee -a php.log
+      - name: No PHP warning, notice or deprecation
+        if: always()
+        run: |
+          if grep -E '^(PHP )?(Warning|Notice|Deprecated|Fatal error|Parse error)' php.log; then
+            exit 1
+          fi
+
+  js:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ['lts/-1', 'lts/*']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Unit tests (bitmaps, compression, drawing orders, graphics pipeline, input, clipboard, session, interface, microphone, .rdp files)
+        run: |
+          status=0
+          for f in tests/*_unit.mjs; do
+            echo "== $f"
+            node "$f" || status=1
+          done
+          exit $status
+      - name: Fuzz tests (random and mutated data against the decoders)
+        run: node tests/fuzz.mjs --strict

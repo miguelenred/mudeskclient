@@ -1,0 +1,25 @@
+MuDeskClient
+Copyright 2026 Miguel Sánchez
+Author: Miguel Sánchez - https://miguelenred.es/mudeskclient
+The idea of the project is his; he organizes the work and sets the way of
+working. He is assisted by artificial intelligence.
+
+This product is licensed under the Apache License, Version 2.0.
+If you use it, a "Powered by MuDeskClient" mention with a link to
+https://miguelenred.es/mudeskclient is appreciated (not required).
+
+It does not include third-party code. Third-party data:
+
+- src/common-passwords.txt: passwords of 12 or more characters (lower case)
+  taken from the SecLists project (Passwords/Common-Credentials),
+  Copyright (c) 2018 Daniel Miessler, MIT License.
+- tests/rdpgfx_unit.mjs: ZGFX sample data from the [MS-RDPEGFX]
+  specification (Microsoft Open Specifications); tests/fixtures/
+  gfx-vectors.txt contains the [MS-RDPEGFX] ClearCodec sample 2.
+- src/Rdp/Ncrush.php, public/assets/bulk.js: NCRUSH Huffman codes and
+  length/offset tables from the [MS-RDPEGDI] specification (Microsoft Open
+  Specifications). tests/fixtures/ncrush-vectors.txt and xcrush-vectors.txt
+  were produced with the compressors of FreeRDP (Apache License 2.0).
+- src/Rdp/Ntlm.php (UPPER), tests/fixtures/windows-upcase.txt: the upper
+  case that Windows 11 gives each UTF-16 code unit, read from its
+  RtlUpcaseUnicodeChar (the table of the user name in NTLM).

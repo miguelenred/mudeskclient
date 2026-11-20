@@ -1,0 +1,19 @@
+Options -Indexes
+
+# Web app manifest (installing the app on phones and computers), in case the server does not know the extension.
+<IfModule mod_mime.c>
+    AddType application/manifest+json .webmanifest
+</IfModule>
+
+# The RDP stream must not be compressed or buffered.
+<IfModule mod_setenvif.c>
+    SetEnvIfNoCase Request_URI "rdp\.php" no-gzip dont-vary
+</IfModule>
+
+# Scripts and styles are revalidated on every load (ETag / 304): the modules that app.js imports carry no version in
+# their address, so after an update the browser must not mix cached old modules with new ones.
+<IfModule mod_headers.c>
+    <FilesMatch "\.(js|css)$">
+        Header set Cache-Control "no-cache"
+    </FilesMatch>
+</IfModule>

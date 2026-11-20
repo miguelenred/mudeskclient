@@ -74,25 +74,27 @@ Only `public/` may be served. Check after deploying: `data/web-check.txt`, `conf
 | Folder / file | PHP needs | Why |
 |---|---|---|
 | `data/` and everything inside | read + write | users, settings, connections, audit, sessions, shared files, run-time files; PHP creates `audit/`, `connections/`, `files/`, `run/`, `sessions/`, `tmp/`, `trace/`, `.htaccess`, `web.config`, `index.html`, `web-check.txt`, `secret.php`, `audit-key.php` (key of the signed audit exports) and, on first run, `setup-code.php` |
+| PHP's temporary folder (`upload_tmp_dir` in php.ini or, when it is not set, the system's: `sys_temp_dir`, `TMPDIR`/`TMP`, `/tmp`) | write | outside the project, and already writable on hostings, XAMPP (`C:\xampp\tmp`) and Linux. PHP keeps there anything over 16 KB sent to the server (uploaded files, long pastes) while it arrives, and drops it when it cannot write there. On Linux and macOS the sockets of the sessions also go there when the path of `data/run/` reaches 100 characters |
 | `public/`, `src/`, `config.php`, `.htaccess` files | read only | code and configuration: nothing is written there |
 
 Folders are created with mode `0700` and files with `0600` when the hosting allows it. If the hosting runs PHP as another user than the FTP account, give that user write access to `data/` only.
 
-On **Windows** (XAMPP, IIS) the account that runs the web server needs the *Modify* permission on `data`. That account is the one of the Apache service or of the IIS application pool (Services → the service → *Log On*), or your own account when Apache is started from the XAMPP panel. Task Manager → Details shows it in the *User name* column of `httpd.exe` or `w3wp.exe`. From a console run as administrator:
+On **Windows** (XAMPP, IIS) the account that runs the web server needs the *Modify* permission on `data` (and on PHP's temporary folder, when it was taken away). That account is the one of the Apache service or of the IIS application pool (Services → the service → *Log On*), or your own account when Apache is started from the XAMPP panel. Task Manager → Details shows it in the *User name* column of `httpd.exe` or `w3wp.exe`. From a console run as administrator:
 
 ```
 icacls "C:\xampp\htdocs\mudesk\data" /grant "ACCOUNT:(OI)(CI)M"
 ```
 
-When `data/` is not writable, the application shows the page "Cannot save to the data folder". The server error log says which folder could not be created.
+When `data/` is not writable, the application shows the page "Cannot save to the data folder". The server error log says which folder could not be created. When PHP's temporary folder is not writable, a request with more than 16 KB is answered "PHP cannot write to its temporary folder" (an upload stops with that message) instead of being taken as empty, and the error log names the folder.
 
 ### Errors
 
-The application never shows PHP's own messages, server paths or traces to the browser, even with `display_errors` on (XAMPP ships it on). Warnings, exceptions and fatal errors go to the server error log: php.ini's `error_log` (in XAMPP, `php\logs\php_error_log`) or, without one, the Apache or IIS log.
+The application never shows PHP's own messages, server paths or traces to the browser, even with `display_errors` on (XAMPP ships it on). Warnings, exceptions and fatal errors go to the server error log: php.ini's `error_log` (in XAMPP, `php\logs\php_error_log`) or, without one, the Apache or IIS log. The one exception is what PHP prints at the start of a request, before the application runs, when `display_startup_errors` is on (XAMPP ships it on, and PHP 8 turns it on when php.ini does not set it): for example, that it could not keep a request body because its temporary folder is not writable. Turn it off on a server that other people use.
 
 When it cannot go on, whoever opens the address sees a page with the look of the sign-in screen, in the browser's language (Spanish or English). The page says what happened and what the administrator must do, and carries the error code. The cases are:
 
 - data folder not writable;
+- PHP's temporary folder not writable;
 - PHP not supported or without OpenSSL;
 - HTTPS required;
 - IP not allowed;

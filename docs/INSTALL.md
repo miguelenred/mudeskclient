@@ -9,7 +9,7 @@ MuDeskClient is **copy and paste**: nothing to build, no database, no programs t
 ## Summary for those who already know
 
 1. PHP 8.1–8.5 with `openssl` and `session`, on Apache (or LiteSpeed) with `AllowOverride All` and HTTPS.
-2. Copy the whole folder into the site (for example `/mudesk/`) and let PHP write to `data/`.
+2. Copy the whole folder into the site (for example `/mudesk/`) and let PHP write to `data/`, the only folder of the project it writes to; PHP's own temporary folder must be writable too, as it already is ([3.3](#33-permissions-of-the-data-folder)).
 3. Open `https://your-site/mudesk/`, type the code of `data/setup-code.php` and create the administrator.
 4. Check that `https://your-site/mudesk/data/web-check.txt` answers 403 or 404.
 5. The web server must reach the RDP port of each remote computer (3389 by default): outgoing firewall of the hosting, the router's and the Windows one.
@@ -70,7 +70,17 @@ When done it must look like this: `public_html/mudesk/public`, `public_html/mude
 
 ### 3.3 Permissions of the `data` folder
 
+Folders that need **write** permission:
+
+| Folder | PHP needs |
+|---|---|
+| `mudesk/data` and everything inside it | read and write (the application creates its subfolders by itself) |
+| PHP's temporary folder (`upload_tmp_dir` in php.ini, or the system's one) | write; it already has it on hostings, XAMPP (`C:\xampp\tmp`) and Linux (`/tmp`). PHP keeps there anything over 16 KB sent to the server (uploaded files, long pastes) while it arrives |
+| everything else (`public`, `src`, `config.php`…) | read only |
+
 PHP must be able to **write** to `mudesk/data`. On most hostings it already can. If opening the application shows "Cannot save to the data folder", select `data` in the File Manager, press **Permissions** and set `755` (or `775` if it still fails with `755`). Never `777`.
+
+If uploading a file shows "PHP cannot write to its temporary folder", ask the hosting provider to fix PHP's temporary folder (the server error log names it).
 
 ### 3.4 First run
 
@@ -120,7 +130,7 @@ XAMPP already has what MuDeskClient needs: `.htaccess` files applied, `mod_rewri
 
 From **other computers of the network**, open `https://PC-ADDRESS/mudesk/` (the address of the XAMPP PC is shown by the command `ipconfig`, for example `192.168.1.20`) and accept the certificate warning there too.
 
-If `data` cannot be written ("Cannot save to the data folder"), see *Write permissions* in [HOSTING](HOSTING.md): with Apache as a service, the service's account needs the *Modify* permission on `data`.
+If `data` cannot be written ("Cannot save to the data folder"), see *Write permissions* in [HOSTING](HOSTING.md): with Apache as a service, the service's account needs the *Modify* permission on `data` and on `C:\xampp\tmp` (PHP's temporary folder in XAMPP).
 
 ## 5. Option C: on a Linux computer (Ubuntu or Debian)
 
@@ -221,6 +231,7 @@ Everything of yours is in the **`data`** folder: users, connections, audit, shar
 | What you see | What to do |
 |---|---|
 | "Cannot save to the data folder" | Let PHP write to `data` ([3.3](#33-permissions-of-the-data-folder), or [HOSTING](HOSTING.md) on Windows) |
+| "PHP cannot write to its temporary folder" | Let PHP write to its temporary folder ([3.3](#33-permissions-of-the-data-folder)); on a hosting, ask the provider |
 | "A secure connection is required" | Open the address with `https://`. On a hosting, turn on the free certificate; on the local network, XAMPP and Linux already have one |
 | "PHP version not supported" | Choose PHP 8.1 to 8.5 in the hosting's panel |
 | Red warning: the data folder can be downloaded | Your server does not apply `.htaccess`: [3.5](#35-check-that-the-data-is-protected) |

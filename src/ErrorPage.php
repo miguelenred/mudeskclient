@@ -21,6 +21,14 @@ final class ErrorPage
                 'MuDeskClient keeps users, connections and the audit log in its data folder, and the web server is not allowed to write there.',
                 'For the administrator: give the account that runs the web server and PHP permission to modify the data folder (and everything in it), then reload the page. The details are in the server error log.'],
         ],
+        'tmp_dir'   => [
+            'es' => ['PHP no puede escribir en su carpeta temporal',
+                'PHP guarda en su carpeta temporal lo que se envía al servidor mientras llega (un archivo que se sube, por ejemplo), y no tiene permiso para escribir en ella: lo enviado se ha perdido.',
+                'Para el administrador: da permiso de escritura sobre la carpeta temporal de PHP (upload_tmp_dir en php.ini o, si no está puesta, la temporal del sistema) a la cuenta con la que se ejecutan el servidor web y PHP. El detalle está en el registro de errores del servidor.'],
+            'en' => ['PHP cannot write to its temporary folder',
+                'PHP keeps what is sent to the server in its temporary folder while it arrives (a file being uploaded, for example), and it is not allowed to write there: what was sent has been lost.',
+                'For the administrator: give the account that runs the web server and PHP permission to write to the temporary folder of PHP (upload_tmp_dir in php.ini or, when it is not set, the system one). The details are in the server error log.'],
+        ],
         'php'       => [
             'es' => ['Versión de PHP no admitida', 'MuDeskClient necesita PHP 8.1 a 8.5 con la extensión OpenSSL activada.',
                 'Para el administrador: instala una de esas versiones o activa la extensión en php.ini (extension=openssl) y reinicia el servidor web.'],

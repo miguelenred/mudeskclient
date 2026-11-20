@@ -74,25 +74,27 @@ Solo `public/` se puede servir. Compruébalo tras desplegar: `data/web-check.txt
 | Carpeta / fichero | PHP necesita | Para qué |
 |---|---|---|
 | `data/` y todo su contenido | lectura + escritura | usuarios, ajustes, conexiones, auditoría, sesiones, archivos compartidos y ficheros de trabajo; PHP crea `audit/`, `connections/`, `files/`, `run/`, `sessions/`, `tmp/`, `trace/`, `.htaccess`, `web.config`, `index.html`, `web-check.txt`, `secret.php`, `audit-key.php` (clave de las exportaciones firmadas de la auditoría) y, en la primera visita, `setup-code.php` |
+| Carpeta temporal de PHP (`upload_tmp_dir` en php.ini o, si no está puesta, la del sistema: `sys_temp_dir`, `TMPDIR`/`TMP`, `/tmp`) | escritura | fuera del proyecto, y ya la tiene en los hostings, en XAMPP (`C:\xampp\tmp`) y en Linux. PHP guarda allí lo que se envía al servidor de más de 16 KB (archivos que se suben, pegados largos) mientras llega, y lo descarta si no puede escribir. En Linux y macOS también van allí los sockets de las sesiones cuando la ruta de `data/run/` llega a 100 caracteres |
 | `public/`, `src/`, `config.php`, ficheros `.htaccess` | solo lectura | código y configuración: ahí no se escribe nada |
 
 Las carpetas se crean con permisos `0700` y los ficheros con `0600` cuando el hosting lo permite. Si el hosting ejecuta PHP con un usuario distinto del de FTP, dale escritura solo sobre `data/`.
 
-En **Windows** (XAMPP, IIS) la cuenta con la que se ejecuta el servidor web necesita el permiso *Modificar* sobre `data`. Esa cuenta es la del servicio de Apache o del grupo de aplicaciones de IIS (Servicios → el servicio → *Iniciar sesión*), o tu propia cuenta si arrancas Apache desde el panel de XAMPP. En el Administrador de tareas → Detalles se ve en la columna *Nombre de usuario* de `httpd.exe` o `w3wp.exe`. Desde una consola como administrador:
+En **Windows** (XAMPP, IIS) la cuenta con la que se ejecuta el servidor web necesita el permiso *Modificar* sobre `data` (y sobre la carpeta temporal de PHP, si se lo han quitado). Esa cuenta es la del servicio de Apache o del grupo de aplicaciones de IIS (Servicios → el servicio → *Iniciar sesión*), o tu propia cuenta si arrancas Apache desde el panel de XAMPP. En el Administrador de tareas → Detalles se ve en la columna *Nombre de usuario* de `httpd.exe` o `w3wp.exe`. Desde una consola como administrador:
 
 ```
 icacls "C:\xampp\htdocs\mudesk\data" /grant "CUENTA:(OI)(CI)M"
 ```
 
-Si `data/` no tiene escritura, la aplicación muestra la página «No se puede guardar en la carpeta de datos». El registro de errores del servidor dice qué carpeta no pudo crear.
+Si `data/` no tiene escritura, la aplicación muestra la página «No se puede guardar en la carpeta de datos». El registro de errores del servidor dice qué carpeta no pudo crear. Si la carpeta temporal de PHP no tiene escritura, una petición de más de 16 KB recibe «PHP no puede escribir en su carpeta temporal» (una subida se detiene con ese mensaje) en lugar de tomarse por vacía, y el registro de errores dice qué carpeta es.
 
 ### Errores
 
-La aplicación nunca muestra al navegador los mensajes de PHP, ni rutas del servidor ni trazas, aunque `display_errors` esté activado (XAMPP lo trae activado). Los avisos, las excepciones y los errores fatales van al registro de errores del servidor: el `error_log` de php.ini (en XAMPP, `php\logs\php_error_log`) o, si no hay, el de Apache o IIS.
+La aplicación nunca muestra al navegador los mensajes de PHP, ni rutas del servidor ni trazas, aunque `display_errors` esté activado (XAMPP lo trae activado). Los avisos, las excepciones y los errores fatales van al registro de errores del servidor: el `error_log` de php.ini (en XAMPP, `php\logs\php_error_log`) o, si no hay, el de Apache o IIS. La única excepción es lo que PHP muestra al empezar una petición, antes de que se ejecute la aplicación, si `display_startup_errors` está activado (XAMPP lo trae activado, y PHP 8 lo activa cuando php.ini no lo indica): por ejemplo, que no pudo guardar el cuerpo de una petición porque su carpeta temporal no tiene escritura. Desactívalo en un servidor que usen otras personas.
 
 Cuando no puede seguir, quien abre la dirección ve una página con el aspecto de la pantalla de acceso, en el idioma del navegador (español o inglés). La página dice qué pasa y qué debe hacer el administrador, y lleva el código del error. Los casos son:
 
 - carpeta de datos sin escritura;
+- carpeta temporal de PHP sin escritura;
 - PHP no admitido o sin OpenSSL;
 - HTTPS obligatorio;
 - IP no permitida;

@@ -9,7 +9,7 @@ MuDeskClient es de **copiar y pegar**: no hay que compilar nada, no usa base de 
 ## Resumen para quien ya sabe
 
 1. PHP 8.1–8.5 con `openssl` y `session`, en Apache (o LiteSpeed) con `AllowOverride All` y HTTPS.
-2. Copia la carpeta entera en el sitio (por ejemplo, `/mudesk/`) y dale a PHP permiso de escritura en `data/`.
+2. Copia la carpeta entera en el sitio (por ejemplo, `/mudesk/`) y dale a PHP permiso de escritura en `data/`, la única carpeta del proyecto en la que escribe; la carpeta temporal de PHP también debe tener escritura, y ya la tiene ([3.3](#33-permisos-de-la-carpeta-data)).
 3. Abre `https://tu-sitio/mudesk/`, escribe el código de `data/setup-code.php` y crea el administrador.
 4. Comprueba que `https://tu-sitio/mudesk/data/web-check.txt` responde 403 o 404.
 5. El servidor web tiene que poder conectar con el puerto RDP de cada equipo remoto (3389 por defecto): cortafuegos de salida del hosting, del router y de Windows.
@@ -70,7 +70,17 @@ Al terminar debe quedar así: `public_html/mudesk/public`, `public_html/mudesk/s
 
 ### 3.3 Permisos de la carpeta `data`
 
+Carpetas que necesitan permiso de **escritura**:
+
+| Carpeta | PHP necesita |
+|---|---|
+| `mudesk/data` y todo su contenido | lectura y escritura (la aplicación crea sola sus subcarpetas) |
+| Carpeta temporal de PHP (`upload_tmp_dir` en php.ini, o la del sistema) | escritura; ya la tiene en los hostings, en XAMPP (`C:\xampp\tmp`) y en Linux (`/tmp`). PHP guarda allí lo que se envía al servidor de más de 16 KB (archivos que se suben, pegados largos) mientras llega |
+| todo lo demás (`public`, `src`, `config.php`…) | solo lectura |
+
 PHP necesita **escribir** en `mudesk/data`. En la mayoría de hostings ya puede. Si al abrir la aplicación ves «No se puede guardar en la carpeta de datos», en el Administrador de archivos selecciona `data`, pulsa **Permisos** y pon `755` (o `775` si con `755` sigue fallando). Nunca `777`.
+
+Si al subir un archivo aparece «PHP no puede escribir en su carpeta temporal», pide al proveedor del hosting que arregle la carpeta temporal de PHP (el registro de errores del servidor dice cuál es).
 
 ### 3.4 Primer arranque
 
@@ -120,7 +130,7 @@ XAMPP ya trae lo que MuDeskClient necesita: `.htaccess` activados, `mod_rewrite`
 
 Desde **otros ordenadores de la red**, abre `https://IP-DEL-PC/mudesk/` (la IP del PC con XAMPP se ve con el comando `ipconfig`, por ejemplo `192.168.1.20`) y acepta también el aviso del certificado.
 
-Si `data` no tiene permiso de escritura (aparece «No se puede guardar en la carpeta de datos»), ver *Permisos de escritura* en [HOSTING](HOSTING.md): con Apache como servicio, la cuenta del servicio necesita el permiso *Modificar* sobre `data`.
+Si `data` no tiene permiso de escritura (aparece «No se puede guardar en la carpeta de datos»), ver *Permisos de escritura* en [HOSTING](HOSTING.md): con Apache como servicio, la cuenta del servicio necesita el permiso *Modificar* sobre `data` y sobre `C:\xampp\tmp` (la carpeta temporal de PHP en XAMPP).
 
 ## 5. Opción C: en un equipo con Linux (Ubuntu o Debian)
 
@@ -221,6 +231,7 @@ Todo lo tuyo está en la carpeta **`data`**: usuarios, conexiones, auditoría, a
 | Lo que ves | Qué hacer |
 |---|---|
 | «No se puede guardar en la carpeta de datos» | Da permiso de escritura a `data` ([3.3](#33-permisos-de-la-carpeta-data), o [HOSTING](HOSTING.md) en Windows) |
+| «PHP no puede escribir en su carpeta temporal» | Da a PHP permiso de escritura en su carpeta temporal ([3.3](#33-permisos-de-la-carpeta-data)); en un hosting, pídeselo al proveedor |
 | «Hace falta una conexión segura» | Abre la dirección con `https://`. En un hosting, activa el certificado gratuito; en la red local, XAMPP y Linux ya lo traen |
 | «Versión de PHP no admitida» | Elige PHP 8.1 a 8.5 en el panel del hosting |
 | Aviso rojo: la carpeta de datos se puede descargar | Tu servidor no aplica `.htaccess`: [3.5](#35-comprobar-que-los-datos-están-protegidos) |

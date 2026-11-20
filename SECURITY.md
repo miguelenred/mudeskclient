@@ -6,7 +6,7 @@ Please do not open a public issue. Use GitHub's **private vulnerability reportin
 
 ## Supported versions
 
-Only the latest release (1.0.2 now) receives security fixes.
+Only the latest release (1.0.3 now) receives security fixes.
 
 ## Hardening checklist
 

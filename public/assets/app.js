@@ -874,7 +874,7 @@ async function runUploads() {
         if (e.name === 'AbortError') {
           stop = 'cancel';
           if (started) filesApi('delete', path).catch(() => {});   // what arrived of it goes
-        } else if (e.message === 'quota') stop = 'quota';
+        } else if (e.message === 'quota' || e.message === 'tmp_dir') stop = e.message;   // the next ones would fail the same way
         else if (e.message === 'auth' || e.message === 'csrf') stop = 'auth';   // the session ended: nothing more goes
         else failed.push(f.path);
       }
@@ -889,7 +889,7 @@ async function runUploads() {
   drawUp();
   if (stop === 'auth') return;                           // the session ended: its window says so
   if (stop === 'cancel') toast(t('fx_upload_cancelled'));
-  else if (stop === 'quota') toast(errText('quota'), true);
+  else if (stop === 'quota' || stop === 'tmp_dir') toast(errText(stop), true);
   else if (failed.length) toast(t('fx_upload_failed', failed.length, failed.slice(0, 3).join(', ') + (failed.length > 3 ? '…' : '')), true);
   else toast(t('fx_uploaded', done));
 }

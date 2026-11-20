@@ -2847,7 +2847,7 @@ check('error page: an exception or a fatal error (out of memory) gives our page,
     $s6, $b6, str_contains($log, 'secret detail'), str_contains($log, 'Allowed memory size')],
     [500, true, false, 500, true, false, 500, '{"error":"internal"}', true, true]);
 $texts = [];
-foreach (['data_dir', 'php', 'https', 'client_ip', 'internal', 'other'] as $k) {
+foreach (['data_dir', 'tmp_dir', 'php', 'https', 'client_ip', 'internal', 'other'] as $k) {
     foreach (['es', 'en'] as $l) {
         $h         = MuDesk\ErrorPage::html(403, $k, $l);
         $texts[]   = preg_match('#^<!doctype html><html lang="' . $l . '">.*<h1>[^<]+</h1><p>[^<]+</p><p class="muted">[^<]+</p>#', $h) === 1;
@@ -2855,7 +2855,38 @@ foreach (['data_dir', 'php', 'https', 'client_ip', 'internal', 'other'] as $k) {
     }
 }
 check('error page: every error in both languages; "try again" only where reloading can help', [array_unique($texts), $retries],
-    [[true], [true, true, true, true, false, false, false, false, true, true, true, true]]);
+    [[true], [true, true, false, false, true, true, false, false, false, false, true, true, true, true]]);
+
+// PHP cannot write to its temporary folder (upload_tmp_dir and sys_temp_dir point nowhere): it drops a request body over
+// 16 KB, with a warning, before the script starts. The answer says so (and the log), instead of going on with an empty
+// body: an uploaded file was saved empty and answered as done. A small body still goes (PHP keeps it in memory).
+// display_startup_errors off: when on (XAMPP, or PHP 8 without it in php.ini) PHP itself prints that warning, headers and
+// all, before any script runs; nothing can take it back, and the page reads that answer as a failed upload anyway.
+$probe = stream_socket_server('tcp://127.0.0.1:0');
+$tport = (int)substr((string)strrchr((string)stream_socket_get_name($probe, false), ':'), 1);
+fclose($probe);
+$tweb = proc_open([PHP_BINARY, '-d', "upload_tmp_dir=$papp/no-such-folder", '-d', "sys_temp_dir=$papp/no-such-folder", '-d', 'display_errors=1', '-d', 'display_startup_errors=0',
+    '-d', 'error_reporting=-1', '-d', 'log_errors=0', '-S', "127.0.0.1:$tport", '-t', $papp], [1 => ['file', $nul, 'w'], 2 => ['file', "$papp/tmp-server.log", 'w']], $tpipes);
+for ($i = 0; $i < 100 && !($ws = @fsockopen('127.0.0.1', $tport)); $i++) {
+    usleep(50000);
+}
+fclose($ws);
+$tpost = static function (string $body) use ($tport): array {   // [status, body]
+    $s = fsockopen('127.0.0.1', $tport, $en, $es, 5);
+    fwrite($s, "POST /ok/public/api.php HTTP/1.0\r\nHost: 127.0.0.1\r\nAccept: */*\r\nContent-Type: application/json\r\nContent-Length: "
+        . strlen($body) . "\r\n\r\n$body");
+    $r = (string)stream_get_contents($s);
+    fclose($s);
+    return [(int)substr($r, 9, 3), substr($r, (int)strpos($r, "\r\n\r\n") + 4)];
+};
+[$ts1, $tb1] = $tpost('{"action":"state","pad":"' . str_repeat('x', 20000) . '"}');
+[$ts2, $tb2] = $tpost('{"action":"state"}');
+proc_terminate($tweb);
+proc_close($tweb);
+$tlog = (string)file_get_contents("$papp/tmp-server.log");
+check('PHP without a writable temporary folder: a body over 16 KB it dropped is refused with tmp_dir (and logged), a small one goes',
+    [$ts1, $tb1, str_contains($tlog, 'cannot write to its temporary folder'), $ts2, isset(json_decode($tb2, true)['build'])],
+    [500, '{"error":"tmp_dir"}', true, 200, true]);
 
 // connection reset by the server while sending: TLS writes then return 0 and the socket stays writable (send() used to spin forever on Windows)
 $key = openssl_pkey_new(['private_key_type' => OPENSSL_KEYTYPE_EC, 'curve_name' => 'prime256v1', 'config' => $cnf]);

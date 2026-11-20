@@ -1320,6 +1320,21 @@ await settle();
     && FS['Proyecto/leeme.txt']?.size === 4 && !!FS['Proyecto/vacía']?.dir && asked.includes('«b.pdf» ya está en esta carpeta.')
     && FS['b.pdf'].size === 2048 && FS['nuevo.txt']?.size === 1, JSON.stringify({ overlay, sent, asked, b: FS['b.pdf'], n: FS['nuevo.txt'] }));
 
+  // PHP could not write to its temporary folder and dropped the body (the gateway says tmp_dir): the reason is shown and the
+  // queue stops, every other file would be lost the same way (it said only that some files had failed)
+  const answer = filesAnswer;
+  filesAnswer = async (q, body) => (q.get('a') === 'upload' ? { error: 'tmp_dir' } : answer(q, body));
+  fileCalls.length = 0;
+  document.body.querySelector('.toasts')?.replaceChildren();
+  list().dispatchEvent(new Ev('drop', { dataTransfer: transfer({ types: ['Files'], items: [{ kind: 'file' }], files: [new File(['1'], 'uno.txt'), new File(['2'], 'dos.txt')] }) }));
+  for (let i = 0; i < 4; i++) await settle();
+  filesAnswer = answer;
+  const tmpToasts = document.body.querySelector('.toasts')?.textContent || '';
+  const tmpSent = fileCalls.filter((c) => c.a === 'upload').map((c) => c.p);
+  check('file explorer: an upload PHP dropped (no temporary folder) says why and stops the queue',
+    tmpToasts.includes(t('e_tmp_dir')) && !tmpToasts.includes(t('fx_upload_failed', 1, 'uno.txt')) && JSON.stringify(tmpSent) === '["uno.txt"]',
+    JSON.stringify({ tmpToasts, tmpSent }));
+
   // renamed in place with F2 (the name without its extension selected), a new folder named at once, keys, a context menu,
   // several items deleted after asking, a folder downloaded as a ZIP (its size asked first: an error is not saved as a file)
   item('b.pdf').dispatchEvent(new Ev('click'));

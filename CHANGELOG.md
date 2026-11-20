@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.3 — 2026-11-20
+
+- **PHP's temporary folder.** When PHP cannot write to its temporary folder it drops anything over 16 KB sent to the server, before the application runs: an uploaded file was then saved empty and the upload said it was done (a file pasted into a session reached the remote computer empty). Now such a request is refused with "PHP cannot write to its temporary folder", an upload stops with that message, and the server error log names the folder.
+- **Documentation:** the installation manual lists the folders that need write permission: `data/`, the only one of the project, and PHP's temporary folder, which hostings, XAMPP and Linux already allow.
+
 ## 1.0.2 — 2026-11-20
 
 - **Ids of users and connections** are never made of decimal digits only. About 1 id in 1,800 was (16 random hex digits that happened to be all decimal), and such a key comes back from the data file as an integer instead of the text that was saved, so comparisons by that id could fail: a check of a user's connections failed now and then in the tests at GitHub. Ids already saved keep working.

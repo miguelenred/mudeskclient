@@ -969,11 +969,24 @@ foreach ($only === null ? array_keys($targets) : [$only] as $name) {
             }
         }
         $t = microtime(true) - $t;
-        if ($t > SLOW) {
-            $errors[] = [sprintf('slow: %.1f s', $t), 'slow'];
-        }
         if (memory_get_peak_usage() > $peak && memory_get_peak_usage() - $mem > MEMORY) {
             $errors[] = [sprintf('memory: %.0f MB', (memory_get_peak_usage() - $mem) / 1048576), 'memory'];
+        }
+        if ($t > SLOW) {
+            // a runner that stops for a while is no fault of the code (3.4 s at GitHub for a case that takes 0.0 s): the same
+            // case, the same input, runs once more, and only slow both times is a failure (what it reports again is left out)
+            $keep = $errors;
+            set_time_limit(10);
+            $again = microtime(true);
+            try {
+                $run($o, $msgs);
+            } catch (Throwable) {
+            }
+            $again  = microtime(true) - $again;
+            $errors = $keep;
+            if ($again > SLOW) {
+                $errors[] = [sprintf('slow: %.1f s, %.1f s again', $t, $again), 'slow'];
+            }
         }
         foreach ($errors as [$text, $key]) {
             $seen[$key] = ($seen[$key] ?? 0) + 1;

@@ -60,7 +60,7 @@ final class Users
 
     public static function create(string $name, string $password, string $role, bool $mustChange): ?array
     {
-        $id = bin2hex(random_bytes(8));
+        $id = Store::newId();
         $u  = [
             'id' => $id, 'username' => $name, 'role' => $role === 'admin' ? 'admin' : 'user',
             'pass' => self::hash($password), 'enabled' => true, 'must_change' => $mustChange,

@@ -886,6 +886,14 @@ MuDesk\Store::update('auditlimit', static function (array &$d): void { $d['hour'
 check('data files: the ones written often compact, the others indented', [str_contains((string)file_get_contents("$tmp/data/ratelimit.json"), "\n"),
     str_contains((string)file_get_contents("$tmp/data/auditlimit.json"), "\n"), str_contains((string)file_get_contents("$tmp/data/users.json"), "\n    ")], [false, false, true]);
 MuDesk\Store::update('ratelimit', static function (array &$d): void { unset($d['x']); });
+// ids of users and connections never all decimal: such a key ("1234567890123456", about 1 in 1,800 ids) came back from the
+// data file as an integer, and a check of the user's connections failed now and then at GitHub. 20,000 ids: with the old
+// ones, some 11 all-decimal; and such a key read back is an integer (why it matters)
+$ids = array_map(static fn() => MuDesk\Store::newId(), range(1, 20000));
+check('data files: new ids of 16 hex digits, never all decimal (such a key comes back as an integer)', [
+    count(array_filter($ids, static fn($i) => preg_match('/^[0-9a-f]{16}$/', $i) === 1)), count(array_filter($ids, 'ctype_digit')),
+    is_int(array_key_first(json_decode('{"1234567890123456":1}', true))), is_string(MuDesk\Users::create('idcheck', 'Id-check-user-1', 'user', false)['id'] ?? null)],
+    [20000, 0, true, true]);
 
 // TOTP: the code that has just turned it on (its step already used) is refused at sign-in with its own answer, wait for the next one
 $pt  = 'Totp-' . bin2hex(random_bytes(6));

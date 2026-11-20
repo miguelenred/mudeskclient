@@ -145,7 +145,7 @@ final class Connections
             if ($id !== '' && !isset($d[$id])) {
                 return 'not_found';
             }
-            $id      = $id !== '' ? $id : bin2hex(random_bytes(8));
+            $id      = $id !== '' ? $id : Store::newId();
             $old     = $d[$id] ?? ['created' => date('c')];
             $c      += ['id' => $id, 'created' => $old['created'], 'updated' => date('c')];
             $c['pass'] = $old['pass'] ?? null;

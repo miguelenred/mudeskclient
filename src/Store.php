@@ -60,6 +60,19 @@ final class Store
         }
     }
 
+    /**
+     * A new id for a record kept as a key of a data file (users, a user's connections): 16 hex digits, never all of them
+     * decimal. A key of only digits ("1234567890123456", about 1 in 1,800 ids) comes back from json_decode() as an
+     * integer, not the text that was saved: a lookup by that id then compared differently (it showed at random in the tests).
+     */
+    public static function newId(): string
+    {
+        do {
+            $id = bin2hex(random_bytes(8));
+        } while (ctype_digit($id));
+        return $id;
+    }
+
     public static function read(string $name): array
     {
         $file = self::file($name);

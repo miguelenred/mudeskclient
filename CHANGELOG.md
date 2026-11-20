@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.2 — 2026-11-20
+
+- **Ids of users and connections** are never made of decimal digits only. About 1 id in 1,800 was (16 random hex digits that happened to be all decimal), and such a key comes back from the data file as an integer instead of the text that was saved, so comparisons by that id could fail: a check of a user's connections failed now and then in the tests at GitHub. Ids already saved keep working.
+
 ## 1.0.1 — 2026-11-20
 
 - **Saved RDP passwords: a stronger key.** The key that wraps each user's data key is now derived with 400,000 rounds of PBKDF2-SHA256 instead of 200,000, twice the work for anyone trying passwords against a copy of the data folder. It is computed by OpenSSL, which gives the same key as before in 30 % less time, so signing in still takes its fixed second (0.78 s of work on the test machine, 0.61 s before). A key wrapped as up to 1.0.0 still opens, and is wrapped again with the new count at the user's next sign-in with the password (about 0.46 s more, once); the saved passwords stay readable. A damaged round count in the users file is refused instead of computed.

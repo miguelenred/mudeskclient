@@ -1337,11 +1337,13 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   // up; the gateway's {"touch": false} brings the mouse back
   Object.defineProperty(navigator, 'maxTouchPoints', { value: 5, configurable: true });
   const { s, canvas: c, wk } = await session();
+  // (only this session's requests: one of a session of an earlier test, late on a slow computer, failed this check)
+  const mine = (from) => sent.slice(from).filter((x) => String(x.url).includes(`sid=${s.sid}`));
   const n0 = sent.length;
   c.fire('pointerdown', touch(1, 10, 10));
   c.fire('pointerup', touch(1, 10, 10));
   await tick();
-  const asMouse = sent.slice(n0).every((x) => x.payload[0] === 1);
+  const asMouse = mine(n0).length > 0 && mine(n0).every((x) => x.payload[0] === 1);
   const frame = (wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode('{"touch":true}') } }), () => {});
   frame();
   const n1 = sent.length;
@@ -1357,7 +1359,7 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   await tick();
   c.fire('pointercancel', touch(1, 140, 100));
   await tick();
-  const frames = sent.slice(n1).filter((x) => x.payload[0] === 16).map(({ payload: p }) => {
+  const frames = mine(n1).filter((x) => x.payload[0] === 16).map(({ payload: p }) => {
     const out = [];
     for (let i = 0; i < p[1]; i++) {
       const o = 2 + i * 6, x = (p[o + 2] | (p[o + 3] << 8)) << 16 >> 16;
@@ -1372,7 +1374,7 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   c.fire('pointerdown', touch(4, 10, 10));
   c.fire('pointerup', touch(4, 10, 10));
   await tick();
-  const mouseAgain = sent.slice(n2).length > 0 && sent.slice(n2).every((x) => x.payload[0] === 1);
+  const mouseAgain = mine(n2).length > 0 && mine(n2).every((x) => x.payload[0] === 1);
   check('multitouch: a mouse until the gateway says so; then frames of every finger (ids, states, a quick tap down then up, cancel); a mouse again after',
     asMouse && shape === '0:down 1:down | 0:still 1:still | 0:still 1:up | 0:still 1:down | 0:still 1:up | 0:cancel' && xs[1] > xs[0] && mouseAgain,
     JSON.stringify({ asMouse, frames, mouseAgain }));

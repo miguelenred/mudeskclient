@@ -52,7 +52,8 @@ export function parseRdp(text, name = '') {
     resize: on('smart sizing') && !on('dynamic resolution') ? 'fit' : 'dynamic',
     clipboard: !off('redirectclipboard'), paste: 'auto', printer: !off('redirectprinters'),
     drive: !!v.drivestoredirect || on('redirectdrives'),   // the computer's drives there: the shared folder here
-    audio: (v.audiomode ?? 0) === 0, mic: on('audiocapturemode'), ask: true,
+    // the microphone and the camera are one option here: either one asked for there takes both
+    audio: (v.audiomode ?? 0) === 0, mic: on('audiocapturemode') || !!String(v.camerastoredirect ?? '').trim(), ask: true,
     app: on('remoteapplicationmode') ? String(v.remoteapplicationprogram || '') : '',    // RemoteApp: its program alone
     app_args: on('remoteapplicationmode') ? String(v.remoteapplicationcmdline || '') : '',
     perf: { wallpaper: off('disable wallpaper'), themes: off('disable themes'), smoothing: v['allow font smoothing'] !== 0,
@@ -60,7 +61,9 @@ export function parseRdp(text, name = '') {
   };
   const notes = [];
   if (on('remoteapplicationmode') && !v.remoteapplicationprogram) notes.push(['rdp_remoteapp', String(v.remoteapplicationname || '')]);
-  if (v.gatewayhostname && v.gatewayusagemethod !== 0 && v.gatewayusagemethod !== 4) notes.push(['rdp_gateway', String(v.gatewayhostname)]);
+  // a Remote Desktop Gateway (always used, or detected: 1, 2) and a connection broker's load balance info, taken
+  if (v.gatewayhostname && v.gatewayusagemethod !== 0 && v.gatewayusagemethod !== 4) conn.gw = String(v.gatewayhostname).trim().toLowerCase();
+  if (v.loadbalanceinfo) conn.lb = String(v.loadbalanceinfo).trim().slice(0, 512);
   if (v['alternate shell'] && !on('remoteapplicationmode')) notes.push(['rdp_shell', String(v['alternate shell'])]);
   if (/^\s*password 51\s*:\s*b\s*:/im.test(text)) notes.push(['rdp_file_password', '']);
   return { conn, notes };
@@ -76,7 +79,7 @@ export function toRdp(c) {
     ...(user ? [`username:s:${user}`] : []),
     'screen mode id:i:2', 'use multimon:i:0', `session bpp:i:${c.bpp || 16}`,
     `dynamic resolution:i:${b(c.resize !== 'fit')}`, `smart sizing:i:${b(c.resize === 'fit')}`,
-    `audiomode:i:${c.audio ? 0 : 2}`, `audiocapturemode:i:${b(c.mic)}`, `redirectclipboard:i:${b(c.clipboard)}`, `redirectprinters:i:${b(c.printer)}`,
+    `audiomode:i:${c.audio ? 0 : 2}`, `audiocapturemode:i:${b(c.mic)}`, `camerastoredirect:s:${c.mic ? '*' : ''}`, `redirectclipboard:i:${b(c.clipboard)}`, `redirectprinters:i:${b(c.printer)}`,
     'drivestoredirect:s:',                                 // the shared folder is MuDesk's own: no drives of the computer
     `enablecredsspsupport:i:${b(c.security !== 'tls')}`, 'authentication level:i:2', 'prompt for credentials:i:0',
     `disable wallpaper:i:${b(!p.wallpaper)}`, `disable themes:i:${b(!p.themes)}`, `allow font smoothing:i:${b(p.smoothing)}`,
@@ -84,7 +87,9 @@ export function toRdp(c) {
     'compression:i:1', 'autoreconnection enabled:i:1',
     ...(c.app ? ['remoteapplicationmode:i:1', `remoteapplicationprogram:s:${c.app}`, `remoteapplicationname:s:${c.name || c.app}`,
       `remoteapplicationcmdline:s:${c.app_args || ''}`] : []),
-  ].join('\r\n') + '\r\n';
+    ...(c.gw ? [`gatewayhostname:s:${c.gw}`, 'gatewayusagemethod:i:1', 'gatewaycredentialssource:i:4', 'gatewayprofileusagemethod:i:1', 'promptcredentialonce:i:1'] : []),
+    ...(c.lb ? [`loadbalanceinfo:s:${c.lb}`] : []),
+  ].map((l) => l.replace(/[\x00-\x1f\x7f]/g, '')).join('\r\n') + '\r\n';   // (a line break in a value made a line of its own)
 }
 
 /** The bytes of a .rdp file: UTF-16 LE with its BOM, as Remote Desktop Connection saves it. */

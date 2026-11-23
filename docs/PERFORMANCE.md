@@ -111,6 +111,7 @@ The workloads are not exactly repeatable (the console lists at a different speed
 |---|---|---|
 | Windows 8.1 / Server 2012 R2 or later | Graphics pipeline, with H.264 when the browser decodes it | Least traffic and almost no PHP CPU; H.264 frees the browser CPU (key on phones) |
 | Windows 7, 8, Server 2008 R2 / 2012 | 16-bit bitmaps with XCRUSH and drawing orders | No useful graphics pipeline (or no H.264) |
+| Windows XP, Server 2003 | 16-bit bitmaps with MPPC (the only compression they have) and drawing orders | No graphics pipeline; with *Standard RDP Security* PHP also decrypts everything with RC4 |
 | xrdp | 16-bit bitmaps with MPPC (all it supports) and drawing orders | xrdp 0.9 has no graphics pipeline |
 
 The **Graphics: Automatic** option (the default) chooses this way: graphics pipeline (with H.264 when the browser decodes it) when the NLA sign-in reports Windows 8.1 / Server 2012 R2 or later, and bitmaps at the connection colour depth otherwise. A RemoteApp connection always uses bitmaps and drawing orders (no graphics pipeline).
@@ -151,6 +152,67 @@ Measured on this computer (the browser's sending on browser doubles with a virtu
 
 The canvas figures were measured in Edge drawing in software (this computer has no graphics card). Keeping the bitmap cache as image data instead of one canvas per entry was ten times faster there, but not adopted: on a graphics card each put uploads the whole image again, and that could not be measured here.
 
+## Fourth review (1.1): decoders, delivery to the page and slow computers
+
+Measured on the test computer: 2 virtual CPUs and no graphics card (Edge draws the canvas in software). "Before" and "after" are the code before and after this review, run in turns on the same data; runs vary by ±10–20 %, so smaller differences are noise. Every decoder gives the same output before and after (the same bytes, the same pixels).
+
+**The gateway (PHP)**, decompressing recorded updates of a FreeRDP server (an animation, scrolling text and a dragged window, with each compression) and the test vectors of FreeRDP's compressors:
+
+| What | Before → after |
+|---|---|
+| MPPC decompression | 2.0–2.5 times faster |
+| XCRUSH decompression: an animation at 16 and 32 bits / scrolling text and a dragged window / its test vectors (its level 2 is MPPC) | 2.1–2.2 / 1.8 / 11.6 times faster; its level 1 (the copies from its 2 MB history) 13–19 % faster |
+| NCRUSH decompression | 1.18–1.37 times faster |
+| RC4, 1 MB in pieces of 12 bytes to 16 KB | 1.35–1.86 times faster |
+| Standard RDP Security: 1 MB of server PDUs opened (RC4 and MAC), in pieces of 20 bytes to 16 KB | 1.26–1.84 times faster |
+| PHP memory of a session | 0.04–0.08 MB more at its peak |
+| A turn of the session's loop (Windows) | 15.6–17 µs → 7.3–9.3 µs (new input connections looked for only when the listening socket is readable, or 20 ms after the last look) |
+| A request of input or frame acknowledgement (Windows, PHP's built-in server) | about 15 ms without OPcache, 5 ms with it ([HOSTING](HOSTING.md#requirements)) |
+
+**The browser's decoders** (the page's decoders run by Node.js on recorded streams, as `tests/bench.mjs` does; the time to decode each recording, best of 7):
+
+| Recording | Before | After |
+|---|---:|---:|
+| 16-bit bitmaps: a console listing / another recording / an animation | 684 / 518 / 188 ms | 510 / 342 / 130 ms |
+| A dragged window at 24 / 15 bits | 162 / 38 ms | 99 / 27 ms |
+| 32-bit bitmaps (planar) | 460 ms | 331 ms |
+| Graphics pipeline, planar: a dragged window / text | 436 / 112 ms | 321 / 75 ms |
+| Graphics pipeline, uncompressed | 72 ms | 41 ms |
+| RemoteFX: dequantization of one component | 5.83 µs | 2.58 µs |
+| RemoteFX progressive | 4,249 ms | 3,317 ms (22 % less) |
+| The whole graphics pipeline, two progressive animations | 4,014 / 1,107 ms | 2,912 / 838 ms |
+| ZGFX | 280 ms | 130 ms |
+| ClearCodec (with its NSCodec), a Windows 11 animation | 324 ms | 294 ms |
+| XCRUSH in the worker: an animation / a dragged window | 323 / 280 ms | 203 / 188 ms |
+| MPPC, scrolling text | 16.3 ms | 12.3 ms |
+| NCRUSH, its test vectors | 3.08 ms | 2.39 ms |
+
+Their memory: at most 256 KB of scratch space per buffer in `gfx.js` and about 20 KB of tables in `rfx.js`, with fewer garbage collections.
+
+**Delivery to the page** (Edge, the page's own thread):
+
+| What | Before | After |
+|---|---:|---:|
+| A graphics-pipeline operation of 2, 4 and 8 areas at 1080p (a fill, cache to surface, surface to surface) | 5.5–43 ms | 0.2–0.6 ms |
+| An H.264 frame of 2, 4 and 8 areas | 15–109 ms | 4.7–6.4 ms |
+| Bitmaps of four recordings (the 16-bit console listing first): the page's thread busy | 371 / 463 / 407 / 233 ms | 210 / 235 / 265 / 151 ms |
+| The same: the whole replay | 2.6 / 3.0 / 2.2 / 1.5 s | 2.0 / 2.2 / 1.7 / 1.1 s |
+
+The graphics pipeline draws an operation of several areas, and an H.264 frame, once through all of them (each drawing of a frame converted the whole of it); the bitmaps of an update reach the page together, in messages of 64 bitmaps and about 4 million pixels at most (see [ARCHITECTURE](ARCHITECTURE.md#screen-path)).
+
+**Slow computers** (Edge limited to 25 % and 16.7 % of the CPU: a quarter and a sixth; the recordings sent as fast as the page takes them, or at their own pace):
+
+| What | Before (25 % / 16.7 %) | After (25 % / 16.7 %) |
+|---|---:|---:|
+| A 1024 × 768 animation through the graphics pipeline, 138 frames: frames per second | 15.2 / 9.6 | 18.4 / 12.3 |
+| The same, 401 frames | 18.4 / 9.7 | 19.9 / 12.3 |
+| A 16-bit console listing (24,388 bitmaps): time to show all of it | 9.4 / 16.5 s | 5.4 / 8.8 s |
+| Bitmaps sent at their pace: from their arrival to their drawing, median | 1,072 / 1,842 ms | 617 / 683 ms |
+
+With a server that paces its frames by the acknowledgements (the graphics pipeline), their latency stays bounded (it does not grow as the session goes on), and from the bytes' arrival to the pixels drawn takes 19–21 ms (median).
+
+Known limit: a burst of hundreds of full-screen scrolls from an old server (ScrBlt orders) queues on the page until it is drawn; the wait is bounded by the burst, it does not grow beyond it. Holding the server back while the page catches up was tried and dropped: 12–25 % less throughput.
+
 ## Microphone
 
 Measured on the test computer (Windows 11 Pro, Edge with its simulated microphone, 30 s of *Settings → Sound → Test your microphone*):
@@ -165,3 +227,16 @@ Measured on the test computer (Windows 11 Pro, Edge with its simulated microphon
 | Level measured by Windows | 99 % with the simulated microphone's tone (3 % before, with no microphone) |
 
 The page resamples in an audio worklet (a 4th-order low-pass filter first when the rate goes down) and joins the pieces waiting to be sent, at most a second: on a slow network the remote computer hears a little later, never more and more later.
+
+## Camera and a folder of this computer (1.1)
+
+Measured on the test computer (Windows 11 Pro), through the dev server on the same computer:
+
+| What | Measured |
+|---|---|
+| Camera: format Windows chose | Motion JPEG 640 × 480 at 30 a second (the first offered); one Sample Request at a time |
+| Camera: pictures and traffic upwards | Edge's simulated camera: 19–24 pictures a second, about 8 KB each, 150–185 KB/s; Firefox's: about 12 a second, about 6 KB. A real camera's pictures are larger (an estimated 30–50 KB at 640 × 480, about 0.5–1.5 MB/s); a slower connection gets fewer pictures, never later ones |
+| Camera: the input meanwhile | not held up: the pictures go on a lane of their own, out of order, two requests at most |
+| Camera: the page in another tab | the same rate: the pictures are paced by a worker's timer (a hidden page's own timers run once a second at most) |
+| Folder: listing 155 files (PowerShell `Get-ChildItem`) | 12.96 s one name per request (each a round trip to the browser, about 84 ms here), 1.0 s with the names sent with the first one and answered by the gateway |
+| Folder: a file read or written | in pieces of up to 1 MB (a read) or as Windows writes them; what a program writes is saved in the browser's folder when it closes the file, or before it is read (the browser reads only what is saved), and the next write copies the file first: a program reading and writing the same large file by turns is slow there. A file emptied when opened is not copied first |

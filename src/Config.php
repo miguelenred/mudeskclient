@@ -21,7 +21,7 @@ final class Config
             'bulk_compression' => 'rdp61', // highest bulk compression offered: 'rdp61' (XCRUSH), 'rdp6' (NCRUSH), 'mppc' or false
         ];
         $dir = self::$c['data_dir'];
-        foreach (['', '/connections', '/audit', '/run', '/sessions', '/files', '/tmp'] as $sub) {
+        foreach (['', '/connections', '/hosts', '/audit', '/run', '/sessions', '/files', '/tmp'] as $sub) {
             if (!is_dir($dir . $sub) && !mkdir($dir . $sub, 0700, true) && !is_dir($dir . $sub)) {
                 error_log("MuDeskClient: the web server cannot create $dir$sub: give the account that runs it permission to modify $dir");
                 ErrorPage::send(500, 'data_dir');

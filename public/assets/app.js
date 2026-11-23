@@ -8,6 +8,8 @@ import { RdpSession } from './session.js';
 import { ClipboardBridge } from './clipboard.js';
 import { AudioPlayer } from './audio.js';
 import { MicCapture } from './mic.js';
+import { CamCapture } from './camera.js';
+import { LocalFolder } from './localdrive.js';
 import { crc32, zipBlob } from './zip.js';
 import { keyboardRows } from './osk.js';
 import { RDP_MAX, decodeRdp, encodeRdp, parseRdp, toRdp } from './rdpfile.js';
@@ -55,6 +57,9 @@ const ICONS = {
   camera: 'M4 8h3l2-3h6l2 3h3v11H4zM12 16.5a3.5 3.5 0 1 0 0-7a3.5 3.5 0 0 0 0 7z',
   crop: 'M6 2v14a2 2 0 0 0 2 2h14M2 6h14a2 2 0 0 1 2 2v14',
   copy: 'M9 9h11v11H9zM5 15H4V4h11v1',
+  pause: 'M8 5v14M16 5v14',
+  share: 'M18 8a3 3 0 1 0 0-6a3 3 0 0 0 0 6zM6 15a3 3 0 1 0 0-6a3 3 0 0 0 0 6zM18 22a3 3 0 1 0 0-6a3 3 0 0 0 0 6zM8.6 13.5l6.8 4M15.4 6.5l-6.8 4',
+  eye: 'M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zM12 15a3 3 0 1 0 0-6a3 3 0 0 0 0 6z',
 };
 const icon = (name) => {
   const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -174,11 +179,12 @@ function modal(title, body, actions) {
   return new Promise((resolve) => {
     const before = document.activeElement;
     const close = (v) => { back.remove(); before?.focus?.(); resolve(v); };
-    const dialog = h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': title, tabindex: -1 }, h('h2', {}, title), body,
-      h('div', { class: 'row end', style: 'margin-top:1rem' }, actions(close)));
+    // its content scrolls between the title and the buttons, always in sight (app.css)
+    const dialog = h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': title, tabindex: -1 }, h('h2', {}, title),
+      h('div', { class: 'modal-body' }, body), h('div', { class: 'row end modal-foot' }, actions(close)));
     const back = h('div', { class: 'modal-back', onclick: (e) => e.target === back && close(null), onkeydown: (e) => e.key === 'Escape' && !e.isComposing && close(null) }, dialog);
     front().append(back);
-    (back.querySelector('input,select,textarea') || dialog).focus();
+    ([...back.querySelectorAll('input,select,textarea')].find((x) => !x.disabled) || dialog).focus();   // (not a disabled one: the focus stayed behind it)
   });
 }
 const confirmDialog = (text) => modal(text, '', (close) => [btn(t('cancel'), () => close(false)), btn(t('yes'), () => close(true), 'primary')]);
@@ -206,6 +212,7 @@ let currentRdp = null, forgetRdp = null;
 function endRdp() {
   currentRdp?.stop();
   currentRdp?.leave?.abort();
+  currentRdp?.dispose?.();
   forgetRdp?.();
   currentRdp = forgetRdp = null;
 }                 // the remote session of this page, in any state, and how to forget its secrets
@@ -311,6 +318,7 @@ const needSecond = () => S.user.totp_required && !S.user.totp && !S.user.passkey
 function render() {
   const r = route();
   if (!S) return;
+  if (r.view === 'watch') return viewWatch(r.arg);       // a session shared with a link: no account needed
   // the session's view left by its address (Back, a link, a typed address): the remote session ends, instead of staying
   // connected where nobody sees it until the next session or signing out
   if (r.view !== 's' && currentRdp) endRdp();
@@ -318,6 +326,7 @@ function render() {
   if (!S.user) return authScreen(S.second ? viewSecond() : viewLogin());
   if (S.user.must_change) return authScreen(viewForcePassword());
   if (r.view === 's' && !needSecond()) return viewSession(r.arg);
+  if (r.view === 'rec' && ['admin', 'auditor'].includes(S.user.role) && !needSecond()) return viewRecording(r.arg);
   const views = { conns: viewConns, files: viewFiles, profile: viewProfile, admin: viewAdmin };
   const view = needSecond() ? 'profile' : (views[r.view] ? r.view : 'conns');
   layout(view, views[view](r.arg));
@@ -331,7 +340,7 @@ function authScreen(content) {
 
 function layout(active, content) {
   const nav = [['conns', t('nav_conns')], ['files', t('nav_files')], ['profile', t('nav_profile')]];
-  if (S.user.role === 'admin') nav.push(['admin', t('nav_admin')]);
+  if (S.user.role === 'admin' || S.user.role === 'auditor') nav.push(['admin', t('nav_admin')]);   // an auditor: the audit and sessions
   const admin = S.user.role === 'admin' && active === 'admin';
   const langSel = select('lang', LANGS, getLang());              // saved in the profile, like the choice made there
   Object.assign(langSel, { title: t('language'), ariaLabel: t('language') });
@@ -420,6 +429,11 @@ async function passkeySignIn() {
 
 function viewLogin() {
   const err = errBox();
+  const back = new URLSearchParams(location.search).get('oidc_error');   // back from the provider without signing in
+  if (back) {
+    history.replaceState(null, '', location.pathname + location.hash);
+    err.textContent = t('e_' + back) !== 'e_' + back && back.startsWith('oidc_') || back === 'outside_hours' ? errText(back) : errText('oidc_provider');
+  }
   const form = h('form', {
     onsubmit: (e) => {
       e.preventDefault();
@@ -432,6 +446,7 @@ function viewLogin() {
   field(t('password'), h('input', { name: 'password', type: 'password', required: true, autocomplete: 'current-password' })),
   err, h('button', { class: 'btn primary', style: 'width:100%' }, t('login')),
   hasPasskeys && h('button', { type: 'button', class: 'btn', style: 'width:100%;margin-top:.6rem', onclick: () => attempt(passkeySignIn, err) }, t('passkey_signin')),
+  S.oidc && h('a', { class: 'btn', href: 'oidc.php?start=1', style: 'width:100%;margin-top:.6rem;text-align:center' }, t('oidc_signin', S.oidc)),
   h('div', { class: 'row end', style: 'margin-top:1rem' }, select('lang', LANGS, getLang())));
   form.lang.addEventListener('change', () => { tabPref('mudesk-lang', form.lang.value); setLang(form.lang.value); render(); });
   return form;
@@ -484,7 +499,7 @@ function viewConns() {
   const draw = () => {
     const q = search.value.trim().toLowerCase();
     const list = data.conns.filter((c) => !q || `${c.name} ${c.host} ${c.group} ${c.user}`.toLowerCase().includes(q));
-    if (!data.conns.length) return fill(box, h('div', { class: 'card muted' }, t('no_conns')));
+    if (!data.conns.length) return fill(box, h('div', { class: 'card muted' }, t(S.user.create_conns === false ? 'no_conns_given' : 'no_conns')));
     const groups = new Map();
     list.forEach((c) => { const g = c.group || ''; if (!groups.has(g)) groups.set(g, []); groups.get(g).push(c); });
     fill(box, ...[...groups].map(([g, items]) => h('section', { class: 'group' },
@@ -493,6 +508,7 @@ function viewConns() {
         h('div', { class: 'name' }, icon('monitor'), c.name, c.managed && h('span', { class: 'badge', title: t('managed_hint') }, icon('lock'), t('managed_badge'))),
         h('div', { class: 'muted small mono' }, (c.user ? (c.domain ? c.domain + '\\' : '') + c.user + ' @ ' : '') + c.host + (c.port !== 3389 ? ':' + c.port : '')),
         c.app && h('div', { class: 'small app-line', title: t('remote_app') }, h('span', { class: 'badge' }, 'RemoteApp'), ' ', h('span', { class: 'mono' }, appName(c.app))),
+        c.record && h('div', { class: 'small' }, h('span', { class: 'badge rec', title: t('rec_notice') }, t('rec_conn'))),
         h('div', { class: 'row' },
           h('a', { class: 'btn primary small', href: '#/s/' + c.id, target: '_blank', rel: 'noopener' }, icon('play'), t('connect')),
           h('span', { class: 'spacer' }),
@@ -505,10 +521,12 @@ function viewConns() {
   load();
   const importer = rdpPicker((files) => data && importRdp(files, (c, notes) => editConn(c, data.keyboards, { notes }),
     (conn) => api('conns.save', { conn })).then(load));
+  const create = S.user.create_conns !== false;            // the administrator lets users make connections (administrators always)
   return h('div', {},
     h('div', { class: 'toolbar' }, h('h1', { style: 'margin:0' }, t('nav_conns')), h('span', { class: 'spacer' }), search,
-      btn(t('import_rdp'), () => importer.click(), '', 'upload', t('import_rdp_hint')), importer,
-      btn(t('new_conn'), () => data && editConn(null, data.keyboards).then((ok) => ok && load()), 'primary', 'plus')),
+      create && [btn(t('import_rdp'), () => importer.click(), '', 'upload', t('import_rdp_hint')), importer,
+        btn(t('occasional_conn'), () => data && editConn(null, data.keyboards, { occasional: true }), '', 'play', t('occasional_hint')),
+        btn(t('new_conn'), () => data && editConn(null, data.keyboards).then((ok) => ok && load()), 'primary', 'plus')]),
     box);
 }
 
@@ -517,6 +535,28 @@ const appName = (a) => String(a || '').replace(/^\|\|/, '');
 // ------------------------------------------------------------------ .rdp files (Remote Desktop Connection)
 
 /** A hidden file field for .rdp files; onFiles(files) once some are chosen. */
+/**
+ * Connections of the administrator from a CSV file (one per row, the columns in the manual): how many were added, and
+ * each refused row, unknown user or unused column, by its row number as the spreadsheet shows it. Resolves when shown.
+ */
+async function importCsv(file) {
+  let r;
+  try {
+    const bytes = await file.arrayBuffer();
+    let csv;
+    try { csv = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { csv = new TextDecoder('windows-1252').decode(bytes); }
+    r = await api('admin.conns.import', { csv });
+  } catch (e) {
+    toast(e instanceof ApiError ? errText(e.message) : String(e.message || e), true);
+    return;
+  }
+  const lines = [...r.errors.map(([row, key]) => t('csv_row', row, errText(key))), ...r.unknown.map(([row, names]) => t('csv_unknown_users', row, names))];
+  await modal(t('import_csv'), h('div', {}, h('p', {}, t('csv_imported', r.created.length)),
+    r.ignored.length > 0 && h('p', { class: 'small muted' }, t('csv_ignored', r.ignored.join(', '))),
+    lines.length > 0 && h('ul', { class: 'small' }, lines.map((l) => h('li', {}, l)))),
+    (close) => [btn(t('close'), () => close(true), 'primary')]);
+}
+
 const rdpPicker = (onFiles) => {
   const input = h('input', { type: 'file', accept: '.rdp', multiple: true, class: 'hidden' });
   input.addEventListener('change', () => { const files = [...input.files]; input.value = ''; if (files.length) onFiles(files); });
@@ -524,7 +564,7 @@ const rdpPicker = (onFiles) => {
 };
 /**
  * .rdp files chosen: one is opened in the connection editor, filled in, to check and save (with what MuDesk does not take,
- * such as RemoteApp or a gateway, said there); several are saved at once and the result said. Resolves when done.
+ * such as a start program, said there); several are saved at once and the result said. Resolves when done.
  */
 async function importRdp(files, edit, save) {
   const read = [];
@@ -563,6 +603,76 @@ const touchOnly = () => matchMedia('(pointer: coarse)').matches && !matchMedia('
 /** Chrome, Edge: the Window Management API lists the screens. Firefox and Safari: the other screen is looked for (probeScreen). */
 const hasScreenApi = () => 'getScreenDetails' in window;
 const OTHER_SCREEN = 'mudesk-other-screen';             // localStorage: the other screen found before in this browser
+/**
+ * "Start in full screen", for one window of a session (win): el (the session, or the page of another screen's window) asked
+ * for full screen. Browsers allow it only from a click in that same window (measured in Edge 158, Brave 158 and Firefox 160:
+ * the other screens' windows were refused), unless a policy or a setting allows it (see "Full screen on every screen" in
+ * docs/USAGE.md). Firefox also gives it only to the window in front, and a window just opened comes in front after asking:
+ * refused while not in front, it is asked again when the window comes in front (its focus event). Kept out of it, the window
+ * goes to full screen with its first press on the remote screen, which goes no further (a click on the remote computer the
+ * user did not mean). Wanted until the user acts: a press in full screen, its own full screen button, or leaving full screen
+ * in the window in front (Esc); taken out of it while another window is in front (Firefox, as it comes, when a window
+ * opens or comes up), its first press brings it back. Its listeners go on the canvas before the session's.
+ */
+function fullOnStart(canvas, win, el, focus) {
+  const doc = win.document, front = () => doc.hasFocus?.() ?? true;
+  let wanted = false, held = null, waiting = false, asking = null;
+  const ac = new AbortController();
+  const again = () => { if (wanted && !doc.fullscreenElement) go(); };
+  const go = () => {
+    // one request at a time: one asked for meanwhile is made once that one is answered (Chrome 158 refused a press's request
+    // while the one asked for as its window came in front, a moment before the press, was still pending)
+    if (asking) { asking.then(again); return; }
+    const was = front();
+    let asked;
+    try { asked = Promise.resolve(el.requestFullscreen?.()); } catch (e) { asked = Promise.reject(e); }
+    asking = asked.then(() => { asking = null; }, () => {
+      asking = null;
+      if (!wanted || was || doc.fullscreenElement) return;   // refused to the window in front: its first press
+      if (front()) go();                                     // come in front meanwhile
+      else if (!waiting) {
+        waiting = true;
+        win.addEventListener('focus', () => { waiting = false; again(); }, { once: true, signal: ac.signal });
+      }
+    });
+  };
+  let atRelease = false;
+  canvas.addEventListener('pointerdown', (e) => {
+    held = null;                                         // (a press before ended, wherever its release went)
+    atRelease = false;
+    if (!wanted) return;
+    if (doc.fullscreenElement) { wanted = false; return; }
+    held = e.pointerId;
+    try { canvas.setPointerCapture(e.pointerId); } catch { /* its release may go elsewhere: the next press forgets it */ }
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    // a mouse's press lets the page go to full screen; a finger's or a pen's only when it is lifted (the browsers' rule)
+    if (e.pointerType === 'mouse') { go(); focus(); } else atRelease = true;
+  });
+  const up = (e) => {
+    if (held === null || e.pointerId !== held) return;
+    held = null;
+    e.stopImmediatePropagation();
+    if (atRelease && e.type === 'pointerup') { go(); focus(); }
+    atRelease = false;
+  };
+  canvas.addEventListener('pointerup', up);
+  canvas.addEventListener('pointercancel', up);
+  // its moves kept from the session too: a finger that moved during that press stayed in the session as a second finger
+  // (its release never reached it), and every later tap was taken for a two-finger gesture
+  canvas.addEventListener('pointermove', (e) => { if (held !== null && e.pointerId === held) e.stopImmediatePropagation(); });
+  doc.addEventListener('fullscreenchange', () => { if (!doc.fullscreenElement && front()) wanted = false; }, { signal: ac.signal });
+  return {
+    arm() { wanted = true; },
+    /** Asked for now: a click's activation, a policy or a setting may allow it. */
+    start() {
+      wanted = true;
+      go();
+    },
+    settle() { wanted = false; },
+    stop() { wanted = false; ac.abort(); },
+  };
+}
 const BAR_X = 'mudesk-bar-x';                            // localStorage: where the session toolbar was left (its centre, 0..1)
 const pasteFor = (mode) => mode === 'on' || (mode !== 'off' && touchOnly());
 const PASTE_SOURCES = ['https://github.com/Garnet-Owl/nemo-voice-typing/issues/4', 'https://github.com/JohnJohn4/dictatem/issues/278',
@@ -585,7 +695,8 @@ const infoBtn = (fn, title = t('paste_info')) => h('button', { type: 'button', c
 /** Commands of the explanations, the same in every language of Windows. */
 const MIC_REG = 'reg add "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services" /v fDisableAudioCapture /t REG_DWORD /d 0 /f';
 const MIC_AUDIO_SERVICE = 'Set-Service Audiosrv -StartupType Automatic; Start-Service Audiosrv';
-/** What the microphone needs: the browser's permission and, on the remote Windows, audio recording allowed. */
+const CAM_REG = 'reg add "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services" /v fDisableCameraRedir /t REG_DWORD /d 0 /f';
+/** What the microphone and the camera need: the browser's permission and, on the remote Windows, their redirection allowed. */
 function micInfo() {
   const cmd = (c) => h('pre', { class: 'cmd' }, c);
   modal(t('mic'), h('div', { class: 'info-text' },
@@ -594,6 +705,7 @@ function micInfo() {
     h('h3', {}, t('mic_info_gpo_h')), h('ol', {}, t('mic_info_gpo').map((s) => h('li', {}, s))),
     h('h3', {}, t('mic_info_reg_h')), h('p', {}, t('mic_info_reg')), cmd(MIC_REG),
     h('p', {}, t('mic_info_service')), cmd(MIC_AUDIO_SERVICE),
+    h('h3', {}, t('cam_info_h')), h('p', {}, t('cam_info')), cmd(CAM_REG),
     h('p', {}, t('mic_info_after'))),
     (close) => [btn(t('close'), () => close(true), 'primary')]);
 }
@@ -606,62 +718,139 @@ function screensInfo() {
     h('p', {}, t('screens_info_general'))),
     (close) => [btn(t('close'), () => close(true), 'primary')]);
 }
+/** Firefox's settings that let a page go to full screen without a press and keep it there when it opens a window. */
+const FULL_FX_PREFS = ['full-screen-api.allow-trusted-requests-only', 'full-screen-api.exit-on.windowOpen', 'full-screen-api.exit-on.windowRaise'];
+/** Start in full screen: what each browser does with the click on Connect, and how to let every screen go without a press. */
+function fullInfo() {
+  const cmd = (c) => h('pre', { class: 'cmd' }, c);
+  const reg = (k) => `reg add "HKLM\\SOFTWARE\\Policies\\${k}\\AutomaticFullscreenAllowedForUrls" /v 1 /t REG_SZ /d "${location.origin}" /f`;
+  modal(t('full_start'), h('div', { class: 'info-text' },
+    h('h3', {}, t('full_info_how_h')), h('p', {}, t('full_info_how')), h('ul', {}, t('full_info_browsers').map((s) => h('li', {}, s))),
+    h('p', {}, t('full_info_press')),
+    h('h3', {}, t('full_info_auto_h')), h('p', {}, t('full_info_auto', location.origin)),
+    h('h3', {}, t('full_info_chromium_h')), h('p', {}, t('full_info_chromium')), cmd(reg('Microsoft\\Edge')), cmd(reg('Google\\Chrome')),
+    h('p', {}, t('full_info_chromium_after')),
+    h('h3', {}, 'Firefox'), h('p', {}, t('full_info_firefox')), h('ul', {}, FULL_FX_PREFS.map((p) => h('li', {}, h('code', {}, p))))),
+    (close) => [btn(t('close'), () => close(true), 'primary')]);
+}
 
 /**
  * The connection editor. opts: notes (what an imported .rdp file has that MuDesk does not take: [i18n key, value]); locked
  * (a connection of the administrator seen by its user: only their own password can be saved or forgotten); admin ({users,
  * assigned}: a connection of the administrator, given to some users or all, without a password: each user has theirs);
- * owner (a user's own connection changed by the administrator: their password can only be forgotten); save(conn, extra).
+ * owner (a user's own connection changed by the administrator: their password can only be forgotten); save(conn, extra);
+ * occasional (a manual connection, not saved: no name, group or password, which is asked for when connecting; Connect
+ * opens its session in a new tab, the connection kept in the web session only).
  */
 function editConn(c, keyboards, opts = {}) {
-  const { admin, owner } = opts, locked = !!opts.locked;
+  const { admin, owner, occasional } = opts, locked = !!opts.locked;
+  // a user who may not make connections: their own keep their target (the computer, port, user, domain and security)
+  const keepTarget = !admin && !owner && !locked && !!c?.id && S.user.create_conns === false;
   c = c || { port: 3389, kbd: 0x040A, bpp: 16, gfx: 'auto', security: 'auto', resize: 'dynamic', clipboard: true, paste: 'auto', drive: true, audio: true, mic: false, printer: true, ask: true, perf: { smoothing: true } };
   const err = errBox();
   const kb = Object.fromEntries(keyboards.map((k) => [k, KB_NAMES[k] || '0x' + k.toString(16)]));
-  const form = h('form', { onsubmit: (e) => e.preventDefault() },
+  // wide, its fields and options in columns where they fit (one on a phone): less scrolling (app.css, .conn-edit)
+  const form = h('form', { class: 'conn-edit', onsubmit: (e) => e.preventDefault() },
     opts.notes?.length > 0 && h('div', { class: 'notice small' }, opts.notes.map(([k, v]) => h('p', {}, t(k, v)))),
     locked && h('div', { class: 'notice small' }, h('p', {}, t('managed_hint'))),
+    keepTarget && h('div', { class: 'notice small' }, h('p', {}, t('conns_locked_hint'))),
+    occasional && h('div', { class: 'notice small' }, h('p', {}, t('occasional_note'))),
     h('div', { class: 'cols' },
-      field(t('conn_name'), h('input', { name: 'name', value: c.name || '', maxlength: 80 })),
-      field(t('conn_group'), h('input', { name: 'group', value: c.group || '', maxlength: 60 })),
+      !occasional && field(t('conn_name'), h('input', { name: 'name', value: c.name || '', maxlength: 80 })),
+      !occasional && field(t('conn_group'), h('input', { name: 'group', value: c.group || '', maxlength: 60 })),
       field(t('host'), h('input', { name: 'host', value: c.host || '', required: true })),
       field(t('port'), h('input', { name: 'port', type: 'number', min: 1, max: 65535, value: c.port })),
-      field(t('rdp_user'), h('input', { name: 'user', value: c.user || '', autocomplete: 'off', placeholder: t('user_forms') })),
-      field(t('domain'), h('input', { name: 'domain', value: c.domain || '', autocomplete: 'off' }))),
-    // RemoteApp: unfolded for a connection with a program, folded for a desktop one; the user folds or unfolds it
-    h('details', { class: 'rail-fields', open: !!c.app }, h('summary', {}, t('remote_app_section')),
-      h('div', { class: 'cols' },
-        field(t('remote_app'), h('input', { name: 'app', value: appName(c.app), maxlength: 260, autocomplete: 'off', placeholder: t('app_placeholder') }), t('app_hint')),
-        field(t('app_args'), h('input', { name: 'app_args', value: c.app_args || '', maxlength: 1000, autocomplete: 'off' })))),
-    admin || owner ? h('p', { class: 'small muted' }, t(admin ? 'admin_pw_note' : 'owner_pw_note'))
-      : S.user.save_passwords ? field(t('rdp_password'), h('input', { name: 'password', type: 'password', autocomplete: 'new-password', placeholder: c.has_pass ? t('pw_saved') : t('pw_none') }), t('pw_warn'))
-      : h('p', { class: 'small muted' }, t('pw_not_allowed')),
-    c.has_pass && check(t('forget_pw'), { name: 'forget' }),
+      field(t('rdp_user'), h('input', { name: 'user', value: c.user || '', autocomplete: 'off', placeholder: t('user_forms') }), admin ? t('user_var_hint') : null),
+      field(t('domain'), h('input', { name: 'domain', value: c.domain || '', autocomplete: 'off' })),
+      // the password beside the user and the domain (two columns wide where they fit)
+      !occasional && h('div', { class: 'conn-pw' },
+        admin || owner ? h('p', { class: 'small muted' }, t(admin ? 'admin_pw_note' : 'owner_pw_note'))
+          : S.user.save_passwords ? field(t('rdp_password'), h('input', { name: 'password', type: 'password', autocomplete: 'new-password', placeholder: c.has_pass ? t('pw_saved') : t('pw_none') }), t('pw_warn'))
+            : h('p', { class: 'small muted' }, t(S.user.no_key ? 'pw_no_key' : 'pw_not_allowed')),
+        c.has_pass && check(t('forget_pw'), { name: 'forget' }))),
+    // the folded sections side by side where they fit
+    h('div', { class: 'conn-sections' },
+      // RemoteApp: unfolded for a connection with a program, folded for a desktop one; the user folds or unfolds it
+      h('details', { class: 'rail-fields', open: !!c.app }, h('summary', {}, t('remote_app_section')),
+        h('div', { class: 'cols' },
+          field(t('remote_app'), h('input', { name: 'app', value: appName(c.app), maxlength: 260, autocomplete: 'off', placeholder: t('app_placeholder') }), t('app_hint')),
+          field(t('app_args'), h('input', { name: 'app_args', value: c.app_args || '', maxlength: 1000, autocomplete: 'off' })))),
+      // Hyper-V: the console of a virtual machine of the host (unfolded when the connection has one)
+      h('details', { class: 'vm-fields', open: !!c.vm }, h('summary', {}, t('vm_section')),
+        field(t('vm_id'), h('input', { name: 'vm', value: c.vm || '', maxlength: 38, autocomplete: 'off', spellcheck: 'false', placeholder: '12345678-9ABC-DEF0-1234-56789ABCDEF0' })),
+        check(t('vm_enhanced'), { name: 'vm_enhanced', checked: !!c.vm_enhanced }),
+        h('small', { class: 'muted' }, t('vm_hint'))),
+      // a connection broker's load balance info and a Remote Desktop Gateway: unfolded when the connection has either
+      h('details', { class: 'farm-fields', open: !!(c.lb || c.gw) }, h('summary', {}, t('farm_section')),
+        h('div', { class: 'cols' },
+          field(t('gw_host'), h('input', { name: 'gw', value: c.gw || '', maxlength: 260, autocomplete: 'off', spellcheck: 'false', placeholder: t('gw_placeholder') }), t('gw_hint')),
+          field(t('lb_info'), h('input', { name: 'lb', value: c.lb || '', maxlength: 238, autocomplete: 'off', spellcheck: 'false', placeholder: t('lb_placeholder') }), t('lb_hint')))),
+      // Wake-on-LAN: unfolded when the connection has a MAC address
+      h('details', { class: 'wol-fields', open: !!c.wol }, h('summary', {}, t('wol_section')),
+        h('div', { class: 'cols' },
+          field(t('wol_mac'), h('input', { name: 'wol', value: c.wol || '', maxlength: 17, autocomplete: 'off', spellcheck: 'false', placeholder: 'AA:BB:CC:DD:EE:FF' })),
+          field(t('wol_ip'), h('input', { name: 'wol_ip', value: c.wol_ip || '', maxlength: 21, autocomplete: 'off', spellcheck: 'false', placeholder: '255.255.255.255' }))),
+        h('small', { class: 'muted' }, t('wol_hint')))),
     admin && usersPick(admin.users, admin.assigned),
     h('details', {}, h('summary', {}, t('advanced')),
-      h('div', { class: 'cols' },
+      h('div', { class: 'cols conn-selects' },
         field(t('keyboard'), select('kbd', kb, c.kbd)),
         field(t('color'), select('bpp', { 16: t('bpp16'), 15: t('bpp15'), 24: t('bpp24'), 32: t('bpp32') }, c.bpp)),
         field(t('gfx'), select('gfx', GFX_MODES(), c.gfx)),
         field(t('security'), select('security', { auto: t('sec_auto'), nla: t('sec_nla'), tls: t('sec_tls') }, c.security)),
-        field(t('resize'), select('resize', { dynamic: t('resize_dynamic'), fit: t('resize_fit') }, c.resize))),
-      check(t('clipboard'), { name: 'clipboard', checked: c.clipboard }),
-      field([t('paste_typing'), ' ', infoBtn(pasteInfo)], select('paste', PASTE_MODES(), c.paste || 'auto'), t('paste_hint')),
-      check(t('drive'), { name: 'drive', checked: c.drive }),
-      check(t('audio'), { name: 'audio', checked: c.audio }),
-      check(t('mic'), { name: 'mic', checked: !!c.mic }),
-      check(t('printer'), { name: 'printer', checked: c.printer }),
-      check(t('ask'), { name: 'ask', checked: c.ask }),
+        field(t('resize'), select('resize', { dynamic: t('resize_dynamic'), fit: t('resize_fit') }, c.resize)),
+        // (two columns wide where they fit: its choices are the longest)
+        h('div', { class: 'conn-paste' }, field([t('paste_typing'), ' ', infoBtn(pasteInfo)], select('paste', PASTE_MODES(), c.paste || 'auto'), t('paste_hint')))),
+      h('div', { class: 'conn-checks' },                // in columns, each box with its note
+        check(t('clipboard'), { name: 'clipboard', checked: c.clipboard }),
+        check(t('drive'), { name: 'drive', checked: c.drive }),
+        check(t('audio'), { name: 'audio', checked: c.audio }),
+        check(t('mic'), { name: 'mic', checked: !!c.mic }),
+        check(t('printer'), { name: 'printer', checked: c.printer }),
+        h('div', {}, check(t('touch_multi'), { name: 'touch', checked: !!c.touch }), h('small', { class: 'muted' }, t('touch_multi_hint'))),
+        (admin || owner) && h('div', {}, check(t('record'), { name: 'record', checked: !!c.record }), h('small', { class: 'muted' }, t('record_hint'))),
+        !occasional && check(t('ask'), { name: 'ask', checked: c.ask })),
       h('p', { class: 'muted small', style: 'margin:.8rem 0 .4rem' }, t('perf')),
-      h('div', { class: 'cols' }, ['wallpaper', 'themes', 'smoothing', 'animations', 'drag'].map((k) => check(t('perf_' + k), { name: 'perf_' + k, checked: c.perf?.[k] }))),
+      h('div', { class: 'cols conn-perf' }, ['wallpaper', 'themes', 'smoothing', 'animations', 'drag'].map((k) => check(t('perf_' + k), { name: 'perf_' + k, checked: c.perf?.[k] }))),
       c.id && !admin && !owner && field(t('cert'), h('div', { class: 'row' }, h('span', { class: 'mono small' }, c.cert || t('cert_none')),
-        c.cert && btn(t('forget_cert'), (e) => attempt(async () => { await api('conns.forget_cert', { id: c.id }); e.target.closest('.row').firstChild.textContent = t('cert_none'); }), 'small')))),
+        (c.cert || Object.keys(c.certs || {}).length > 0) && btn(t('forget_cert'), (e) => attempt(async () => { await api('conns.forget_cert', { id: c.id }); e.target.closest('.row').firstChild.textContent = t('cert_none'); }), 'small')))),
     err);
   if (locked) form.querySelectorAll('input,select').forEach((el) => { if (!['password', 'forget'].includes(el.getAttribute('name'))) el.disabled = true; });
+  else if (keepTarget) form.querySelectorAll('input,select').forEach((el) => { if (['host', 'port', 'user', 'domain', 'security', 'vm', 'wol', 'wol_ip', 'gw', 'lb'].includes(el.getAttribute('name'))) el.disabled = true; });
   let saving = false;
-  return modal((c.name || t('new_conn')) + (owner ? ' · ' + owner : ''), form, (close) => [
+  const values = (d) => ({
+    id: c.id, name: d.name, group: d.group, host: d.host ?? c.host, port: +(d.port ?? c.port), user: d.user ?? c.user, domain: d.domain ?? c.domain, kbd: +d.kbd, bpp: +d.bpp,
+    security: d.security ?? c.security, resize: d.resize, clipboard: !!d.clipboard, paste: d.paste, drive: !!d.drive, audio: !!d.audio, mic: !!d.mic, printer: !!d.printer, gfx: d.gfx, ask: occasional || !!d.ask,
+    app: d.app || '', app_args: d.app_args || '', touch: !!d.touch, wol: (d.wol ?? c.wol ?? '').trim(), wol_ip: (d.wol_ip ?? c.wol_ip ?? '').trim(), vm: (d.vm ?? c.vm ?? '').trim(), vm_enhanced: !!d.vm_enhanced, gw: (d.gw ?? c.gw ?? '').trim(), lb: (d.lb ?? c.lb ?? '').trim(),
+    record: !!d.record,                                   // (only the administrator's editor has it: the gateway keeps it for the user's own)
+    perf: Object.fromEntries(['wallpaper', 'themes', 'smoothing', 'animations', 'drag'].map((k) => [k, !!d['perf_' + k]])),
+  });
+  // a manual connection: kept in the web session by the gateway, its session opened in a new tab (that tab opened in the
+  // click itself: one opened once the answer came would be blocked as a pop-up)
+  const connectNow = () => {
+    if (saving || !form.reportValidity()) return;
+    const tab = window.open('', '_blank');
+    if (tab) tab.opener = null;
+    saving = true;
+    attempt(async () => {
+      try {
+        const r = await api('conns.occasional', { conn: values(formData(form)) });
+        const url = new URL('#/s/' + r.conn.id, location.href).href;
+        if (tab) tab.location.href = url;
+        else location.href = url;
+        close(true);
+      } catch (e) {
+        tab?.close();
+        throw e;
+      } finally {
+        saving = false;
+      }
+    }, err);
+  };
+  let close = () => {};
+  return modal(occasional ? t('occasional_conn') : (c.name || t('new_conn')) + (owner ? ' · ' + owner : ''), form, (closeIt) => (close = closeIt, [
     btn(t('cancel'), () => close(false)),
-    btn(t('save'), () => {
+    occasional ? btn(t('connect'), connectNow, 'primary') : btn(t('save'), () => {
       if (saving || !form.reportValidity()) return;      // a double click saved a new connection twice
       const d = formData(form);
       const once = (f) => { saving = true; attempt(async () => { try { await f(); } finally { saving = false; } }, err); };
@@ -671,19 +860,14 @@ function editConn(c, keyboards, opts = {}) {
         once(async () => { await api('conns.save', { conn: { id: c.id, password } }); toast(t('saved')); close(true); });
         return;
       }
-      const conn = {
-        id: c.id, name: d.name, group: d.group, host: d.host, port: +d.port, user: d.user, domain: d.domain, kbd: +d.kbd, bpp: +d.bpp,
-        security: d.security, resize: d.resize, clipboard: !!d.clipboard, paste: d.paste, drive: !!d.drive, audio: !!d.audio, mic: !!d.mic, printer: !!d.printer, gfx: d.gfx, ask: !!d.ask,
-        app: d.app || '', app_args: d.app_args || '',
-        perf: Object.fromEntries(['wallpaper', 'themes', 'smoothing', 'animations', 'drag'].map((k) => [k, !!d['perf_' + k]])),
-      };
+      const conn = values(d);
       if (d.password) conn.password = d.password;
       else if (d.forget && !owner) conn.password = '';
       const users = admin && (d.all_users ? ['*'] : admin.users.filter((u) => d['u_' + u.id]).map((u) => u.id));
       const save = opts.save ? () => opts.save(conn, admin ? users : !!d.forget) : () => api('conns.save', { conn });
       once(async () => { await save(); toast(t('saved')); close(true); });
     }, 'primary'),
-  ]);
+  ]));
 }
 /** Who sees a connection of the administrator: every user (also those created later), or the ones ticked. */
 function usersPick(users, assigned) {
@@ -1568,9 +1752,9 @@ function viewProfile() {
     h('h1', {}, t('profile')),
     needSecond() && h('p', { class: 'warn banner', role: 'alert' }, t('twofa_needed')),
     h('div', { class: 'card' }, h('h2', {}, t('language')), langSel),
-    h('div', { class: 'card' }, h('h2', {}, t('twofa')), twofa),
-    h('div', { class: 'card' }, h('h2', {}, t('passkeys')), passkeys),
-    h('div', { class: 'card' }, h('h2', {}, t('change_password')), passwordForm(() => {})),
+    u.source !== 'oidc' && h('div', { class: 'card' }, h('h2', {}, t('twofa')), twofa),
+    u.source !== 'oidc' && h('div', { class: 'card' }, h('h2', {}, t('passkeys')), passkeys),
+    h('div', { class: 'card' }, h('h2', {}, t('change_password')), u.source ? h('p', { class: 'muted' }, t('password_external_' + u.source)) : passwordForm(() => {})),
     profileActivity());
 }
 
@@ -1605,8 +1789,8 @@ function profileActivity() {
 // ------------------------------------------------------------------ administration
 
 function viewAdmin(tab) {
-  tab = tab || 'users';
-  const tabs = ['users', 'conns', 'settings', 'sessions', 'audit', 'traces'];
+  const tabs = S.user.role === 'auditor' ? ['audit', 'sessions'] : ['users', 'conns', 'settings', 'sessions', 'audit', 'traces'];
+  tab = tabs.includes(tab) ? tab : tabs[0];
   const body = { users: adminUsers, conns: adminConns, settings: adminSettings, sessions: adminSessions, audit: adminAudit, traces: adminTraces }[tab] || adminUsers;
   return h('div', {}, h('h1', {}, t('nav_admin')),
     h('nav', { class: 'tabs' }, tabs.map((k) => h('a', { href: '#/admin/' + k, class: k === tab ? 'active' : '' }, t(k)))),
@@ -1620,7 +1804,7 @@ function adminUsers() {
     fill(box, h('table', { class: 'list' },
       h('thead', {}, h('tr', {}, [t('username'), t('role'), t('enabled'), '2FA', t('last_login'), ''].map((x) => h('th', {}, x)))),
       h('tbody', {}, users.map((u) => h('tr', {},
-        h('td', {}, u.username), h('td', {}, t('role_' + u.role)),
+        h('td', {}, u.username, u.source && [' ', h('span', { class: 'badge', title: t('source_' + u.source) }, u.source === 'ad' ? 'Windows' : 'OIDC')]), h('td', {}, t('role_' + u.role)),
         h('td', {}, h('span', { class: 'badge' + (u.enabled ? ' on' : '') }, u.enabled ? t('yes') : t('no'))),
         h('td', {}, u.totp || u.passkeys.length ? h('span', { class: 'badge on' }, [u.totp && 'TOTP', u.passkeys.length && t('passkeys')].filter(Boolean).join(' + ')) : ''),
         h('td', { class: 'small muted' }, fmtDate(u.last_login)),
@@ -1667,10 +1851,25 @@ function adminConns() {
   };
   const importer = rdpPicker((files) => data && importRdp(files, (c, notes) => managed(c, notes), (conn) => api('admin.conn.save', { conn, users: [] }))
     .then(() => { if (files.length > 1) toast(t('rdp_imported_admin'), false, 8000); load(); }));
+  const csv = h('input', { type: 'file', accept: '.csv,text/csv', class: 'hidden' });
+  csv.addEventListener('change', () => { const f = csv.files[0]; csv.value = ''; if (f) importCsv(f).then(load); });
   load();
   return h('div', {}, h('div', { class: 'toolbar' }, h('span', { class: 'spacer' }),
+    btn(t('import_csv'), () => csv.click(), '', 'upload', t('import_csv_hint')), csv,
     btn(t('import_rdp'), () => importer.click(), '', 'upload', t('import_rdp_hint')), importer,
     btn(t('new_conn'), () => data && managed(null), 'primary', 'plus')), box);
+}
+
+/** Sign-in hours of a user: the days and a span of time, in the time zone of the settings (not for administrators). */
+function hoursCard(hrs) {
+  return h('div', { class: 'card', style: 'margin-top:1rem' },
+    h('h3', {}, t('hours_h')),
+    check(t('hours_only'), { name: 'hours_on', checked: !!hrs }),
+    h('div', { class: 'row', style: 'flex-wrap:wrap' }, [1, 2, 3, 4, 5, 6, 7].map((d) => check(t('day_' + d), { name: 'day_' + d, checked: hrs ? hrs.days.includes(d) : d <= 5 }))),
+    h('div', { class: 'cols' },
+      field(t('hours_from'), h('input', { name: 'hours_from', type: 'time', value: hrs?.from || '08:00' })),
+      field(t('hours_to'), h('input', { name: 'hours_to', type: 'time', value: hrs?.to || '18:00' }))),
+    h('small', { class: 'muted' }, t('hours_help')));
 }
 
 function editUser(u) {
@@ -1681,7 +1880,10 @@ function editUser(u) {
     field(t('max_sessions'), h('input', { name: 'max_sessions', type: 'number', min: 0, max: 50, value: u?.max_sessions ?? 0 })),
     check(t('enabled'), { name: 'enabled', checked: u ? u.enabled : true }),
     check(t('admin_rights'), { name: 'admin', checked: u?.role === 'admin' }),   // several administrators can be
-    u && h('div', { class: 'card', style: 'margin-top:1rem' },
+    check(t('auditor_rights'), { name: 'auditor', checked: u?.role === 'auditor' }), h('small', { class: 'muted' }, t('auditor_help')),
+    hoursCard(u?.hours),
+    u && u.source && h('p', { class: 'small muted', style: 'margin-top:1rem' }, t('source_' + u.source)),
+    u && !u.source && h('div', { class: 'card', style: 'margin-top:1rem' },
       h('h3', {}, t('reset_password')), h('p', { class: 'small muted' }, t('reset_warning')),
       h('div', { class: 'row' }, h('input', { id: 'np', type: 'text', placeholder: t('temp_password'), autocomplete: 'off', style: 'flex:1' }),
         btn(t('reset_password'), () => attempt(async () => { await api('admin.user.password', { id: u.id, password: document.getElementById('np').value }); toast(t('saved')); }, err))),
@@ -1689,15 +1891,19 @@ function editUser(u) {
     err);
   return modal(u ? u.username : t('new_user'), form, (close) => [btn(t('cancel'), () => close(false)), btn(t('save'), () => {
     if (!form.reportValidity()) return;
-    const { admin, ...d } = formData(form);
-    attempt(async () => { await api('admin.user.save', { id: u?.id, ...d, role: admin ? 'admin' : 'user', enabled: !!d.enabled, max_sessions: +d.max_sessions }); toast(t('saved')); close(true); }, err);
+    const { admin, auditor, hours_on: hoursOn, hours_from: from, hours_to: to, ...d } = formData(form);
+    const days = [1, 2, 3, 4, 5, 6, 7].filter((i) => d['day_' + i]);
+    for (let i = 1; i <= 7; i++) delete d['day_' + i];
+    const hours = hoursOn ? { days, from, to } : null;
+    attempt(async () => { await api('admin.user.save', { id: u?.id, ...d, role: admin ? 'admin' : auditor ? 'auditor' : 'user', enabled: !!d.enabled, max_sessions: +d.max_sessions, hours }); toast(t('saved')); close(true); }, err);
   }, 'primary')]);
 }
 
 function adminSettings() {
   const box = h('div', {}, t('loading'));
   attempt(async () => {
-    const { settings: s } = await api('admin.settings');
+    const { settings: s, server_timezone: serverTz, oidc_redirect: oidcRedirect } = await api('admin.settings');
+    const zones = typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : [];
     const err = errBox();
     const list = (k) => h('div', { class: 'card' }, h('h2', {}, t(k + '_list')),
       h('div', { class: 'row', style: 'margin-bottom:.6rem' },
@@ -1706,20 +1912,48 @@ function adminSettings() {
       h('textarea', { name: k + '_list', rows: 5, class: 'mono', spellcheck: 'false' }, s[k].list.join('\n')),
       h('small', { class: 'muted' }, t('list_hint')));
     const nums = ['login_max_attempts', 'login_lock_minutes', 'login_global_max', 'session_idle_minutes', 'rdp_idle_minutes', 'max_sessions_per_user', 'max_sessions_total',
-      'reconnect_attempts', 'audit_retention_days', 'files_quota_mb'];
+      'reconnect_attempts', 'audit_retention_days', 'files_quota_mb', 'record_days'];
     const help = { max_sessions_total: t('s_max_sessions_total_help') };
     const form = h('form', { onsubmit: (e) => e.preventDefault() },
       list('clients'), list('targets'),
       h('div', { class: 'card' }, h('div', { class: 'cols' }, nums.map((k) => field(t('s_' + k), h('input', { name: k, type: 'number', value: s[k] }), help[k]))),
         check(t('s_totp_required'), { name: 'totp_required', checked: s.totp_required }),
         check(t('s_trace_all'), { name: 'trace_all', checked: s.trace_all }),
-        check(t('s_save_passwords'), { name: 'save_passwords', checked: s.save_passwords }), h('small', { class: 'muted' }, t('s_save_passwords_help'))),
+        check(t('s_save_passwords'), { name: 'save_passwords', checked: s.save_passwords }), h('small', { class: 'muted' }, t('s_save_passwords_help')),
+        check(t('s_users_create_conns'), { name: 'users_create_conns', checked: !!s.users_create_conns }), h('small', { class: 'muted' }, t('s_users_create_conns_help')),
+        check(t('s_kerberos_rc4'), { name: 'kerberos_rc4', checked: !!s.kerberos_rc4 }), h('small', { class: 'warn' }, t('s_kerberos_rc4_help')),
+        field(t('s_timezone'), h('input', { name: 'timezone', value: s.timezone, list: 'tz-list', placeholder: serverTz, autocomplete: 'off', spellcheck: 'false' }), t('s_timezone_help', serverTz)),
+        h('datalist', { id: 'tz-list' }, zones.map((z) => h('option', { value: z })))),
+      h('div', { class: 'card' }, h('h2', {}, t('sso_h')),
+        h('h3', {}, t('oidc_h')), h('p', { class: 'small muted' }, t('oidc_help')),
+        field(t('oidc_redirect'), h('input', { value: oidcRedirect || '', readonly: true, class: 'mono', onfocus: (e) => e.target.select() })),
+        h('div', { class: 'cols' },
+          field(t('oidc_issuer'), h('input', { name: 'oidc_issuer', value: s.oidc_issuer || '', placeholder: 'https://login.microsoftonline.com/…/v2.0', autocomplete: 'off', spellcheck: 'false' })),
+          field(t('oidc_client_id'), h('input', { name: 'oidc_client_id', value: s.oidc_client_id || '', autocomplete: 'off', spellcheck: 'false' })),
+          field(t('oidc_secret'), h('input', { name: 'oidc_secret', type: 'password', autocomplete: 'new-password', placeholder: s.oidc_secret_set ? t('pw_saved') : '' })),
+          field(t('oidc_label'), h('input', { name: 'oidc_label', value: s.oidc_label || '', maxlength: 40, placeholder: 'Microsoft' })),
+          field(t('oidc_claim'), select('oidc_claim', { email: t('oidc_claim_email'), preferred_username: t('oidc_claim_username') }, s.oidc_claim || 'email')),
+          field(t('oidc_domains'), h('input', { name: 'oidc_domains', value: (s.oidc_domains || []).join(' '), placeholder: 'empresa.com', autocomplete: 'off', spellcheck: 'false' }))),
+        check(t('oidc_create'), { name: 'oidc_create', checked: !!s.oidc_create }),
+        h('h3', {}, t('ad_h')), h('p', { class: 'small muted' }, t('ad_help')),
+        h('div', { class: 'cols' },
+          field(t('ad_host'), h('input', { name: 'ad_host', value: s.ad_host || '', placeholder: 'servidor.empresa.local', autocomplete: 'off', spellcheck: 'false' })),
+          field(t('port'), h('input', { name: 'ad_port', type: 'number', min: 1, max: 65535, value: s.ad_port || 3389 })),
+          field(t('ad_domain'), h('input', { name: 'ad_domain', value: s.ad_domain || '', placeholder: 'EMPRESA', autocomplete: 'off', spellcheck: 'false' }))),
+        check(t('ad_create'), { name: 'ad_create', checked: !!s.ad_create }),
+        s.ad_host && field(t('ad_cert'), h('div', { class: s.ad_cert ? 'mono small' : 'small error' }, s.ad_cert || t('ad_cert_none')), t('ad_cert_help')),
+        s.ad_host && check(t('ad_repin'), { name: 'ad_repin' })),
       err, btn(t('save'), () => {
         const d = formData(form);
         const lines = (k) => d[k + '_list'].split(/[\r\n,]+/).map((x) => x.trim()).filter(Boolean);
         const settings = {
           clients: { mode: d.clients_mode, list: lines('clients') }, targets: { mode: d.targets_mode, list: lines('targets') },
-          totp_required: !!d.totp_required, trace_all: !!d.trace_all, save_passwords: !!d.save_passwords,
+          totp_required: !!d.totp_required, trace_all: !!d.trace_all, save_passwords: !!d.save_passwords, users_create_conns: !!d.users_create_conns,
+          kerberos_rc4: !!d.kerberos_rc4,
+          timezone: (d.timezone || '').trim(),
+          oidc_issuer: d.oidc_issuer.trim(), oidc_client_id: d.oidc_client_id.trim(), oidc_secret: d.oidc_secret, oidc_label: d.oidc_label.trim(),
+          oidc_claim: d.oidc_claim, oidc_domains: d.oidc_domains.split(/[\s,;]+/).filter(Boolean), oidc_create: !!d.oidc_create,
+          ad_host: d.ad_host.trim(), ad_port: +d.ad_port, ad_domain: d.ad_domain.trim(), ad_create: !!d.ad_create, ad_repin: !!d.ad_repin,
           ...Object.fromEntries(nums.map((k) => [k, +d[k]])),
         };
         attempt(async () => {
@@ -1743,7 +1977,7 @@ function adminSessions() {
       h('thead', {}, h('tr', {}, [t('username'), t('conn_name'), t('host'), t('origin'), t('started'), ''].map((x) => h('th', {}, x)))),
       h('tbody', {}, sessions.map((s) => h('tr', {}, h('td', {}, s.user), h('td', {}, s.conn), h('td', { class: 'mono small' }, s.host),
         h('td', { class: 'mono small' }, s.ip), h('td', { class: 'small' }, fmtDate(s.started)),
-        h('td', { style: 'text-align:right' }, btn(t('terminate'), () => attempt(async () => { await api('admin.sessions.kill', { sid: s.sid }); setTimeout(load, 1500); }), 'small danger')))))) : h('p', { class: 'muted' }, t('no_sessions')));
+        h('td', { style: 'text-align:right' }, S.user.role === 'admin' && btn(t('terminate'), () => attempt(async () => { await api('admin.sessions.kill', { sid: s.sid }); setTimeout(load, 1500); }), 'small danger')))))) : h('p', { class: 'muted' }, t('no_sessions')));
   });
   load();
   return h('div', {}, h('div', { class: 'toolbar' }, h('span', { class: 'spacer' }), btn('', load, 'small', 'refresh')), box);
@@ -1767,7 +2001,8 @@ function adminAudit() {
     const { _d, _n, ...rec } = r;
     modal(r.event, h('div', {}, bad.has(_d + ':' + _n) && h('p', { class: 'error' }, t('audit_' + bad.get(_d + ':' + _n))),
       h('pre', { class: 'mono small audit-json' }, JSON.stringify(rec, null, 2)), h('p', { class: 'small muted' }, `${_d} · #${_n}`)),
-      (close) => [btn(t('close'), () => close())]);
+      (close) => [r.recording && r.sid && btn(t('rec_play'), () => { close(); location.hash = '#/rec/' + r.sid; }, 'primary', 'play'),
+        btn(t('close'), () => close())].filter(Boolean));
   };
   const brief = (r) => Object.entries(r).filter(([k]) => !['t', 'ip', 'user', 'event', 'ok', 'ua', 'ws', 'p', 'h', '_d', '_n'].includes(k))
     .map(([k, v]) => k + '=' + (v !== null && typeof v === 'object' ? JSON.stringify(v) : v)).join(' ');
@@ -1775,9 +2010,11 @@ function adminAudit() {
     h('thead', {}, h('tr', {}, [t('when'), t('username'), 'IP', t('event'), t('details')].map((x) => h('th', {}, x)))),
     h('tbody', {}, rows.map((r) => {
       const why = bad.get(r._d + ':' + r._n);
-      return h('tr', { class: why ? 'tampered' : '', title: why ? t('audit_' + why) : '', onclick: () => detail(r) },
+      return h('tr', { class: why ? 'tampered' : '', title: why ? t('audit_' + why) : '', tabindex: 0, onclick: () => detail(r),
+        onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); detail(r); } } },
         h('td', { class: 'small nowrap' }, fmtDate(r.t)), h('td', {}, r.user || ''), h('td', { class: 'mono small nowrap' }, r.ip),
-        h('td', { class: 'nowrap' }, h('span', { class: 'badge' + (r.ok === true ? ' on' : r.ok === false ? ' fail' : '') }, r.event)),
+        h('td', { class: 'nowrap' }, h('span', { class: 'badge' + (r.ok === true ? ' on' : r.ok === false ? ' fail' : '') }, r.event),
+          r.recording && r.sid && [' ', h('span', { class: 'badge rec', title: t('rec_play') }, t('rec_conn'))]),
         h('td', { class: 'mono small audit-brief' }, brief(r)));
     })))
     : h('p', { class: 'muted' }, t('audit_none')),
@@ -1872,7 +2109,8 @@ async function viewSession(id) {
   document.title = t('app');
   fill(app, h('div', { class: 'center muted' }, t('loading')));
   const data = await attempt(() => api('conns.list'));
-  const conn = data?.conns.find((c) => c.id === id);
+  if (route().view !== 's' || route().arg !== id) return;         // the user went elsewhere meanwhile
+  const conn = data?.conns.find((c) => c.id === id) ?? data?.occasional?.find((c) => c.id === id);   // (a manual one: of this web session)
   if (!conn) { fill(app, h('div', { class: 'center' }, h('div', { class: 'auth' }, errText('not_found')))); return; }
   document.title = conn.name + ' · ' + t('app');
 
@@ -1888,11 +2126,46 @@ async function viewSession(id) {
   const root = h('div', { class: 'session' + (conn.app ? ' rail' : '') }, canvas, keyboard, railWait, taskbar, bar, panel, overlay);
   fill(app, root);
 
+  // "Start in full screen" (connect dialog, on by default; remembered with the options): this window and, with "Use all my
+  // screens", the other screens' windows (before the session's own listeners on the canvas)
+  const fullOk = !!root.requestFullscreen;
+  const mainFull = fullOnStart(canvas, window, root, () => s.focus());
+  let startFull = false;
   const s = new RdpSession({ container: root, canvas, keyboard, conn, csrf: S.csrf, retries: S.user.reconnect ?? 10, onState });
+  // recorded by the administrator: said while the session lasts
+  const recBadge = h('div', { class: 'rec-badge hidden', role: 'status' }, t('rec_badge'));
+  root.append(recBadge);
+  s.onRecording = (on) => recBadge.classList.toggle('hidden', !on);
+  // a message of the Remote Desktop Gateway: one to accept before connecting (its consent message: declined, no connection),
+  // or one to read (a service message, also during the session). One window at a time; a text already waiting, or more than
+  // three, left out (a gateway sending many stacked windows without end); closed, as declined, when the session ends or
+  // connects again (before, a consent window answered later went to whatever session there was then)
+  let gwChain = Promise.resolve(), gwWaiting = [], gwOpen = null;
+  s.onGatewayMessage = (text, consent) => {
+    if (!consent && (gwWaiting.includes(text) || gwWaiting.length >= 3)) return Promise.resolve(true);
+    gwWaiting.push(text);
+    const shown = gwChain.then(() => modal(t('gw_msg_title'), h('p', { class: 'gw-msg' }, text), (close) => {
+      gwOpen = close;
+      return consent ? [btn(t('cancel'), () => close(false)), btn(t('gw_accept'), () => close(true), 'primary')] : [btn(t('accept'), () => close(true), 'primary')];
+    })).finally(() => { gwOpen = null; gwWaiting.splice(gwWaiting.indexOf(text), 1); });
+    gwChain = shown.catch(() => {});
+    return shown;
+  };
+  // shared with links: how many guests watch, always in sight while any does
+  const watching = h('div', { class: 'watch-badge owner hidden', role: 'status' });
+  root.append(watching);
+  let watchers = 0, shares = [], made = null, shareMode = 'view';   // the session's links; the one just made, with its address
+  s.onViewers = (n) => {
+    watchers = n;
+    fill(watching, icon('eye'), ' ', t('share_viewers', n));
+    watching.classList.toggle('hidden', !n);
+    if (panelOpen === 'share') showShare();
+  };
   let panelOpen = null, extra = {}, clip = null, savePw = null, statsTimer = 0;
   endRdp();                                              // a session left by a previous view of this page
   currentRdp = s;
   s.leave = new AbortController();                       // the window's listeners of this view go with it
+  s.leave.signal.addEventListener('abort', () => mainFull.stop());
   forgetRdp = () => { extra = {}; s.extra = {}; savePw = null; };
   const popups = screenWindows = [], clipHistory = [];  // the clipboard history lives as long as this window
   let osk = null;                                        // the on-screen keyboard, while it is shown
@@ -2048,12 +2321,53 @@ async function viewSession(id) {
             'small', 'clip', t('shot_remote_hint')))]);
   }
 
+  /** Sharing the session: links for guests without an account, to watch it or, if given, to use it too. */
+  function showShare(load = false) {
+    if (!s.sid) { fill(panel, panelHead(t('share')), h('p', { class: 'small muted' }, t('share_wait'))); return; }   // not connected yet
+    if (load) {
+      attempt(async () => { ({ shares } = await api('session.shares', { sid: s.sid })); showShare(); });
+      return;
+    }
+    const mode = h('select', { 'aria-label': t('share_mode'), onchange: () => { shareMode = mode.value; } },
+      h('option', { value: 'view', selected: shareMode === 'view' }, t('share_view')), h('option', { value: 'control', selected: shareMode === 'control' }, t('share_control')));
+    const url = (link) => location.href.split('#')[0] + '#/watch/' + link;
+    const make = () => attempt(async () => {
+      const j = await api('session.share', { sid: s.sid, mode: mode.value });
+      ({ shares } = j);
+      made = { id: j.id, url: url(j.link), mode: j.mode };
+      showShare();
+      navigator.clipboard?.writeText(made.url).then(() => toast(t('share_copied')), () => {});
+    });
+    const revoke = (id) => attempt(async () => {
+      ({ shares } = await api('session.unshare', { sid: s.sid, id }));
+      if (made?.id === id) made = null;
+      showShare();
+    });
+    fill(panel, panelHead(t('share')), h('p', { class: 'small muted' }, t('share_hint')),
+      h('div', { class: 'row' }, mode, btn(t('share_make'), make, 'small primary', 'share')),
+      made && h('div', { class: 'row share-made' }, h('input', { readonly: true, value: made.url, 'aria-label': t('share_link'), onfocus: (e) => e.target.select() }),
+        btn('', () => navigator.clipboard?.writeText(made.url).then(() => toast(t('share_copied')), () => toast(t('clip_denied'), true)), 'small', 'copy', t('copy'))),
+      h('p', { class: 'small' }, icon('eye'), ' ', t('share_viewers', watchers)),
+      shares.length ? h('ul', { class: 'share-list' }, shares.map((x) => h('li', {},
+        h('span', { class: 'spacer' }, t(x.mode === 'control' ? 'share_control' : 'share_view'), h('span', { class: 'small muted' }, ' · ', fmtDate(x.created))),
+        btn(t('share_revoke'), () => revoke(x.id), 'small danger', 'x'))))
+        : h('p', { class: 'small muted' }, t('share_none')));
+  }
+
   function showFiles() {
-    const input = h('input', { type: 'file', multiple: true, class: 'hidden', onchange: () => { clip.sendFiles([...input.files]); input.value = ''; } });
+    const input = clip && h('input', { type: 'file', multiple: true, class: 'hidden', onchange: () => { clip.sendFiles([...input.files]); input.value = ''; } });
+    const f = s.folder;
     fill(panel, panelHead(t('files_panel')),
-      h('div', { class: 'drop-zone', 'data-drop': t('drop_files_here') },
+      clip && h('div', { class: 'drop-zone', 'data-drop': t('drop_files_here') },
         h('p', { class: 'small muted' }, t('send_files_hint')), btn(t('send_files'), () => input.click(), 'small primary', 'upload'), input),
-      h('div', { style: 'margin-top:1rem' }, clip.filesView()));
+      clip && h('div', { style: 'margin-top:1rem' }, clip.filesView()),
+      // a folder of this computer as a drive there: chosen here, while the session runs
+      f && h('div', { style: clip ? 'margin-top:1rem' : '' }, h('h3', {}, t('local_folder_h')),
+        f.shared
+          ? [h('p', { class: 'small' }, t('local_folder_on', f.name), f.readonly ? ' ' + t('local_folder_ro') : ''),
+            btn(t('local_folder_stop'), () => f.stop(), 'small', 'x')]
+          : [h('p', { class: 'small muted' }, t(LocalFolder.writable() ? 'local_folder_hint' : 'local_folder_hint_ro')),
+            btn(t('local_folder_pick'), () => f.pick().catch(() => toast(t('local_folder_failed'), true)), 'small primary', 'folder')]));
   }
   /** The files of a drop; folders are left out (the clipboard takes files only) and said so. */
   function dropFiles(dt) {
@@ -2087,22 +2401,35 @@ async function viewSession(id) {
     const c = d.createElement('canvas');
     c.style.cssText = 'display:block;touch-action:none';   // its size: in proportion to the window (RdpSession.addView)
     const k = d.createElement('textarea');
+    const full = fullOnStart(c, w, d.documentElement, () => k.focus({ preventScroll: true }));
     k.style.cssText = 'position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;border:0;padding:0;font-size:16px';
+    // the look of the session's toolbar (app.css, .bar): its dark bar and its icon buttons, set here (this window has no
+    // style sheet, and its hover by the pointer's events: an inline style element would break the page's CSP)
     const bar = d.createElement('div');
     bar.className = 'screen-bar';
-    bar.style.cssText = 'position:fixed;top:0;left:50%;z-index:2;display:flex;gap:8px;padding:8px;background:rgba(15,20,29,.9);'
-      + 'border-radius:0 0 10px 10px;box-shadow:0 4px 16px rgba(0,0,0,.4);transform:translateX(-50%);transition:transform .2s';
-    const button = (cls, f) => {
+    bar.style.cssText = 'position:fixed;top:0;left:50%;z-index:2;display:flex;gap:3px;align-items:center;padding:5px 6px;'
+      + 'background:rgba(20,26,38,.92);color:#fff;border-radius:0 0 12px 12px;box-shadow:0 4px 18px rgba(0,0,0,.4);transform:translateX(-50%);transition:transform .2s';
+    const coarse = !!w.matchMedia?.('(pointer: coarse)')?.matches;   // (as the toolbar: larger on a touch screen)
+    const button = (cls, ic, title, f) => {
       const b = d.createElement('button');
       b.type = 'button';
       b.className = cls;
-      b.style.cssText = 'padding:8px 14px;font:14px system-ui;border:0;border-radius:6px;cursor:pointer;background:#fff;color:#111';
+      b.setAttribute('title', title);
+      b.setAttribute('aria-label', title);
+      b.style.cssText = `display:grid;place-items:center;padding:${coarse ? 9 : 6}px;border:0;border-radius:8px;background:transparent;color:#fff;cursor:pointer`;
+      const svg = icon(ic);
+      svg.style.width = svg.style.height = (coarse ? 24 : 20) + 'px';
+      b.append(svg);
+      b.addEventListener('pointerenter', () => { b.style.background = 'rgba(255,255,255,.15)'; });
+      b.addEventListener('pointerleave', () => { b.style.background = 'transparent'; });
       b.addEventListener('click', () => { f(); k.focus({ preventScroll: true }); });
       return b;
     };
-    const fs = button('fs', () => (d.fullscreenElement ? d.exitFullscreen() : d.documentElement.requestFullscreen())?.catch?.(() => {}));
-    const shut = button('close', () => w.close());          // its monitor leaves the remote desktop (pagehide)
-    shut.textContent = t('close_this_screen');
+    const fs = button('fs', 'full', t('fullscreen'), () => {
+      full.settle();
+      (d.fullscreenElement ? d.exitFullscreen() : d.documentElement.requestFullscreen())?.catch?.(() => {});
+    });
+    const shut = button('close', 'x', t('close_this_screen'), () => w.close());   // its monitor leaves the remote desktop (pagehide)
     bar.append(fs, shut);
     let tuck = 0;
     const show = (ms) => {                                  // shown; tucked away after ms (0: kept while the pointer is on it)
@@ -2110,7 +2437,11 @@ async function viewSession(id) {
       w.clearTimeout(tuck);
       if (ms) tuck = w.setTimeout(() => { bar.style.transform = 'translate(-50%, -100%)'; }, ms);
     };
-    const label = () => { fs.textContent = d.fullscreenElement ? t('exit_fullscreen') : t('fullscreen'); };
+    const label = () => {
+      const l = d.fullscreenElement ? t('exit_fullscreen') : t('fullscreen');
+      fs.setAttribute('title', l);
+      fs.setAttribute('aria-label', l);
+    };
     d.addEventListener('fullscreenchange', () => { label(); show(3000); });
     d.addEventListener('pointermove', (e) => { if (e.clientY < 12) show(2500); });
     bar.addEventListener('pointerenter', () => show(0));
@@ -2124,6 +2455,7 @@ async function viewSession(id) {
     (d.head || d.body).append(watch);
     s.addView(c, k, i);
     w.addEventListener('pagehide', () => { s.removeView(c); if (panelOpen === 'screens') showScreens(); });   // its monitor goes
+    if (startFull) full.start();
   }
   /** Where a window's screen is on the desktop (Firefox: screen.left/top; Safari: availLeft/availTop) and its size. */
   const screenRect = (win) => { const sc = win.screen; return { x: sc.left ?? sc.availLeft ?? 0, y: sc.top ?? sc.availTop ?? 0, w: sc.width, h: sc.height }; };
@@ -2157,18 +2489,24 @@ async function viewSession(id) {
     popups.push(w);
     if (panelOpen === 'screens') toggle('screens', null);
   }
-  /** Without the API, "use all my screens": the other screen looked for (probeScreen); not found, its window says how. */
-  function findScreens() {
+  /**
+   * Without the API, "use all my screens": the other screen looked for (probeScreen); not found, its window says how. With
+   * full, this window in full screen too, asked for after the window opens: the click lets one new window open, and asking
+   * for full screen first takes the click (Firefox 160, as it comes, then blocked the window). Asked for right after it
+   * opens, this window is still the one in front (Firefox gives full screen only to it: allowed without a click, it gets it;
+   * as it comes, its first press).
+   */
+  function findScreens(full) {
     const [w, o] = probeScreen();
+    if (full) mainFull.start();
     if (!w) return false;
     if (!o) { screenByHand(w); return false; }
     twoScreens(w, o);
-    root.requestFullscreen?.().catch(() => {});
     return true;
   }
   /** The same once connected: found, the session reconnects with a remote monitor on each screen (see onState). */
-  function findScreensNow() {
-    if (findScreens()) { restartAll = true; s.stop(); }
+  function findScreensNow(full) {
+    if (findScreens(full)) { restartAll = true; s.stop(); }
   }
   /** Not found beside this screen: the user takes the window to the other one; its place is remembered for next time. */
   function screenByHand(w) {
@@ -2191,7 +2529,7 @@ async function viewSession(id) {
   }
   function showScreens() {
     if (!s.multi) {                                      // Firefox, Safari: the other screen looked for on request
-      fill(panel, panelHead(t('screens')), h('p', { class: 'small muted' }, t('screens_find_hint')), btn(t('screens_find'), findScreensNow, 'small primary'));
+      fill(panel, panelHead(t('screens')), h('p', { class: 'small muted' }, t('screens_find_hint')), btn(t('screens_find'), () => findScreensNow(startFull), 'small primary'));
       return;
     }
     // a screen is part of the remote desktop only while its window is open (closing it brings its windows to the others)
@@ -2288,6 +2626,15 @@ async function viewSession(id) {
     s.clipboard = clip;
     s.audio = opts.audio ? new AudioPlayer() : null;
     s.mic = opts.mic ? new MicCapture({ send: (pcm, max, frame) => s.sendMic(pcm, max, frame), onError: (k) => toast(t(k), true, 10000) }) : null;
+    // the camera with the microphone (one option): a program there that uses it turns it on (an empty picture: it could not)
+    s.cam = opts.mic ? new CamCapture({ send: (jpeg, no) => s.sendCam(jpeg, no), fail: (no) => s.sendCam(new Uint8Array(0), no), onError: (k) => toast(t(k), true, 10000) }) : null;
+    // a folder of this computer, with the shared folder's option (chosen in the Files panel)
+    s.folder = opts.drive ? new LocalFolder({
+      send: (no, b) => s.sendFolderReply(no, b),
+      list: (no, answer, rest) => s.sendFolderList(no, answer, rest),
+      onChange: () => { s.folder.shared ? s.shareFolder(s.folder.name, s.folder.readonly) : s.unshareFolder(); if (panelOpen === 'files') showFiles(); },
+      onRefused: () => toast(t('local_folder_refused'), true, 10000),
+    }) : null;
     if (s.audio || s.mic) {
       const unlock = () => { s.audio?.unlock(); s.mic?.unlock(); };   // touch screens allow sound from pointerup / touchend, not pointerdown
       for (const type of ['pointerdown', 'pointerup', 'touchend', 'keydown']) root.addEventListener(type, unlock, true);
@@ -2324,6 +2671,7 @@ async function viewSession(id) {
       h('span', { class: 'title' }, conn.name),
       stats,
       barBtn('full', t('fullscreen'), () => {
+        mainFull.settle();                               // full screen is the user's from now on
         if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); return; }
         if (!s.multi && (hasScreenApi() ? screen.isExtended : knownScreen() && !touchOnly())) { offerAllScreens(); return; }
         fullAndOthers();
@@ -2337,7 +2685,8 @@ async function viewSession(id) {
       conn.app && barBtn('rows', t('rail_windows'), () => toggle('wins', showWins), 'wins'),
       barBtn('camera', t('shot'), () => toggle('shot', showShot), 'shot'),
       clip && barBtn('clip', t('clipboard_panel'), () => toggle('clip', showClip), 'clip'),
-      clip && barBtn('folder', t('files_panel'), () => toggle('files', showFiles), 'files'),
+      (clip || s.folder) && barBtn('folder', t('files_panel'), () => toggle('files', showFiles), 'files'),
+      !conn.app && barBtn('share', t('share'), () => toggle('share', () => showShare(true)), 'share'),
       barBtn('power', t('disconnect'), () => { s.stop(); }),
       barBtn('up', t('hide_toolbar'), () => bar.classList.toggle('tucked')),
       h('button', { type: 'button', class: 'handle', 'aria-label': t('show_toolbar'), onclick: () => bar.classList.remove('tucked') }, icon('down')));
@@ -2435,50 +2784,71 @@ async function viewSession(id) {
         const d = formData(form);
         const opts = { audio: !!d.audio, mic: !!d.mic, clipboard: !!d.clipboard, paste: !!d.paste, drive: !!d.drive, printer: !!d.printer, gfx: d.gfx, bpp: +d.bpp };
         const paste = opts.paste === pasteFor('auto') ? 'auto' : opts.paste ? 'on' : 'off';   // what this device would pick stays automatic
-        if (d.remember) attempt(() => api('conns.options', { id: conn.id, opts: { ...opts, paste, ask: false } }));
+        // "use all my screens" remembered where it is offered; unticked in Firefox or Safari before the other screen was ever
+        // found (its box comes unticked then), not: ticked by default once it is
+        const multiKept = !!form.querySelector('[name=multi]') && (hasScreenApi() || !!knownScreen() || !!d.multi);
+        if (d.remember) attempt(() => api('conns.options', { id: conn.id, opts: { ...opts, paste, ...(fullOk ? { full: !!d.full } : {}), ...(multiKept ? { multi: !!d.multi } : {}), ask: false } }));
         savePw = ask && d.save_pw ? d.password : null;
-        extra = { ...extra, opts: { ...opts, trace: !!d.trace }, ...(ask ? { password: d.password, ...(d.user ? { user: d.user } : {}) } : {}) };
-        if (d.multi) await (hasScreenApi() ? useAllScreens() : findScreens());   // (without the API, a window opened in this click)
+        // all the screens (without the API, a window opened in this click, then full screen), in full screen if chosen; else
+        // this one only. First, before waiting for anything: Firefox and Safari let the click open a window or go to full
+        // screen only while it is being handled
+        startFull = fullOk && !!d.full;
+        if (d.multi && !hasScreenApi()) findScreens(startFull);
+        else if (!(d.multi && await useAllScreens(startFull)) && startFull) mainFull.start();
+        extra = { ...extra, opts: { ...opts, trace: !!d.trace }, ...(ask ? { password: d.password, ...(d.user ? { user: d.user } : {}) } : {}),
+          cam: opts.mic && await CamCapture.present() };   // (a camera offered to the remote computer only if this one has one)
         setup(opts);
         s.start(extra);
       },
     },
     h('h2', {}, conn.name), h('p', { class: 'muted small mono' }, conn.host),
-    ask && credentialFields(),
-    ask && S.user.save_passwords && check(t('save_pw'), { name: 'save_pw' }),
-    h('p', { class: 'muted small', style: 'margin:.4rem 0' }, t('connect_options')),
-    check(t('audio'), { name: 'audio', checked: conn.audio }),
-    h('div', { class: 'check-info' }, check(t('mic'), { name: 'mic', checked: !!conn.mic }), infoBtn(micInfo, t('more_info'))),
-    check(t('clipboard'), { name: 'clipboard', checked: conn.clipboard }),
-    h('div', { class: 'check-info' }, check(t('paste_typing'), { name: 'paste', checked: pasteFor(conn.paste) }), infoBtn(pasteInfo)),
-    h('small', { class: 'muted', style: 'display:block;margin:-.2rem 0 .4rem 1.6rem' }, t('paste_hint')),
-    check(t('drive'), { name: 'drive', checked: conn.drive }),
-    check(t('printer'), { name: 'printer', checked: conn.printer }),
+    conn.record && h('p', { class: 'notice small' }, t('rec_notice')),
     conn.app && h('p', { class: 'small muted' }, t('rail_session', appName(conn.app))),
-    hasScreenApi() ? screen.isExtended !== false   // only with several screens
-      && h('div', { class: 'check-info' }, check(t('all_screens'), { name: 'multi' }), infoBtn(screensInfo, t('more_info')))
-      : !touchOnly() && [h('div', { class: 'check-info' }, check(t('all_screens'), { name: 'multi', checked: !!knownScreen() }),   // Firefox, Safari: looked for
-        infoBtn(screensInfo, t('more_info'))),
-        h('p', { class: 'small muted' }, t('screens_other_browsers'))],
-    !conn.app && field(t('gfx'), select('gfx', GFX_MODES(), conn.gfx)),
-    field(t('color'), select('bpp', { 16: t('bpp16'), 15: t('bpp15'), 24: t('bpp24'), 32: t('bpp32') }, conn.bpp)),
-    check(t('remember_opts'), { name: 'remember' }),
-    h('details', { class: 'small' }, h('summary', { class: 'muted' }, t('advanced')), check(t('trace_opt'), { name: 'trace' }), h('small', { class: 'muted' }, t('trace_hint'))),
+    ask && credentialFields(),
+    ask && S.user.save_passwords && !conn.occasional && check(t('save_pw'), { name: 'save_pw' }),   // (a manual one: nothing saved)
+    // the options folded, unfolded to change them; then in two columns where the window is wide enough (one on a
+    // phone): Connect without scrolling down to it
+    h('details', { class: 'conn-more' }, h('summary', {}, t('connect_options')),
+      h('div', { class: 'conn-opts' },
+        check(t('audio'), { name: 'audio', checked: conn.audio }),
+        h('div', { class: 'check-info' }, check(t('mic'), { name: 'mic', checked: !!conn.mic }), infoBtn(micInfo, t('more_info'))),
+        check(t('clipboard'), { name: 'clipboard', checked: conn.clipboard }),
+        h('div', {}, h('div', { class: 'check-info' }, check(t('paste_typing'), { name: 'paste', checked: pasteFor(conn.paste) }), infoBtn(pasteInfo)),
+          h('small', { class: 'muted', style: 'display:block;margin:-.2rem 0 .4rem 1.6rem' }, t('paste_hint'))),
+        check(t('drive'), { name: 'drive', checked: conn.drive }),
+        check(t('printer'), { name: 'printer', checked: conn.printer }),
+        hasScreenApi() ? screen.isExtended !== false   // only with several screens
+          && h('div', { class: 'check-info' }, check(t('all_screens'), { name: 'multi', checked: conn.multi !== false }), infoBtn(screensInfo, t('more_info')))   // (on unless turned off and remembered)
+          : !touchOnly() && h('div', {}, h('div', { class: 'check-info' }, check(t('all_screens'), { name: 'multi', checked: !!knownScreen() && conn.multi !== false }),   // Firefox, Safari: looked for (on once found)
+            infoBtn(screensInfo, t('more_info'))),
+            h('p', { class: 'small muted' }, t('screens_other_browsers'))),
+        fullOk && h('div', { class: 'check-info' }, check(t('full_start'), { name: 'full', checked: conn.full !== false }),   // (on unless turned off and remembered)
+          infoBtn(fullInfo, t('more_info'))),
+        !conn.app && field(t('gfx'), select('gfx', GFX_MODES(), conn.gfx)),
+        field(t('color'), select('bpp', { 16: t('bpp16'), 15: t('bpp15'), 24: t('bpp24'), 32: t('bpp32') }, conn.bpp))),
+      !conn.occasional && check(t('remember_opts'), { name: 'remember' }),
+      h('details', { class: 'small' }, h('summary', { class: 'muted' }, t('advanced')), check(t('trace_opt'), { name: 'trace' }), h('small', { class: 'muted' }, t('trace_hint')))),
     h('button', { class: 'btn primary', style: 'width:100%' }, t('connect')));
     box(closeX(), form);
     // the first field, else Connect (not the info buttons: Enter opened the phone keyboard's explanation instead of connecting)
     (form.querySelector('input:not([type=checkbox])') || form.querySelector('button:not(.info)')).focus();
   }
-  /** Window Management API: every screen becomes a separate monitor of the remote session. */
-  /** One remote monitor per screen of this computer (asks for the browser's permission); false if there is only one or no permission. */
-  async function useAllScreens() {
+  /**
+   * Window Management API: one remote monitor per screen of this computer (asks for the browser's permission), the other
+   * screens' windows opened now, in this click; with full, every screen in full screen (before, always). False if there is
+   * only one screen or no permission.
+   */
+  async function useAllScreens(full) {
     try {
       const sd = screenDetails = await window.getScreenDetails();
       if (sd.screens.length < 2) return false;
       const pri = sd.screens.find((x) => x.isPrimary) || sd.currentScreen;
       const mons = sd.screens.map((sc) => ({ vx: sc.left - pri.left, vy: sc.top - pri.top, w: sc.width, h: sc.height, primary: sc === pri, sc }));
       s.setMonitors(mons, sd.screens.indexOf(sd.currentScreen));
-      await fullAndOthers();                             // chosen now: the other screens' windows (and monitors) at once
+      if (full) {                                        // chosen now: the other screens' windows (and monitors) at once
+        mainFull.arm();
+        await fullAndOthers();
+      } else openOthers();
       return true;
     } catch {
       toast(t('screens_denied'), true);
@@ -2494,9 +2864,13 @@ async function viewSession(id) {
   function fullAndOthers() {
     const sc = screenDetails?.currentScreen;
     const full = root.requestFullscreen?.(sc ? { screen: sc } : undefined)?.catch(() => {});   // not awaited: the windows open in this same click
-    if (s.multi) s.screens.forEach((m, i) => s.views.some((v) => v.mon === i) || openScreen(i));
+    openOthers();
     navigator.keyboard?.lock?.().catch(() => {});
     return full;
+  }
+  /** A window on each screen that has none (without full screen, Chromium lets a click open one: the rest from Screens). */
+  function openOthers() {
+    if (s.multi) s.screens.forEach((m, i) => s.views.some((v) => v.mon === i) || openScreen(i));
   }
   /** Full screen asked for on a computer with several screens, the session on one: all of them (reconnecting) or only this one. */
   function offerAllScreens() {
@@ -2504,8 +2878,9 @@ async function viewSession(id) {
       btn(t('screens_only_this'), () => { close(); root.requestFullscreen?.().catch(() => {}); }),
       btn(t('screens_use_all'), async () => {
         close();
-        if (!hasScreenApi()) findScreensNow();               // (its window opened in this click)
-        else if (await useAllScreens()) { restartAll = true; s.stop(); }
+        startFull = fullOk;                                  // full screen was asked for: the other screens' windows too
+        if (!hasScreenApi()) findScreensNow(true);           // (its window opened in this click)
+        else if (await useAllScreens(true)) { restartAll = true; s.stop(); }
       }, 'primary')]);
   }
   function askCredentials() {
@@ -2523,6 +2898,12 @@ async function viewSession(id) {
   }
   function onState(state, info) {
     overlay.classList.toggle('hidden', state === 'connected');
+    if (state === 'ended' || state === 'reconnecting') gwOpen?.(false);   // (a gateway's window of that connection)
+    if (state !== 'connected' && (watchers || shares.length || made)) {   // the links went with that connection's session
+      shares = [];
+      made = null;
+      s.onViewers(0);
+    }
     if (taskbar) drawTaskbar(state === 'connected' ? s.railWindows() : []);   // RemoteApp: opening it (a spinner) until its window comes
     if (state === 'ended' && ['auth', 'csrf', 'signed_out'].includes(info.end)) {   // the web session is over: said so
       popups.splice(0).forEach((w) => w.close());        // (the other screens' windows too)
@@ -2550,12 +2931,13 @@ async function viewSession(id) {
     // RemoteApp connected again quietly (the server ended the session while its program was opening): the spinner stays
     if ((state === 'connecting' || state === 'reconnecting') && info.quiet) { overlay.classList.add('hidden'); return; }
     if (state === 'connecting' || state === 'reconnecting') return box(h('div', { class: 'spinner' }), state === 'connecting' ? t('connecting') : t('reconnecting', info.attempt, S.user.reconnect));
+    if (state === 'waking') return box(h('div', { class: 'spinner' }), t('waking'));
     // ended
     if (info.end === 'cert_changed') {
-      return box(h('h2', {}, t('r_cert_changed')), h('p', {}, t('cert_changed')), h('p', { class: 'small' }, t('cert_new')), h('p', { class: 'mono small' }, info.detail),
+      return box(h('h2', {}, info.host ? t('r_cert_changed_host', info.host) : t('r_cert_changed')), h('p', {}, t('cert_changed')), h('p', { class: 'small' }, t('cert_new')), h('p', { class: 'mono small' }, info.detail),
         h('div', { class: 'row end' }, btn(t('cancel'), closeTab), btn(t('accept_cert'), () => { extra.trust = info.detail; s.start(extra); }, 'primary')));
     }
-    if (info.end === 'auth_failed' && !conn.has_pass) return askCredentials();
+    if (['auth_failed', 'gateway_auth'].includes(info.end) && !conn.has_pass) return askCredentials();   // (the gateway's: the same password)
     const ei = info.errorInfo && t('ei_' + info.errorInfo) !== 'ei_' + info.errorInfo ? t('ei_' + info.errorInfo) : null;
     const msg = ei || (t('r_' + info.end) !== 'r_' + info.end ? t('r_' + info.end) : t('disconnected'));
     box(h('h2', {}, t('disconnected')), h('p', {}, msg), h('div', { class: 'row end' }, btn(t('close'), closeTab), btn(t('reconnect'), () => s.start(extra), 'primary')));
@@ -2565,8 +2947,104 @@ async function viewSession(id) {
   else {
     setup(conn);
     extra = { ...extra, opts: { paste: pasteFor(conn.paste) } };   // only the browser knows whether it is a phone
-    s.start(extra);
+    // without the dialog there is no click: full screen at once only where a policy allows it, else at the first press
+    startFull = fullOk && conn.full !== false;
+    if (startFull) mainFull.start();
+    (conn.mic ? CamCapture.present() : Promise.resolve(false)).then((cam) => { extra.cam = cam; s.start(extra); });
   }
+}
+
+// ------------------------------------------------------------------ a session's recording
+
+/** h:mm:ss (or m:ss) of milliseconds. */
+const clockText = (ms) => {
+  const s = Math.floor(ms / 1000), hh = Math.floor(s / 3600), mm = Math.floor(s / 60) % 60, ss = String(s % 60).padStart(2, '0');
+  return hh ? `${hh}:${String(mm).padStart(2, '0')}:${ss}` : `${mm}:${ss}`;
+};
+
+/** A session's recording (#/rec/<sid>), for administrators and auditors: played with the session's own decoders. */
+async function viewRecording(sid) {
+  document.title = t('app');
+  fill(app, h('div', { class: 'center muted' }, t('loading')));
+  const info = (await attempt(() => api('admin.recording', { sid })))?.recording;
+  if (route().view !== 'rec' || route().arg !== sid) return;     // the user went elsewhere meanwhile
+  if (!info) {
+    fill(app, h('div', { class: 'center' }, h('div', { class: 'auth' }, h('p', {}, errText('not_found')), h('a', { class: 'btn', href: '#/admin/audit' }, t('back')))));
+    return;
+  }
+  document.title = (info.conn || '') + ' · ' + t('rec_title') + ' · ' + t('app');
+  // a session still running has no length yet: up to now
+  const total = info.ended ? (info.seconds || 0) * 1000 : Math.max(1000, Date.now() - (Date.parse(info.started) || Date.now()));
+  const canvas = h('canvas', { width: 1024, height: 768, tabindex: -1 });
+  const keyboard = h('textarea', { class: 'kbd', 'aria-label': t('rec_title') });
+  const overlay = h('div', { class: 'overlay hidden' });
+  const time = h('span', { class: 'rec-time' }, clockText(0) + ' / ' + clockText(total));
+  const seek = h('input', { type: 'range', min: 0, max: Math.max(1000, total), step: 1000, value: 0, 'aria-label': t('rec_position') });
+  const speed = h('select', { 'aria-label': t('rec_speed') }, [1, 2, 4, 8].map((v) => h('option', { value: v }, v + '×')));
+  let paused = false, seeking = false;
+  const toggle = h('button', { type: 'button', onclick: () => { paused = !paused; s.replayCmd(paused ? 'pause' : 'play'); drawToggle(); } });
+  const drawToggle = () => { fill(toggle, icon(paused ? 'play' : 'pause')); toggle.setAttribute('title', t(paused ? 'rec_resume' : 'rec_pause')); toggle.setAttribute('aria-label', t(paused ? 'rec_resume' : 'rec_pause')); };
+  drawToggle();
+  const bar = h('div', { class: 'rec-bar' },
+    h('a', { href: '#/admin/audit', title: t('back'), 'aria-label': t('back') }, icon('x')), toggle, time, seek, speed,
+    h('span', { class: 'rec-who' }, `${info.user || ''} · ${info.conn || ''} · ${fmtDate(info.started)}`, info.truncated ? ' · ' + t('rec_cut') : ''));
+  const root = h('div', { class: 'session rec' }, canvas, keyboard, overlay, bar);
+  fill(app, root);
+  const box = (...c) => fill(overlay, h('div', { class: 'box' }, ...c));
+  const s = new RdpSession({ container: root, canvas, keyboard, conn: { id: '', name: '' }, csrf: S.csrf, retries: 0, replay: { sid, from: 0, speed: 1 }, onState });
+  endRdp();                                              // a session left by a previous view of this page
+  currentRdp = s;
+  s.onReplayPos = (ms, done) => {
+    const at = done ? Math.max(ms, total) : ms;            // (nothing is recorded while the screen stays still: at its end, all of it)
+    time.textContent = clockText(at) + ' / ' + clockText(total);
+    if (!seeking) seek.value = at;
+  };
+  const from = (ms) => { s.replay.from = ms; paused = false; drawToggle(); overlay.classList.add('hidden'); s.start(); };
+  seek.addEventListener('input', () => { seeking = true; });
+  seek.addEventListener('change', () => { seeking = false; from(+seek.value); });   // played again up to there, then at its pace
+  speed.addEventListener('change', () => { s.replay.speed = +speed.value; s.replayCmd('speed', +speed.value); });
+  function onState(state, info) {
+    if (state !== 'ended') return;
+    if (['auth', 'csrf'].includes(info.end)) { sessionEnded(info.reason); return; }   // the web session is over
+    const why = info.end && !['network', 'user'].includes(info.end) ? h('p', { class: 'error' }, errText(info.end)) : null;   // (refused: not found, forbidden...)
+    box(h('h2', {}, t('rec_end')), why, h('div', { class: 'row end' }, h('a', { class: 'btn', href: '#/admin/audit' }, t('back')), btn(t('rec_again'), () => from(0), 'primary')));
+    overlay.classList.remove('hidden');
+  }
+  s.start();
+}
+
+// ------------------------------------------------------------------ a shared session, as a guest
+
+/** Watching a session shared with a link (#/watch/<link>): no account needed; using it too when its owner allowed it. */
+function viewWatch(link) {
+  document.title = t('app');
+  const canvas = h('canvas', { width: 1024, height: 768, tabindex: -1 });
+  const keyboard = h('textarea', { class: 'kbd', autocapitalize: 'off', autocomplete: 'off', spellcheck: 'false', 'aria-label': t('share_guest') });
+  const overlay = h('div', { class: 'overlay' });
+  const badge = h('div', { class: 'watch-badge hidden', role: 'status' });
+  const recBadge = h('div', { class: 'rec-badge hidden', role: 'status' }, t('rec_badge'));
+  const root = h('div', { class: 'session' }, canvas, keyboard, badge, recBadge, overlay);
+  fill(app, root);
+  const box = (...c) => fill(overlay, h('div', { class: 'box' }, ...c));
+  const s = new RdpSession({ container: root, canvas, keyboard, conn: { id: '', name: '' }, csrf: S.csrf, retries: 0, guest: { link }, onState });
+  s.onRecording = (on) => recBadge.classList.toggle('hidden', !on);
+  endRdp();                                              // a session left by a previous view of this page
+  currentRdp = s;
+  function onState(state, info) {
+    overlay.classList.toggle('hidden', state === 'connected');
+    if (state === 'connected') {
+      document.title = info.conn + ' · ' + t('app');
+      fill(badge, icon('eye'), ' ', t(info.watch === 'control' ? 'share_watching_control' : 'share_watching', info.owner, info.conn));
+      badge.classList.remove('hidden', 'faded');
+      setTimeout(() => badge.classList.add('faded'), 6000);   // then out of the way of the desktop
+      if (info.watch === 'control') s.focus();
+      return;
+    }
+    if (state === 'connecting' || state === 'reconnecting') return box(h('div', { class: 'spinner' }), t('share_joining'));
+    badge.classList.add('hidden');
+    box(h('h2', {}, t('share_over')), h('p', {}, t('share_over_text')), h('div', { class: 'row end' }, btn(t('retry'), () => s.start(), 'primary')));
+  }
+  s.start();
 }
 
 // ------------------------------------------------------------------ start

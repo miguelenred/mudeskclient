@@ -26,11 +26,47 @@ final class Transport
     public int $bytesIn = 0;
     public int $bytesOut = 0;
 
+    /** The Remote Desktop Gateway this connection goes through (its socket is then the client's end of a loopback pair) */
+    public ?Gateway $gw = null;
+
+    /** A connection through a Remote Desktop Gateway already open to the remote computer. */
+    public static function through(Gateway $gw): self
+    {
+        $t       = (new \ReflectionClass(self::class))->newInstanceWithoutConstructor();
+        $t->sock = $gw->inner();
+        $t->gw   = $gw;
+        return $t;
+    }
+
+    /**
+     * Moves the gateway's bytes both ways (nothing without one); false once the tunnel ended and all it brought was given to
+     * this socket (which then reads it, and then its end, as from a remote computer that closed).
+     */
+    public function pump(): bool
+    {
+        return $this->gw === null || $this->gw->pump();
+    }
+
+    /** The streams to wait on for reading: the socket, and the gateway's while it can bring something (pump() moves it). */
+    public function streams(): array
+    {
+        return $this->gw === null ? [$this->sock] : [$this->sock, ...$this->gw->readable()];
+    }
+
+    /** The streams to wait on for writing: the gateway's while frames wait for it (nothing without one). */
+    public function writeStreams(): array
+    {
+        return $this->gw === null ? [] : $this->gw->writable();
+    }
+
     public function __construct(string $ip, int $port)
     {
         $ctx  = stream_context_create(['socket' => ['tcp_nodelay' => true], 'ssl' => [
             'verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true,
             'capture_peer_cert' => true, 'security_level' => 0, 'SNI_enabled' => false,
+            // (triple DES last, where OpenSSL has it: Windows Server 2003's TLS has no AES; without it, Client falls back to
+            // Standard RDP Security)
+            'ciphers' => 'DEFAULT:DES-CBC3-SHA',
         ]]);
         $addr = str_contains($ip, ':') ? "[$ip]" : $ip;
         // the timeout also limits the TLS handshake (PHP applies a client's connection timeout to it)
@@ -42,13 +78,39 @@ final class Transport
         stream_set_blocking($s, false);
     }
 
+    /** Whether $ip:$port takes a TCP connection within $timeout seconds (closed at once: nothing is sent). */
+    public static function reachable(string $ip, int $port, float $timeout): bool
+    {
+        $s = @stream_socket_client('tcp://' . (str_contains($ip, ':') ? "[$ip]" : $ip) . ":$port", $errno, $err, $timeout);
+        if ($s === false) {
+            return false;
+        }
+        fclose($s);
+        return true;
+    }
+
     public function startTls(): \OpenSSLCertificate
     {
         $m = STREAM_CRYPTO_METHOD_TLSv1_0_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_1_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT
            | (defined('STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT') ? STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT : 0);
-        stream_set_blocking($this->sock, true);
-        if (!@stream_socket_enable_crypto($this->sock, true, $m)) {
-            throw new ProtocolException('TLS handshake failed: ' . (error_get_last()['message'] ?? ''), 'tls');
+        if ($this->gw !== null) {
+            // through a gateway: the handshake goes through pump(), so it is made step by step (blocking, nothing pumped it)
+            $end = microtime(true) + self::WAIT;
+            while (($ok = @stream_socket_enable_crypto($this->sock, true, $m)) === 0) {
+                if (microtime(true) > $end) {
+                    throw new ProtocolException('TLS handshake through the gateway failed', 'tls');
+                }
+                $this->pump();                         // (a tunnel that ended: the handshake sees the end and fails)
+                $this->waitStreams(0.05);
+            }
+            if ($ok !== true) {
+                throw new ProtocolException('TLS handshake failed: ' . (error_get_last()['message'] ?? ''), 'tls');
+            }
+        } else {
+            stream_set_blocking($this->sock, true);
+            if (!@stream_socket_enable_crypto($this->sock, true, $m)) {
+                throw new ProtocolException('TLS handshake failed: ' . (error_get_last()['message'] ?? ''), 'tls');
+            }
         }
         $cert = stream_context_get_params($this->sock)['options']['ssl']['peer_certificate'] ?? null;
         if (!$cert instanceof \OpenSSLCertificate) {
@@ -67,6 +129,9 @@ final class Transport
 
     public function send(string $data): void
     {
+        if (!is_resource($this->sock)) {                       // (closed: a second disconnect, say)
+            throw new ProtocolException('Connection closed', 'closed');
+        }
         $this->bytesOut += strlen($data);
         $until = microtime(true) + 30;                         // a server reading a byte now and then held the worker for ever
         while ($data !== '') {
@@ -80,6 +145,13 @@ final class Transport
             if ($n === 0) {
                 if (feof($this->sock)) { // reset by the peer: TLS writes return 0, not false, and the socket stays writable
                     throw new ProtocolException('Connection lost (write)', 'closed');
+                }
+                if ($this->gw !== null) {               // the pair is full until the tunnel takes it: the gateway waited on
+                    if (!$this->pump()) {                // (its socket, not this one: readable as it is, it made this spin)
+                        throw new ProtocolException('Gateway closed the tunnel', 'closed');
+                    }
+                    $this->gw->wait(0.05);
+                    continue;
                 }
                 $r = $e = null;
                 $w = [$this->sock];
@@ -109,20 +181,42 @@ final class Transport
 
     public function wait(float $timeout): bool
     {
+        if ($this->gw !== null) {                       // the tunnel's bytes moved while waiting for the remote computer's
+            $end = microtime(true) + $timeout;
+            do {
+                $this->pump();                         // (a tunnel that ended: its last bytes, then its end, read here)
+                $r = [$this->sock];
+                $w = $e = null;
+                if (@stream_select($r, $w, $e, 0) > 0) {
+                    return true;
+                }
+                $this->waitStreams(min(0.05, max(0.0, $end - microtime(true))));
+            } while (microtime(true) < $end);
+            return false;
+        }
         $r = [$this->sock];
         $w = $e = null;
         return @stream_select($r, $w, $e, (int)$timeout, (int)(fmod($timeout, 1) * 1e6)) > 0;
+    }
+
+    private function waitStreams(float $timeout): void
+    {
+        $r = $this->streams();
+        $w = $this->writeStreams() ?: null;
+        $e = null;
+        @stream_select($r, $w, $e, 0, (int)($timeout * 1e6));
     }
 
     private function fill(int $n, float $timeout = self::WAIT): void
     {
         $end = microtime(true) + $timeout;
         while (strlen($this->buf) < $n) {
-            if (!$this->drain()) {
-                throw new ProtocolException('Connection closed by server', 'closed');
-            }
+            $alive = $this->drain();
             if (strlen($this->buf) >= $n) {
-                break;
+                break;                                     // (what came before the close is read: a server says why, then closes)
+            }
+            if (!$alive) {
+                throw new ProtocolException('Connection closed by server', 'closed');
             }
             $left = $end - microtime(true);
             if ($left <= 0) {
@@ -139,6 +233,13 @@ final class Transport
         $s         = substr($this->buf, 0, $n);
         $this->buf = substr($this->buf, $n);
         return $s;
+    }
+
+    /** Reads exactly $n bytes (RDSTLS's PDUs, of a known size). */
+    public function recv(int $n, float $timeout = self::WAIT): string
+    {
+        $this->fill($n, $timeout);
+        return $this->take($n);
     }
 
     /** Reads a complete DER element (CredSSP TSRequest). */
@@ -215,5 +316,6 @@ final class Transport
         if (is_resource($this->sock)) {
             @fclose($this->sock);
         }
+        $this->gw?->close();
     }
 }

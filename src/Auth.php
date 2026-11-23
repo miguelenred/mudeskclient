@@ -97,10 +97,30 @@ final class Auth
     public static function require(bool $admin = false, bool $allowPending = false): array
     {
         $u = self::user() ?? Http::fail('auth', 401, self::$closed === null ? [] : ['reason' => self::$closed]);
-        if (!$allowPending && ($u['must_change'] || (Settings::get('totp_required') && !Users::hasSecondFactor($u)))) {
+        // (the provider's own second step counts for a session opened with OpenID Connect)
+        if (!$allowPending && ($u['must_change'] || (Settings::get('totp_required') && !Users::hasSecondFactor($u) && ($_SESSION['via'] ?? '') !== 'oidc'))) {
             Http::fail('pending', 403);
         }
         if ($admin && $u['role'] !== 'admin') {
+            Http::fail('forbidden', 403);
+        }
+        return $u;
+    }
+
+    /**
+     * Like require(), for what an auditor may read too: the audit log and the active sessions (an administrator or an
+     * auditor; an auditor changes nothing).
+     */
+    /** Whether the user makes connections of their own (and imports .rdp files): administrators, and others when allowed. */
+    public static function createsConns(array $u): bool
+    {
+        return $u['role'] === 'admin' || Settings::get('users_create_conns');
+    }
+
+    public static function requireAuditor(): array
+    {
+        $u = self::require();
+        if (!in_array($u['role'], ['admin', 'auditor'], true)) {
             Http::fail('forbidden', 403);
         }
         return $u;
@@ -219,8 +239,13 @@ final class Auth
      */
     public static function confirmPassword(array $u, string $password): bool
     {
-        if (password_verify($password, $u['pass'])) {
+        // a Windows account: its password is the Windows one, checked against the domain again
+        $win = ($u['source'] ?? '') === 'ad' ? (WindowsLogin::enabled() ? WindowsLogin::check(WindowsLogin::userName($u['username']), $password) : 'off') : null;
+        if ($win === 'ok' || ($win === null && password_verify($password, $u['pass']))) {
             return true;
+        }
+        if ($win !== null && !in_array($win, ['auth_failed', 'account_locked', 'account_disabled', 'account_expired', 'password_expired'], true)) {
+            return false;                          // the domain did not answer: not counted against the user
         }
         Audit::log('reauth_fail', ['tries' => ($_SESSION['reauth_fails'] ?? 0) + 1], null, false);
         if (($_SESSION['reauth_fails'] = ($_SESSION['reauth_fails'] ?? 0) + 1) >= 5) {
@@ -379,6 +404,10 @@ final class Auth
                 : (!$u['enabled'] ? 'disabled' : 'bad_signature'))], $u['username'] ?? null, false);
             return 'invalid';
         }
+        if (!$pending && ($u['source'] ?? '') === 'ad') {
+            Audit::log('login_fail', ['method' => 'passkey', 'reason' => 'windows_password_first'], $u['username'], false);
+            return 'passkey_password';                    // the domain must say the account is still valid
+        }
         if (!$pending) {                                   // passwordless: the data key comes from the passkey
             $prf = WebAuthn::unb64u((string)($in['prf'] ?? ''));
             $dek = $u['passkeys'][$pk]['dek'] === null || strlen($prf) !== 32 ? null
@@ -410,14 +439,24 @@ final class Auth
         // second step (TOTP code) only while the password step is valid; the lock keys follow the same user as the check
         $pending = ($_SESSION['pending']['exp'] ?? 0) > time() && $code !== '' ? $_SESSION['pending'] : null;
         $u       = $pending !== null ? Users::get($pending['uid']) : Users::byName($name);
+        $windows = $pending === null && WindowsLogin::enabled() && ($u === null || ($u['source'] ?? '') === 'ad');
+        if ($windows) {                   // a Windows account: one name (and one lock) however its domain is typed
+            $name = WindowsLogin::userName($name);
+            $u    = Users::byName($name);
+        }
         $keys    = self::keys($pending['name'] ?? $name, $u);
         if (($lock = self::lockedFor($keys)) !== null) {
             Audit::anonymous() && Audit::log('login_fail', ['method' => $pending !== null ? 'totp' : 'password', 'reason' => 'locked_' . $lock], $pending['name'] ?? $name, false);
             return $lock === 'ip' ? 'locked_ip' : 'invalid';
         }
         if ($pending === null) {
-            $hash = $u['pass'] ?? self::DUMMY_HASH;
-            if (!password_verify($password, $hash) || $u === null || !$u['enabled']) {
+            if ($windows) {
+                $w = self::windows($name, $password, $u, $keys);   // a Windows account: checked against the domain
+                if (is_string($w)) {
+                    return $w;
+                }
+                $u = $w;
+            } elseif (!password_verify($password, $u['pass'] ?? self::DUMMY_HASH) || $u === null || !$u['enabled']) {
                 self::failure($keys);
                 Audit::log('login_fail', ['method' => 'password', 'reason' => $u === null ? 'unknown_user'
                     : ($u['enabled'] ? 'bad_password' : 'disabled')], $name, false);
@@ -429,6 +468,10 @@ final class Auth
                 self::failure($keys);
                 Audit::log('login_fail', ['method' => 'password', 'reason' => 'bad_password'], $name, false);
                 return 'invalid';
+            }
+            if (!Users::withinHours($u)) {   // said before the second step, which could not open a session either
+                Audit::log('login_fail', ['method' => 'password', 'reason' => 'outside_hours'], $u['username'], false);
+                return 'outside_hours';
             }
             if ($dek === null) {
                 // should never happen (the key is wrapped with this same password: only a damaged users file); the account
@@ -448,7 +491,7 @@ final class Auth
                     }
                 });
             }
-            if (password_needs_rehash($u['pass'], PASSWORD_BCRYPT, Users::HASH)) {
+            if (!isset($u['source']) && password_needs_rehash($u['pass'], PASSWORD_BCRYPT, Users::HASH)) {   // (never the Windows password)
                 Users::update($u['id'], static fn(array &$x) => $x['pass'] = Users::hash($password));
             }
             session_regenerate_id(true);
@@ -488,11 +531,101 @@ final class Auth
         return self::finish($u, $keys, 'totp');
     }
 
+    /**
+     * The Windows account $name signs in (WindowsLogin): its user (made now if the settings allow it), or 'invalid'. Its data
+     * key is wrapped with the Windows password: changed in Windows, the old one cannot open it, so a new one is made and
+     * the saved RDP passwords go (said in the audit log).
+     */
+    private static function windows(string $name, #[\SensitiveParameter] string $password, ?array $u, array $keys): array|string
+    {
+        $login = WindowsLogin::userName($name);
+        $u   ??= Users::byName($login);
+        if ($u !== null && ($u['source'] ?? '') !== 'ad') {
+            return 'invalid';                      // a local user typed as DOMAIN\name: never checked against Windows
+        }
+        $r = $login === '' || $password === '' ? 'auth_failed' : WindowsLogin::check($login, $password);
+        if (in_array($r, ['unreachable', 'timeout', 'nla_unavailable', 'ad_cert', 'mitm', 'protocol', 'kerberos', 'kerberos_integrity'], true)) {
+            // the computer that checks them did not (down, or not the one pinned): not the user's failure, so not counted
+            Audit::log('login_fail', ['method' => 'windows', 'reason' => $r], $name, false);
+            return 'ad_unavailable';
+        }
+        if ($r !== 'ok' || ($u !== null && !$u['enabled'])) {
+            self::failure($keys);
+            Audit::log('login_fail', ['method' => 'windows', 'reason' => $r === 'ok' ? 'disabled' : ($u === null && $r === 'auth_failed' ? 'unknown_user' : $r)], $name, false);
+            return 'invalid';
+        }
+        if ($u === null) {
+            if (!Settings::get('ad_create')) {
+                self::failure($keys);
+                Audit::log('login_fail', ['method' => 'windows', 'reason' => 'no_user'], $name, false);
+                return 'invalid';
+            }
+            $made = Users::createExternal($login, 'ad', $password);
+            $u    = $made ?? Users::byName($login);              // (made meanwhile by another request: it must be a Windows one too)
+            if ($u === null || ($u['source'] ?? '') !== 'ad') {
+                return 'invalid';
+            }
+            $made && Audit::log('user_create', ['target' => $login, 'role' => 'user', 'source' => 'ad'], $login, true);
+        }
+        if (Crypto::unwrapKey($password, $u['dek'], $u['id']) === null) {   // the Windows password changed since the last time
+            // a new data key, under the users' lock and only if no other sign-in replaced it meanwhile; the copies the passkeys
+            // kept go with the old one, and the user's other sessions end (as with a password change)
+            $old     = $u['dek'];
+            $renewed = false;
+            Users::update($u['id'], static function (array &$x) use ($password, $old, &$renewed): void {
+                if (($x['dek'] ?? null) === $old) {
+                    $x['dek'] = Crypto::wrapKey($password, random_bytes(32), $x['id']);
+                    foreach ($x['passkeys'] ?? [] as $i => $p) {
+                        $x['passkeys'][$i]['dek'] = null;
+                    }
+                    $x['sv'] = ($x['sv'] ?? 1) + 1;
+                    $renewed = true;
+                }
+            });
+            if ($renewed) {
+                Connections::forgetPasswords($u['id']);
+                Audit::log('saved_passwords_lost', ['reason' => 'windows_password_changed'], $u['username'], false);
+            }
+            $u = Users::get($u['id']);
+            if (Crypto::unwrapKey($password, $u['dek'], $u['id']) === null) {
+                return 'invalid';                  // replaced meanwhile with another password
+            }
+        }
+        return $u;
+    }
+
+    /**
+     * Signs in $u after the OpenID Connect provider vouched for it: no password, so no data key (the saved RDP passwords
+     * are not opened in this session), and the provider's own second step counts. 'ok', 'outside_hours' or 'invalid'.
+     */
+    public static function loginExternal(array $u, string $how): string
+    {
+        $keys = self::keys($u['username'], $u);
+        if (!$u['enabled']) {
+            Audit::log('login_fail', ['method' => $how, 'reason' => 'disabled'], $u['username'], false);
+            return 'invalid';
+        }
+        session_regenerate_id(true);
+        unset($_SESSION['dek']);
+        $r = self::finish($u, $keys, $how);
+        if ($r === 'ok') {
+            $_SESSION['via'] = $how;
+        }
+        return $r;
+    }
+
     /** Opens the session of $u after a complete sign-in and remembers the browser (the 20 used most recently). */
     private static function finish(array $u, array $keys, string $how): string
     {
         unset($_SESSION['pending']);
+        if (!Users::withinHours($u)) {   // the right credentials outside the user's sign-in hours: no session (not a failure)
+            unset($_SESSION['dek']);
+            Audit::log('login_fail', ['method' => $how, 'reason' => 'outside_hours'], $u['username'], false);
+            return 'outside_hours';
+        }
         session_regenerate_id(true);
+        $_SESSION             = array_intersect_key($_SESSION, ['dek' => 1]);   // (the data key of this sign-in)
+        $_SESSION['seen']     = time();
         $_SESSION['uid']      = $u['id'];
         $_SESSION['username'] = $u['username'];
         $_SESSION['since']    = time();

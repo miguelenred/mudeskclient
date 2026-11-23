@@ -6,7 +6,8 @@ declare(strict_types=1);
  *
  * Random and mutated server PDUs against the RDP core (fast-path, slow-path, licensing, MCS, NLA, bulk decompression)
  * and the channels (clipboard, with browser messages too; drive and printer; audio; dynamic channels; RemoteApp, with the
- * browser's window commands too), on test objects
+ * browser's window commands too; Kerberos: a KDC's errors and replies, a service's tokens, its MIC and Wrap; the gateway's
+ * tunnel response with its consent message, a broker's target certificate and password), on test objects
  * as in tests/run.php. Only ProtocolException may come out: a PHP warning, notice or deprecation, any other exception,
  * or a case that takes over 2 s (it is stopped at 10 s) or 32 MB is a failure, shown with its input (hex) and the
  * command that replays it.
@@ -16,7 +17,7 @@ declare(strict_types=1);
  */
 
 use MuDesk\{Config, Files, Text};
-use MuDesk\Rdp\{Bulk, Client, Cliprdr, CredSsp, Der, Drdynvc, ProtocolException, Rail, Rdpdr, Rdpsnd, Trace, Transport};
+use MuDesk\Rdp\{Bulk, Client, Cliprdr, CredSsp, Der, Drdynvc, Gateway, Kerberos, KerberosCrypto, ProtocolException, Rail, RdpSecurity, Rdpdr, Rdpecam, Rdpsnd, Trace, Transport};
 
 error_reporting(E_ALL);
 ini_set('display_errors', '1');
@@ -41,6 +42,8 @@ const GFX         = 'Microsoft::Windows::RDS::Graphics';
 const STREAM      = 0x5354524D;     // in a file contents response: the stream id of the download under way
 const PATHS       = ['\\', '\\a.txt', '\\dir', '\\dir\\b.bin', '\\new', '\\dir\\new.txt', '\\x', '\\dir\\x\\y', '..\\up', '\\a.txt\\sub',
                      '\\web.config', '\\.htaccess', '\\a:b', '\\*', '\\dir\\*', '\\a?.txt', '/dir/b.bin', ''];
+
+require __DIR__ . '/fixtures/krb_fixture.php';
 
 // ------------------------------------------------------------------ random data (mt_rand: seeded for each case)
 
@@ -832,6 +835,126 @@ $targets = [
             }
         },
     ],
+    'camera' => [300,                                    // camera: the server's MS-RDPECAM messages on its channels and the browser's pictures
+        static function (): array {
+            $msgs = [];
+            for ($i = rnd(20); $i >= 0; $i--) {
+                $ch = pick([9, 10, 11]);
+                // each input: "e" + a message on the enumeration channel, "o"/"x" + channel (opened, closed), "d" + channel + a
+                // message on it, "p" + u8 (0: of the current start, else that number) + u32 (a picture of that many bytes from
+                // the browser; 0: it could not open its camera), "z" (the connection given up)
+                $m = match (rnd(10)) {
+                    0       => 'e' . (chance(80) ? pack('CC', rnd(3), 4) : bytes(rnd(6))),
+                    1       => 'o' . chr($ch),
+                    2       => 'x' . chr($ch),
+                    3       => 'd' . chr($ch) . pack('CC', 2, pick([7, 8, 9, 0x10, 0x14])),
+                    4       => 'd' . chr($ch) . pack('CCC', 2, pick([0x0B, 0x0D, 0x11, 0x16]), pick([0, 0, 1, rnd(255)])),
+                    5       => 'd' . chr($ch) . pack('CC', 2, 0x0F) . str_repeat(pack('CCVVVVVVC', pick([0, 0, 1]), pick([2, 2, 1, rnd(9)]), pick([640, 1280, 320, 800, mt_rand()]),
+                                   pick([480, 720, 240, 600, mt_rand()]), pick([30, 15, 0, mt_rand()]), pick([1, 1, 0, 1001]), 1, 1, rnd(4)), pick([1, 1, 2, 0])) . bytes(chance(85) ? 0 : rnd(5)),
+                    6       => 'p' . pack('CV', chance(80) ? 0 : 1 + rnd(255), chance(10) ? 0 : pick([5, 40000, rnd(3000000)])),
+                    7       => 'd' . chr($ch) . bytes(rnd(40)),
+                    8       => 'z',
+                    default => 'd' . chr($ch) . pack('CCC', 2, 0x11, 0),
+                };
+                $msgs[] = chance(10) && $m[0] === 'd' ? 'd' . $m[1] . mutate(substr($m, 2)) : $m;
+            }
+            return [['trace' => chance(30)], $msgs];
+        },
+        static function (array $o, array $msgs): void {
+            $v   = new Drdynvc(client($o), false, true, false, 'Cámara de MuDesk');
+            $run = static fn(): int => (new ReflectionProperty(Rdpecam::class, 'run'))->getValue((new ReflectionProperty(Drdynvc::class, 'cam'))->getValue($v));
+            $v->onData("\x10\x08RDCamera_Device_Enumerator\0");
+            foreach ($msgs as $m) {
+                match ($m[0]) {
+                    'e'     => $v->onData("\x30\x08" . substr($m, 1)),
+                    'o'     => $v->onData("\x10" . $m[1] . "RDCamera_Device_0\0"),
+                    'x'     => $v->onData("\x40" . $m[1]),
+                    'd'     => $v->onData("\x30" . $m[1] . substr($m, 2)),
+                    'z'     => $v->stopCapture(),
+                    default => $v->camData(chr(ord($m[1]) ?: $run()) . str_repeat("\xFF", unpack('V', $m, 2)[1])),
+                };
+            }
+        },
+    ],
+    'localdrive' => [300,                                // this computer's folder: the server's requests to it and the browser's answers
+        static function (): array {
+            $msgs = [];
+            for ($i = rnd(16); $i >= 0; $i--) {
+                $cid = rnd(6);
+                // each input: "s" (the server's request), "r" (an answer from the browser), "l" (a listing's first answer with the
+                // others), each with u8 which request's number (below 200: of one of the last four, else any), "a"/"u"/"z" (shared,
+                // no longer shared, the session ended), "c" (the devices asked for: client id confirm)
+                $msgs[] = match (rnd(9)) {
+                    0, 1, 2 => 's' . (chance(85) ? substr_replace(irp(3, rnd(4), pick([0x00, 0x02, 0x03, 0x04, 0x05, 0x06, 0x0A, 0x0C, 0x0E, rnd(32)])), pack('V', $cid), 12, 4)
+                                                 : bytes(rnd(40))),
+                    3, 4    => 'r' . chr(rnd(256)) . (chance(85) ? pack('VVV', pick([3, 3, 2]), $cid, pick([0, 0, 0xC000000F, mt_rand()])) . bytes(pick([0, 4, 5, rnd(40)])) : bytes(rnd(20))),
+                    5       => 'l' . chr(rnd(256)) . maybe(pack('V', 17) . pack('VVVVC', 3, $cid, 0, rnd(4), 1) . pack('VVV', rnd(4), pick([1, 3, 12]), $n = pick([0, 2, rnd(5), 70000]))
+                                   . implode('', array_map(static fn() => pack('V', $k = rnd(30)) . bytes($k), range(1, min($n, 20))))),
+                    6       => chance(70) ? 'a' . bytes(rnd(12)) : 'u',
+                    7       => 'z',
+                    default => 'c',
+                };
+            }
+            return [['trace' => chance(30), 'drive' => chance(90)], $msgs];
+        },
+        static function (array $o, array $msgs): void {
+            $d  = rdpdr(client($o), $o['drive'], false);
+            $no = static fn(int $k): string => pack('V', $k < 200 ? max(0, (new ReflectionProperty(Rdpdr::class, 'localNo'))->getValue() - $k % 4) : mt_rand());
+            $d->addLocal('Fotos', chance(30));
+            foreach ($msgs as $m) {
+                $rest = substr($m, 1);
+                match ($m[0]) {
+                    's'     => $d->onData(pack('vv', 0x4472, 0x4952) . substr($rest, 4)),
+                    'r'     => $d->localReply($no(ord($rest[0] ?? "\0")) . substr($rest, 1)),
+                    'l'     => $d->localList($no(ord($rest[0] ?? "\0")) . substr($rest, 1)),
+                    'a'     => $d->addLocal($rest, false),
+                    'u'     => $d->removeLocal(),
+                    'z'     => $d->removeLocal(false),
+                    default => $d->onData(pack('vvvvV', 0x4472, 0x4343, 1, 12, 7)),
+                };
+            }
+        },
+    ],
+    'touch' => [300,                                     // multitouch: the server's RDPEI messages and the browser's frames
+        static function (): array {
+            $msgs = [];
+            for ($i = rnd(12); $i >= 0; $i--) {
+                // each input: "d" + a message of the channel, "c" (closed and opened again) or "f" + a frame from the browser
+                $n    = chance(80) ? 1 + rnd(9) : rnd(255);
+                $kind = rnd(6);
+                if ($kind === 3) {
+                    $msgs[] = 'c';
+                    continue;
+                }
+                if ($kind >= 4) {
+                    $f      = chr($n) . implode('', array_map(static fn() => pack('CCvv', rnd(255), chance(90) ? rnd(3) : rnd(255), mt_rand(0, 0xFFFF), mt_rand(0, 0xFFFF)), range(1, max(1, $n))));
+                    $msgs[] = 'f' . (chance(15) ? mutate($f) : $f);
+                    continue;
+                }
+                $m = match ($kind) {
+                    0       => pack('vVV', 1, 10, [0x00010000, 0x00010001, 0x00020000, 0x00030000, mt_rand()][rnd(4)]) . (chance(50) ? pack('V', rnd(3)) : ''),
+                    1       => pack('vV', [4, 5][rnd(1)], 6),
+                    default => chr(rnd(255)) . bytes(rnd(20)),
+                };
+                $msgs[] = 'd' . (chance(15) ? mutate($m) : $m);
+            }
+            return [['trace' => chance(30)], $msgs];
+        },
+        static function (array $o, array $msgs): void {
+            $v = new Drdynvc(client($o), false, false, true);
+            $v->onData("\x10\x07Microsoft::Windows::RDS::Input\0");
+            foreach ($msgs as $m) {
+                if ($m[0] === 'c') {
+                    $v->onData("\x40\x07");
+                    $v->onData("\x10\x07Microsoft::Windows::RDS::Input\0");
+                } elseif ($m[0] === 'f') {
+                    $v->touchData(substr($m, 1));
+                } else {
+                    $v->onData("\x30\x07" . substr($m, 1));
+                }
+            }
+        },
+    ],
     'rail' => [300,                                      // RemoteApp: the server's RAIL PDUs and the browser's window commands
         static function (): array {
             $pdu  = static function (int $type, string $body): string {
@@ -870,6 +993,224 @@ $targets = [
             $r->workArea(1 + rnd(4000), 1 + rnd(4000));
         },
     ],
+    'kerberos' => [200,                                  // Kerberos and the gateway: a KDC's answers, a service's tokens, a tunnel response
+        static function (): array {
+            $key   = bytes(32);
+            $ctx   = bytes(32);
+            $str   = static fn() => KrbFixture::str(chance(80) ? 'TEST.LOCAL' : bytes(rnd(20)));
+            $einfo = Der::seq(Der::seq(Der::ctx(1, Der::int(19)), Der::ctx(2, Der::octet(Der::seq(Der::seq(Der::ctx(0, Der::int(pick([17, 18, 23, rnd(0xFFFF)]))),
+                chance(80) ? Der::ctx(1, $str()) : '', chance(30) ? Der::ctx(2, Der::octet(chance(70) ? pack('N', rnd(5000)) : bytes(rnd(6)))) : ''))))));
+            $ext   = Der::seq(Der::ctx(1, Der::int(pick([3, rnd(10)]))), Der::ctx(2, Der::octet(bytes(rnd(14)))));
+            $error = KrbFixture::app(30, Der::seq(Der::ctx(0, Der::int(5)), Der::ctx(1, Der::int(30)), Der::ctx(4, KrbFixture::time(mt_rand())),
+                Der::ctx(5, Der::int(0)), Der::ctx(6, Der::int(pick([24, 25, 6, 7, 18, 23, 37, rnd(100)]))), Der::ctx(9, $str()),
+                chance(70) ? Der::ctx(12, Der::octet(chance(50) ? $einfo : $ext)) : ''));
+            $part  = KrbFixture::app(pick([25, 26, 27]), Der::seq(Der::ctx(0, Der::seq(Der::ctx(0, Der::int(pick([17, 18, 23]))), Der::ctx(1, Der::octet(bytes(pick([16, 32, rnd(40)])))))),
+                Der::ctx(2, Der::int(7)), Der::ctx(4, Der::tlv(0x03, bytes(5)))));
+            $rep   = KrbFixture::app(27, Der::seq(Der::ctx(0, KrbFixture::time(mt_rand())), Der::ctx(1, Der::int(rnd(999999))),
+                chance(80) ? Der::ctx(2, Der::seq(Der::ctx(0, Der::int(pick([17, 18, 3]))), Der::ctx(1, Der::octet(bytes(pick([16, 32, rnd(40)])))))) : '',
+                chance(80) ? Der::ctx(3, Der::int(mt_rand())) : ''));
+            $apRep = KrbFixture::app(15, Der::seq(Der::ctx(0, Der::int(5)), Der::ctx(1, Der::int(15)),
+                Der::ctx(2, Der::seq(Der::ctx(0, Der::int(18)), Der::ctx(2, Der::octet(KerberosCrypto::encrypt($key, 12, maybe($rep))))))));
+            $gss   = Der::tlv(0x60, Der::tlv(0x06, "\x2A\x86\x48\x86\xF7\x12\x01\x02\x02") . pick(["\x02\x00", "\x03\x00", bytes(2)]) . (chance(80) ? $apRep : $error));
+            $hdr   = "\x04\x04\x05\xFF\xFF\xFF\xFF\xFF" . pack('J', rnd(9));
+            $resp  = Der::ctx(1, Der::seq(Der::ctx(0, Der::tlv(0x0A, chr(rnd(4)))), chance(70) ? Der::ctx(2, Der::octet(maybe($gss))) : '',
+                chance(40) ? Der::ctx(3, Der::octet($hdr . bytes(12))) : ''));
+            $wrap  = KrbFixture::wrap($ctx, rnd(99), bytes(rnd(80)), pick([0, 16, rnd(40)]));
+            $text  = Text::toUtf16(text()) . "\0\0";
+            $fields = rnd(0x1F);
+            $tunnel = pack('vVvv', 0, 0, $fields, 0) . ($fields & 1 ? bytes(4) : '') . ($fields & 2 ? bytes(4) : '')
+                . ($fields & 4 ? bytes(pick([16, 20])) . pack('v', 6) . bytes(6) : '') . ($fields & 0x10 ? pack('v', chance(80) ? strlen($text) : rnd(0xFFFF)) . $text : '');
+            $tcert = base64_encode(pack('VVV', pick([32, 1, rnd(40)]), pick([1, 2]), chance(80) ? 8 : rnd(0xFFFFFFFF)) . bytes(8));
+            return [['key' => bin2hex($key), 'ctx' => bin2hex($ctx)], array_map(static fn(string $m) => maybe($m, 60),
+                [$error, $part, $resp, $wrap, $tunnel, $tcert, Text::toUtf16(text()) . pick(["\0\0", '', bytes(3)]), pack('N', mt_rand())])];
+        },
+        static function (array $o, array $msgs): void {
+            $try = static function (callable $f): void {
+                try {
+                    $f();
+                } catch (ProtocolException) {
+                }
+            };
+            [$error, $part, $resp, $wrap, $tunnel, $tcert, $cookie, $flags] = $msgs;
+            $priv = static fn(string $m) => (new ReflectionMethod(Kerberos::class, $m))->getClosure();
+            $try(static function () use ($priv, $error): void {
+                $e = $priv('krbError')($error);
+                if ($e !== null) {
+                    $priv('etypeInfo')($e[1], 'TEST.LOCALana');
+                    $priv('extStatus')($e[1]);
+                }
+            });
+            $try(static fn() => $priv('repPart')($part, 7));
+            $k = (new ReflectionClass(Kerberos::class))->newInstanceWithoutConstructor();
+            foreach (['service' => ['', hex2bin($o['key']), 18], 'subkey' => random_bytes(32), 'mechTypes' => Der::seq(), 'etype' => 18] as $p => $v) {
+                (new ReflectionProperty(Kerberos::class, $p))->setValue($k, $v);
+            }
+            $try(static fn() => $k->accept($resp));
+            (new ReflectionProperty(Kerberos::class, 'key'))->setValue($k, hex2bin($o['ctx']));
+            $try(static fn() => $k->unwrap($wrap));
+            // (an RC4 context, a Windows Server 2003 domain's: RFC 4757's tokens, a real one changed or garbage)
+            $r4 = (new ReflectionClass(Kerberos::class))->newInstanceWithoutConstructor();
+            $rk = substr(hex2bin($o['ctx']), 0, 16);
+            foreach (['service' => ['', $rk, 23], 'subkey' => $rk, 'key' => $rk, 'mechTypes' => Der::seq(), 'etype' => 23] as $p => $v) {
+                (new ReflectionProperty(Kerberos::class, $p))->setValue($r4, $v);
+            }
+            $try(static fn() => $r4->unwrap(maybe(KrbFixture::rc4Wrap($rk, 5, substr($wrap, 0, 40), true), 60)));
+            $try(static fn() => $r4->unwrap($wrap));
+            $try(static fn() => $r4->accept($resp));
+            $try(static fn() => Gateway::consentMessage($tunnel));
+            $try(static fn() => Client::targetCertificate($tcert));
+            $try(static fn() => Client::cookiePassword($cookie));
+            Gateway::deniedBy(unpack('N', str_pad($flags, 4, "\0"))[1]);
+        },
+    ],
+];
+
+$targets['rdpsec'] = [200,                               // Standard RDP Security: what an XP or 2003 server sends
+    static function (): array {
+        $method = pick([1, 2, 8, 16]);
+        $cr = bytes(32);
+        $sr = bytes(32);
+        $sv = new RdpSecurity($method, $cr, $sr, true);
+        $pdus = [];
+        for ($i = 0; $i < 6; $i++) {
+            $d = bytes(rnd(200));
+            $pdus[] = chance(50) ? $sv->seal(pick([0, 0x0080, 0x0400, 0x0800]), $d) : implode('', $sv->fastSeal($d, chance(30)));
+        }
+        $n = bytes(pick([64, 128, 256, rnd(300)]));
+        $mod = strrev($n) . str_repeat("\0", 8);
+        $cert = chance(50)
+            ? pack('VVVvv', 1, 1, 1, 6, 20 + strlen($mod)) . 'RSA1' . pack('VVV', chance(80) ? strlen($mod) : rnd(0xFFFF), strlen($n) * 8, strlen($n) - 1) . pack('V', 65537) . $mod
+            : pack('VV', pick([2, 0x80000002]), rnd(3)) . pack('V', rnd(400)) . bytes(rnd(400));
+        $fields = '';
+        foreach ([bytes(rnd(40)), bytes(rnd(40)), bytes(rnd(130))] as $f) {
+            $fields .= pack('V', chance(90) ? strlen($f) : rnd(0xFFFFFF)) . $f;
+        }
+        $redir = "\0\0" . pack('vvVV', 0x0400, 12 + strlen($fields), rnd(99), pick([0x4 | 0x10 | 0x8000, 0x4000 | 0x8000 | 0x10, rnd(0x1FFFF)])) . $fields;
+        return [['method' => $method, 'cr' => bin2hex($cr), 'sr' => bin2hex($sr)], array_map(static fn(string $m) => maybe($m, 60), [...$pdus, $cert, $redir])];
+    },
+    static function (array $o, array $msgs): void {
+        $cl = new RdpSecurity($o['method'], hex2bin($o['cr']), hex2bin($o['sr']));
+        $redir = array_pop($msgs);
+        $cert = array_pop($msgs);
+        foreach ($msgs as $m) {
+            try {
+                $cl->open($m);
+            } catch (ProtocolException) {
+            }
+            try {
+                $cl->fastOpen($m, (bool)(strlen($m) & 1));
+            } catch (ProtocolException) {
+            }
+        }
+        try {
+            RdpSecurity::publicKey($cert);
+        } catch (ProtocolException) {
+        }
+        try {
+            Client::redirection($redir);
+        } catch (ProtocolException) {
+        }
+    },
+];
+
+$targets['rpc'] = [200,                                  // a gateway of the RPC transport (Windows Server 2008, 2008 R2): its OUT channel
+    static function (): array {
+        $hdr  = static fn(int $type, int $flags, int $len, int $auth, int $call): string => pack('CCCCV', 5, 0, $type, $flags, 0x10) . pack('vvV', $len, $auth, $call);
+        $text = static function (): array {
+            $w = Text::toUtf16(text()) . "\0\0";
+            return [$w, intdiv(strlen($w), 2), str_repeat("\0", (4 - strlen($w) % 4) % 4)];
+        };
+        $msgStub = static function () use ($text): string {             // a TsProxyMakeTunnelCall answer: a message, or a reauthentication
+            [$w, $n, $pad] = $text();
+            $m = chance(80) ? $n : rnd(0xFFFF);
+            return pack('VVVV', 0x00020000, pick([0x4750, rnd(0xFFFF)]), 0x4750, 0x00020004) . pack('VVVVV', 1, pick([1, 2, 3, rnd(9)]), rnd(2), 2, pick([0x00020008, 0]))
+                . pack('VVVV', 1, rnd(2), $m, pick([0x0002000C, 0])) . pack('VVV', $m, pick([0, rnd(9)]), $m) . $w . $pad . pack('V', 0);
+        };
+        $pdu = static function () use ($hdr, $msgStub): string {
+            $kind = rnd(6);
+            if ($kind === 0) {                                          // RTS: the virtual connection, flow control, the OUT channel made again
+                $cmds = '';
+                $n    = rnd(4);
+                for ($i = 0; $i < $n; $i++) {
+                    $t     = pick([0, 1, 2, 3, 6, 7, 8, 10, 11, 13, 14, rnd(20)]);
+                    $size  = [0 => 4, 1 => 24, 2 => 4, 3 => 16, 4 => 4, 5 => 4, 6 => 4, 7 => 0, 9 => 0, 10 => 0, 12 => 16, 13 => 4, 14 => 4][$t] ?? rnd(8);
+                    $cmds .= pack('V', $t) . match ($t) {
+                        8       => pack('V', pick([rnd(20), rnd(0xFFFFFFFF)])) . bytes(rnd(20)),
+                        11      => pack('V', rnd(2)) . bytes(pick([4, 16])) . bytes(12),
+                        default => bytes($size),
+                    };
+                }
+                $body = pack('vv', pick([0, 0x0001, 0x0002, 0x0004, 0x0010, 0x0020, rnd(0xFFFF)]), chance(90) ? $n : rnd(0xFFFF)) . $cmds;
+                return $hdr(0x14, 3, 16 + strlen($body), 0, 0) . $body;
+            }
+            if ($kind === 1) {                                          // a fault
+                return $hdr(0x03, 3, 32, 0, pick([5, 6, 7, rnd(99)])) . pack('VvCCVV', 0, 0, 0, 0, pick([0x1C010002, 0x800759DB, rnd(0xFFFFFFFF)]), 0);
+            }
+            if ($kind === 2) {                                          // a bind_ack, a bind_nak, anything else
+                $body = bytes(rnd(80));
+                return $hdr(pick([0x0C, 0x0D, rnd(0x14)]), 3, 16 + strlen($body), 0, pick([7, rnd(99)])) . $body;
+            }
+            // a response: the pipe's bytes (its end), a message, an answer waited for, one no call waits for; signed or not
+            $call = pick([5, 6, 7, rnd(99)]);
+            $stub = match ($call) {
+                5       => chance(20) ? pack('V', rnd(0xFFFF)) : bytes(rnd(400)),
+                6       => $msgStub(),
+                default => pick([pack('V', pick([0, rnd(0xFFFFFFFF)])), bytes(rnd(100))]),
+            };
+            $auth = chance(50);
+            $pad  = (16 - strlen($stub) % 16) % 16;
+            $tail = $auth ? str_repeat("\0", $pad) . pack('CCCCV', 0x0A, 5, chance(90) ? $pad : rnd(255), 0, 0) . bytes(16) : '';
+            $flags = pick([0x03, 0x01, 0x02, 0x00, rnd(255)]);
+            return $hdr(0x02, $flags, 24 + strlen($stub) + strlen($tail), $auth ? 16 : 0, $call) . pack('VvCC', strlen($stub), 0, 0, 0) . $stub . $tail;
+        };
+        $msgs = [];
+        for ($i = rnd(12) + 1; $i > 0; $i--) {
+            $m      = chance(70) ? $pdu() : $pdu() . $pdu();
+            $msgs[] = chance(10) ? pick(["HTTP/1.1 200 Success\r\nContent-Length: 1073741824\r\n\r\n", "HTTP/1.1 401 Unauthorized\r\n\r\n", bytes(rnd(60)) . "\r\n\r\n"]) . $m : maybe($m, 80);
+        }
+        // the tunnel's answer, the authorization's, a message: as the fixture's, changed or garbage
+        [$w, $n, $padW] = $text();
+        $neg    = rnd(0x1F);
+        $pid    = pick([0x4350, 0x4552, rnd(0xFFFF)]);
+        $tunnel = pack('VVVV', 0x00020000, $pid, $pid, 0x00020004) . pack('VVV', 0, chance(80) ? 0 : rnd(64), pick([0, 0x00020008])) . bytes(16) . pack('V', pick([0x00020008, 0]))
+            . ($pid === 0x4350 ? pack('VVVVV', 1, pick([1, 2, rnd(9)]), rnd(2), 1, pick([0x0002000C, 0])) : '')
+            . pack('vvV', 0x5452, 0x5643, 0x00020010) . pack('V', chance(90) ? 1 : rnd(0xFFFF)) . pack('vvvv', 1, 1, 0, 0) . pack('V', 1) . pack('VVV', 1, 1, $neg)
+            . pack('VVVV', rnd(2), rnd(2), chance(80) ? $n : rnd(0xFFFF), pick([0x00020014, 0])) . pack('VVV', $n, 0, $n) . $w . $padW
+            . bytes(20) . pack('VV', 3, pick([0, 0x800759DB, 0x800759E9, rnd(0xFFFFFFFF)]));
+        $authz  = pack('VVVV', 0x00020000, pick([0x5052, 0x800759DB, rnd(0xFFFF)]), 0x5052, 0x00020004) . pack('VVVV', 0x5152, 0, 0, 0)
+            . pack('l8', ...array_map(static fn() => pick([0, 1, rnd(0xFFFF)]), range(1, 8))) . pack('V', pick([0, 0x800759ED, rnd(0xFFFFFFFF)]));
+        return [['state' => rnd(3), 'recycle' => rnd(4), 'consent' => chance(50), 'fault' => chance(10) ? rnd(0xFFFFFFFF) : null],
+            [...$msgs, maybe($tunnel, 60), maybe($authz, 60), maybe($msgStub(), 60)]];
+    },
+    static function (array $o, array $msgs): void {
+        $g     = (new ReflectionClass(Gateway::class))->newInstanceWithoutConstructor();
+        $set   = static fn(string $p, mixed $v) => (new ReflectionProperty(Gateway::class, $p))->setValue($g, $v);
+        $pf    = PHP_OS_FAMILY === 'Windows' ? STREAM_PF_INET : STREAM_PF_UNIX;   // (a pair of TCP sockets: Windows only)
+        $pairs = [stream_socket_pair($pf, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP), stream_socket_pair($pf, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP)];
+        // (a new OUT channel asked for: to port 0, refused at once, as a gateway gone)
+        foreach (['rpc' => true, 'rpcState' => $o['state'], 'recycle' => $o['recycle'], 'pipeCall' => 5, 'msgCall' => 6, 'msgCalls' => 32, 'rpcWaiting' => [7 => true],
+                  'sock' => $pairs[0][0], 'succ' => $pairs[1][0], 'rpcHttp' => ['gw.test', 'gw.test', '127.0.0.1', 0, 'u', 'd', 'p', '', 'id']] as $p => $v) {
+            $set($p, $v);
+        }
+        [$tunnel, $authz, $msg] = array_splice($msgs, -3);
+        $call = static function (string $m, mixed ...$args) use ($g): void {
+            try {
+                (new ReflectionMethod(Gateway::class, $m))->invoke($g, ...$args);
+            } catch (ProtocolException) {
+            }
+        };
+        foreach ($msgs as $m) {
+            $set('in', $m);
+            $call('rpcIncoming');
+        }
+        $call('rpcTunnel', $tunnel, $o['fault'], static fn(string $t): bool => $o['consent']);
+        $call('rpcAuthorized', $authz, $o['fault']);
+        $call('rpcMessage', $msg);
+        foreach ($pairs as [$a, $b]) {
+            is_resource($a) && fclose($a);
+            fclose($b);
+        }
+    },
 ];
 
 // ------------------------------------------------------------------ run
@@ -900,7 +1241,7 @@ $tmp = sys_get_temp_dir() . '/mudesk-fuzz-' . bin2hex(random_bytes(4));
 mkdir("$tmp/data/tmp/fuzz", 0700, true);
 file_put_contents("$tmp/config.php", '<?php return ["data_dir" => ' . var_export("$tmp/data", true) . '];');
 Config::load("$tmp/config.php");
-file_put_contents(Config::dir('settings.json'), '{"files_quota_mb":1}');
+file_put_contents(Config::dir('settings.json'), '{"files_quota_mb":1,"kerberos_rc4":true}');   // (RC4's code fuzzed too)
 file_put_contents(Cliprdr::tmpDir('fuzz') . '/0', str_repeat('f', 100));
 file_put_contents(Cliprdr::tmpDir('fuzz') . '/1', '');
 file_put_contents(Cliprdr::tmpDir('fuzz') . '/image.dib', pack('VllvvVV', 40, 1, 1, 1, 32, 0, 4) . str_repeat("\0", 20));

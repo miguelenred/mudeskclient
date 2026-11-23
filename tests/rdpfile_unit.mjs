@@ -18,15 +18,18 @@ const mstsc = ['screen mode id:i:2', 'use multimon:i:0', 'desktopwidth:i:1920', 
   'remoteapplicationmode:i:0', 'alternate shell:s:', 'shell working directory:s:', 'gatewayhostname:s:rdg.ejemplo.com',
   'gatewayusagemethod:i:1', 'gatewaycredentialssource:i:4', 'gatewayprofileusagemethod:i:1', 'promptcredentialonce:i:0',
   'gatewaybrokeringtype:i:0', 'use redirection server name:i:0', 'rdgiskdcproxy:i:0', 'kdcproxyname:s:',
+  'loadbalanceinfo:s:tsv://MS Terminal Services Plugin.1.Escritorios',
   'username:s:EJEMPLO\\maría', 'password 51:b:01000000D08C9DDF0115D1118C7A00C04FC297EB0100000034ABCD'].join('\r\n') + '\r\n';
 const a = parseRdp(decodeRdp(utf16(mstsc)), 'Oficina María.rdp');
 check('.rdp from Remote Desktop Connection (UTF-16 LE): address and port, DOMAIN\\user, colours, redirections, appearance',
   JSON.stringify(a.conn) === JSON.stringify({ name: 'Oficina María', group: '', host: 'pc-oficina.ejemplo.local', port: 3390, user: 'maría',
     domain: 'EJEMPLO', kbd: 0x040A, bpp: 32, gfx: 'auto', security: 'auto', resize: 'dynamic', clipboard: true, paste: 'auto', printer: false,
-    drive: true, audio: true, mic: false, ask: true, app: '', app_args: '', perf: { wallpaper: true, themes: true, smoothing: true, animations: false, drag: false } }),
+    drive: true, audio: true, mic: false, ask: true, app: '', app_args: '', perf: { wallpaper: true, themes: true, smoothing: true, animations: false, drag: false },
+    gw: 'rdg.ejemplo.com', lb: 'tsv://MS Terminal Services Plugin.1.Escritorios' }),
   JSON.stringify(a.conn));
-check('.rdp: what MuDesk does not take is said (gateway, saved password); the password is never read',
-  JSON.stringify(a.notes) === JSON.stringify([['rdp_gateway', 'rdg.ejemplo.com'], ['rdp_file_password', '']]) && !JSON.stringify(a).includes('D08C9DDF'),
+check('.rdp: what MuDesk does not take is said (the saved password); the password is never read; the gateway and the broker\'s load balance info taken and written back',
+  JSON.stringify(a.notes) === JSON.stringify([['rdp_file_password', '']]) && !JSON.stringify(a).includes('D08C9DDF')
+    && toRdp(a.conn).includes('gatewayhostname:s:rdg.ejemplo.com\r\ngatewayusagemethod:i:1') && toRdp(a.conn).includes('loadbalanceinfo:s:tsv://MS Terminal Services Plugin.1.Escritorios'),
   JSON.stringify(a.notes));
 
 // other encodings and forms: UTF-8 (with and without BOM), Windows-1252, UTF-16 without BOM; IPv6 in brackets and bare; the
@@ -72,6 +75,19 @@ check('.rdp written: UTF-16 LE with BOM and CRLF, read back the same (drives nev
     === JSON.stringify([['pc.local', 3389, 'ana', 'CASA', 24, 'tls', 'fit', false, true, false, false, true, { wallpaper: true, themes: false, smoothing: true, animations: true, drag: false }],
       ['fe80::2', 3390, 'luis@ejemplo.com', '', 32, 'auto', 'dynamic', true, false, false, true, false, { wallpaper: false, themes: false, smoothing: false, animations: false, drag: false }]]),
   JSON.stringify(back));
+
+// the camera: one box with the microphone, taken from either (a camera redirected: `camerastoredirect` with a device, "*"
+// for all), and written to both
+const camOnly = parseRdp('full address:s:pc\r\naudiocapturemode:i:0\r\ncamerastoredirect:s:*\r\n', 'c').conn;
+const camNone = parseRdp('full address:s:pc\r\naudiocapturemode:i:0\r\ncamerastoredirect:s:\r\n', 'c').conn;
+check('.rdp: the camera taken with the microphone\'s box (camerastoredirect), and written with it',
+  camOnly.mic === true && camNone.mic === false && text0.includes('\r\ncamerastoredirect:s:*\r\n') && text0.includes('\r\naudiocapturemode:i:1\r\n')
+  && decodeRdp(written[1]).includes('\r\ncamerastoredirect:s:\r\n'), JSON.stringify([camOnly.mic, camNone.mic]));
+
+// a line break in a value (a name or user with one, from a CSV cell or a direct call) never makes a line of its own in the file
+const injected = toRdp({ host: 'pc', port: 3389, user: 'ana\r\nfull address:s:otro', name: 'N', app: 'C:\\a.exe', app_args: '-x\r\nalternate shell:s:cmd' });
+check('.rdp written: a line break in a value never makes a line of its own', !injected.includes('\r\nfull address:s:otro') && !injected.includes('\r\nalternate shell:s:cmd')
+  && injected.includes('username:s:anafull address:s:otro'), injected);
 
 console.log(failed ? `\n${failed} failed` : '\nAll tests passed');
 process.exit(failed ? 1 : 0);

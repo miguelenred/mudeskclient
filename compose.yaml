@@ -1,0 +1,22 @@
+# MuDeskClient - https://miguelenred.es/mudeskclient - Apache License 2.0
+# MuDeskClient with Docker Compose: `docker compose up -d` in this folder, then open https://localhost:8443 and type the
+# setup code: docker compose exec mudesk cat /var/www/mudesk/data/setup-code.php (its second line).
+# It runs the published image; to build the image from this folder's code instead, uncomment the line "build: ." and
+# start it with `docker compose up -d --build`. See "Option D: Docker" in docs/INSTALL.md.
+services:
+  mudesk:
+    image: ghcr.io/miguelenred/mudeskclient:latest
+    # build: .
+    container_name: mudesk
+    restart: unless-stopped
+    ports:
+      - "8443:443"
+    volumes:
+      - mudesk-data:/var/www/mudesk/data   # users, connections and settings: kept when the container is made again
+      - mudesk-tls:/etc/mudesk/tls         # the self-signed certificate made at the first start (or your cert.pem and key.pem)
+    # environment:
+    #   MUDESK_HOSTNAME: mudesk.example.com   # the name in the self-signed certificate
+
+volumes:
+  mudesk-data:
+  mudesk-tls:

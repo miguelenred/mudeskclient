@@ -5,10 +5,49 @@
 let failed = 0;
 const check = (name, ok, info = '') => { console.log((ok ? 'OK   ' : 'FAIL ') + name + (info ? ' ' + info : '')); if (!ok) failed++; };
 const tick = () => new Promise((r) => setTimeout(r, 0));
+// the test's own clock for the session's timers (retries, resize checks): the timers due run in their order, the answers
+// between them, the same on any computer, loaded or not (checks in real time failed now and then on a busy one); a timer
+// of 0 ms stays a real one (tick)
+const testClock = () => {
+  const real = [globalThis.setTimeout, globalThis.clearTimeout];
+  let now = 0;
+  const due = [];
+  globalThis.setTimeout = (f, ms = 0, ...a) => {
+    if (!(+ms > 0)) return real[0](f, 0, ...a);
+    const tm = { at: now + +ms, f: () => f(...a) };
+    due.push(tm);
+    return tm;
+  };
+  globalThis.clearTimeout = (tm) => { if (tm && typeof tm === 'object') tm.f = null; else real[1](tm); };
+  const settle = async () => { for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r)); };
+  return {
+    async advance(ms) {
+      const end = now + ms;
+      for (;;) {
+        await settle();
+        const next = due.filter((tm) => tm.f && tm.at <= end).sort((x, y) => x.at - y.at)[0];
+        if (!next) break;
+        now = next.at;
+        const f = next.f;
+        next.f = null;
+        f();
+      }
+      now = end;
+      await settle();
+    },
+    restore() { [globalThis.setTimeout, globalThis.clearTimeout] = real; },
+  };
+};
 
 // ------------------------------------------------------------ browser doubles
 class El {
-  constructor() { this.l = {}; this.style = {}; this.value = ''; this.width = 1024; this.height = 768; this.offsetWidth = 1024; this.offsetHeight = 768; }
+  constructor() {
+    this.l = {}; this.style = {}; this.value = ''; this.width = 1024; this.height = 768; this.offsetWidth = 1024; this.offsetHeight = 768;
+    const c = this.classes = new Set();
+    this.classList = { add: (...n) => n.forEach((x) => c.add(x)), remove: (...n) => n.forEach((x) => c.delete(x)), contains: (n) => c.has(n),
+      toggle: (n, on = !c.has(n)) => { if (on) c.add(n); else c.delete(n); return on; } };
+  }
+  appendChild(e) { (this.children ||= []).push(e); return e; }
   addEventListener(t, f) { (this.l[t] ||= []).push(f); }
   fire(t, e = {}) { e.target ??= this; e.preventDefault ??= () => { e.prevented = true; }; (this.l[t] || []).forEach((f) => f(e)); return e; }
   getBoundingClientRect() { return { left: 0, top: 0, width: this.width, height: this.height }; }
@@ -40,7 +79,7 @@ class Pixels {
 }
 Object.assign(globalThis, {
   document: { hidden: false, createElement: () => new El(), addEventListener() {} },
-  ResizeObserver: class { observe() {} },
+  ResizeObserver: class { observe() {} disconnect() {} },
   ImageData: class { constructor(data, w, h) { Object.assign(this, { data, w, h }); } },
   Worker: class { constructor() { this.msgs = []; workers.push(this); } postMessage(m) { this.msgs.push(m); } terminate() {} },
   requestAnimationFrame: (f) => setTimeout(f, 0),
@@ -413,7 +452,103 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   const frames = [Uint8Array.of(2, 5, 0, 0, 0, 100, 0, 100, 0, 16), bitmap(64, 64), bitmap(200, 100)];
   const sizes = await run({ ok: true, body: { getReader: () => ({ read: async () => (frames.length ? { value: frames.shift(), done: false } : { done: true }) }) } });
   const seen = sizes.filter((m) => m.t !== 'end').map((m) => m.t === 'log' ? m.msg : m.t).join(' | ');
-  check('worker: bitmaps no larger than the desktop', seen === 'frame | rect | bitmap: bad size or depth (200 x 100 at 16 bpp)', seen);
+  check('worker: bitmaps no larger than the desktop', seen === 'frame | rects | bitmap: bad size or depth (200 x 100 at 16 bpp)', seen);
+
+  // the bitmaps of an update go to the page together, 64 at most in a message (one each was half of the page's time on
+  // them), in order; those decoded before a broken one still go, before its error
+  const many = (n, bad) => {
+    const len = 16 * 16 * 2, u = new Uint8Array(5 + 1 + 4 + n * (18 + len)), dv = new DataView(u.buffer);
+    u[0] = 1; dv.setUint32(1, u.length - 5, true); u[5] = 1; dv.setUint16(8, n, true);
+    for (let i = 0, o = 10; i < n; i++, o += 18 + len) {
+      const [w, h] = i === bad ? [200, 100] : [16, 16];
+      [i * 16 % 96, 0, i * 16 % 96 + 15, 15, w, h, 16, 0, len].forEach((v, k) => dv.setUint16(o + k * 2, v, true));
+    }
+    return u;
+  };
+  const upd = [Uint8Array.of(2, 5, 0, 0, 0, 100, 0, 100, 0, 16), many(150), many(5, 3)];
+  const batches = await run({ ok: true, body: { getReader: () => ({ read: async () => (upd.length ? { value: upd.shift(), done: false } : { done: true }) }) } });
+  const shape = batches.filter((m) => m.t !== 'end' && m.t !== 'frame').map((m) => (m.t === 'rects' ? m.rects.length + ':' + m.rects.map((r) => r.x).join('.') : m.t)).join(' | ');
+  const xs = (n) => Array.from({ length: n }, (_, i) => i * 16 % 96).join('.');
+  check('worker: the bitmaps of an update in messages of 64 at most, in order; those before a broken one first',
+    shape === `64:${xs(64)} | ${'64:' + Array.from({ length: 64 }, (_, i) => (i + 64) * 16 % 96).join('.')} | 22:${Array.from({ length: 22 }, (_, i) => (i + 128) * 16 % 96).join('.')} | 3:${xs(3)} | log`, shape);
+
+  // ... and about 4 million pixels at most in a message (64 bitmaps of a whole 1920 x 1080 desktop, from a few hundred bytes
+  // of update, held 506 MB in the worker before it posted them)
+  const whole = (n) => {
+    const u = new Uint8Array(5 + 1 + 4 + n * 18), dv = new DataView(u.buffer);
+    u[0] = 1; dv.setUint32(1, u.length - 5, true); u[5] = 1; dv.setUint16(8, n, true);
+    for (let i = 0, o = 10; i < n; i++, o += 18) [0, 0, 1023, 1023, 1024, 1024, 32, 0, 0].forEach((v, k) => dv.setUint16(o + k * 2, v, true));
+    return u;
+  };
+  const updWhole = [Uint8Array.of(2, 5, 0, 0, 0, 0, 4, 0, 4, 32), whole(10)];
+  const wholes = await run({ ok: true, body: { getReader: () => ({ read: async () => (updWhole.length ? { value: updWhole.shift(), done: false } : { done: true }) }) } });
+  const perMsg = wholes.filter((m) => m.t === 'rects').map((m) => m.rects.length).join(' ');
+  check('worker: about 4 million pixels at most in a message of bitmaps', perMsg === '4 4 2', perMsg);
+
+  // connected again for a guest of a shared session (frame 14): the worker's decoders start anew (a fragment of the old
+  // connection is not joined to the new one's), and the page is told
+  const f10 = (frag, bytes) => { const u = new Uint8Array(8 + bytes.length); u[0] = 10; new DataView(u.buffer).setUint32(1, 3 + bytes.length, true); u.set([5, frag, 0, ...bytes], 5); return u; };
+  const resetRun = async (withReset) => {
+    const parts = [f10(2, [7, 7, 7]), ...(withReset ? [Uint8Array.of(14, 0, 0, 0, 0)] : []), f10(1, [9, 9])];
+    const out = await run({ ok: true, body: { getReader: () => ({ read: async () => (parts.length ? { value: parts.shift(), done: false } : { done: true }) }) } });
+    return out.filter((m) => m.t === 'frame').map((m) => m.type + ':' + [...m.d].join(','));
+  };
+  const resets = [await resetRun(false), await resetRun(true)];
+  check('worker: connected again for a guest: its decoders start anew, and the page is told',
+    JSON.stringify(resets) === JSON.stringify([['1:5,7,7,7,9,9'], ['14:', '1:5,9,9']]), JSON.stringify(resets));
+
+  // a recording played (frames with their time, [u32 ms][u8 type][u32 length][payload]): at its pace, times the speed; what
+  // comes before `from` at once; paused and played again from the page; its position told, and its end
+  const timed = (list) => {
+    const parts = list.map(([ms, json]) => {
+      const d = new TextEncoder().encode(json), u = new Uint8Array(9 + d.length), dv = new DataView(u.buffer);
+      dv.setUint32(0, ms, true); u[4] = 3; dv.setUint32(5, d.length, true); u.set(d, 9);
+      return u;
+    });
+    parts.push(Uint8Array.of(0, 0, 0, 0, 0, 3, 0, 0, 0, 101, 110, 100));   // the gateway's "end": read whole
+    return { ok: true, body: { getReader: () => ({ read: async () => (parts.length ? { value: parts.shift(), done: false } : { done: true }) }) } };
+  };
+  const playFor = async (o, during) => {
+    globalThis.fetch = async () => timed([[0, '{"a":0}'], [100, '{"a":100}'], [200, '{"a":200}']]);
+    posted.length = 0;
+    const t0 = performance.now(), at = [];
+    const seen = new Proxy(posted, { set: (a, k, v) => { if (v?.t === 'frame') at.push(Math.round(performance.now() - t0)); a[k] = v; return true; } });
+    globalThis.postMessage = (m) => seen.push(m);
+    const done = globalThis.onmessage({ data: { url: 'https://gateway.test/rdp.php?a=replay', headers: {}, body: '', timed: true, ...o } });
+    await during?.();
+    await Promise.race([done, new Promise((r) => setTimeout(r, 3000))]);   // (a worker that never ends: said, not waited for)
+    globalThis.onmessage({ data: { cmd: 'stop' } });
+    globalThis.postMessage = (m) => posted.push(m);
+    return { at, frames: posted.filter((m) => m.t === 'frame').length, end: posted.filter((m) => m.t === 'pos').at(-1) };
+  };
+  // (times measured on a busy computer can come late: measured again, up to 3 times; a pace that is wrong fails all of them)
+  const paced = async () => ({
+    normal: await playFor({ from: 0, speed: 1 }),
+    fast: await playFor({ from: 0, speed: 4 }),
+    jump: await playFor({ from: 150, speed: 1 }),
+    paused: (await playFor({ from: 0, speed: 1 }, async () => {
+      await new Promise((r) => setTimeout(r, 20));
+      globalThis.onmessage({ data: { cmd: 'pause' } });
+      await new Promise((r) => setTimeout(r, 300));
+      globalThis.onmessage({ data: { cmd: 'play' } });
+    })).at,
+  });
+  const onPace = ({ normal, fast, jump, paused }) => normal.frames === 3 && normal.at[2] >= 190 && normal.at[2] < 400 && fast.at[2] >= 45
+    && fast.at[2] < 150 && jump.at[1] < 40 && jump.at[2] >= 40 && jump.at[2] < 150 && paused[2] >= 480 && normal.end?.done === true && normal.end?.ms === 200;
+  let pacing = await paced();
+  for (let i = 1; i < 3 && !onPace(pacing); i++) pacing = await paced();
+  let stoppedIn = null;
+  const stopped = await playFor({ from: 0, speed: 1 }, async () => {
+    await new Promise((r) => setTimeout(r, 20));
+    globalThis.onmessage({ data: { cmd: 'pause' } });
+    const t = performance.now();
+    globalThis.onmessage({ data: { cmd: 'stop' } });   // the page left the player while paused
+    stoppedIn = t;
+  });
+  stoppedIn = performance.now() - stoppedIn;
+  check('worker: a recording stopped while paused ends at once (its worker went on for ever)', stopped.frames === 1 && stoppedIn < 500, JSON.stringify({ stopped, stoppedIn }));
+  check('worker: a recording at its pace (times the speed), from a point at once, paused and played again; its end told',
+    onPace(pacing), JSON.stringify(pacing));
   globalThis.fetch = fetch0;
 }
 
@@ -526,6 +661,7 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   const container = new El(), canvas = new El(), keyboard = new El();
   const s = new RdpSession({ container, canvas, keyboard, conn: { id: 'c', resize: 'fit' }, csrf: 'x', retries: 3, onState: () => {} });
   s.setMonitors([{ vx: 0, vy: 0, w: 1920, h: 1080, primary: true }, { vx: 1920, vy: 0, w: 1280, h: 1024, primary: false }], 0);
+  const clock = testClock();
   s.start();
   await tick();
   const wk = workers.at(-1);
@@ -538,10 +674,42 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   await tick();
   const n0 = sent.length;
   wk.onmessage({ data: { t: 'frame', type: 5, d: new Uint8Array(0) } });   // Display Control is there
-  await new Promise((r) => setTimeout(r, 450));
+  await clock.advance(450);
+  clock.restore();
   const asked = sent.slice(n0).map((x) => x.payload).filter((p) => p[0] === 13).map((p) => new TextDecoder().decode(new Uint8Array(p.slice(1))));
   check('several screens: a window opened while connecting gets its monitor once connected', asked.length >= 1
     && asked.every((a) => a === '[[0,0,1920,1080,1],[1920,0,1280,1024,0]]'), JSON.stringify(asked));
+}
+
+// a window that takes its size while connecting (Firefox: the other screen's window opened small, 400 x 300, and made the
+// size of its screen just after; the request had gone with its first size): its monitor follows once connected, without
+// waiting for Display Control (before, that monitor stayed 400 x 300 until the server opened it, a minute later)
+{
+  const container = new El(), canvas = new El(), keyboard = new El();
+  const s = new RdpSession({ container, canvas, keyboard, conn: { id: 'c', resize: 'dynamic' }, csrf: 'x', retries: 3, onState: () => {} });
+  s.setMonitors([{ vx: 0, vy: 0, w: 1920, h: 1080, primary: true }, { vx: 1920, vy: 0, w: 1920, h: 1080, primary: false }], 0);
+  const wl = {}, win = { innerWidth: 400, innerHeight: 300, addEventListener: (t, f) => { (wl[t] ||= []).push(f); } };
+  const other = new El();
+  other.ownerDocument = { defaultView: win };
+  s.addView(other, new El(), 1);                         // found before connecting: its window still small
+  const clock = testClock();
+  s.start();
+  await tick();
+  const wk = workers.at(-1), monsOf = (w) => JSON.parse(w.msgs.find((m) => m.body)?.body || '{}').mons?.map((m) => m.slice(2, 4));
+  const first = monsOf(wk);
+  Object.assign(win, { innerWidth: 1904, innerHeight: 1000 });   // the size of its screen, while connecting
+  (wl.resize || []).forEach((f) => f());
+  await clock.advance(450);
+  wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify({ token: 't' })) } });   // its session id
+  await clock.advance(1800);                             // (checked; no Display Control yet: connected again with it)
+  const quit = wk.msgs.some((m) => m.cmd === 'stop');
+  wk.onmessage({ data: { t: 'end' } });                  // (the connection before, ended)
+  await tick();
+  const again = workers.at(-1) === wk ? null : monsOf(workers.at(-1));
+  s.stop();
+  clock.restore();
+  check('several screens: a window that took its size while connecting gets a monitor of that size once connected, not when Display Control opens',
+    JSON.stringify(first?.[1]) === '[400,300]' && quit && JSON.stringify(again?.[1]) === '[1904,1000]', JSON.stringify({ first, quit, again }));
 }
 
 // RemoteApp: only the windows of the program are copied to the page (their visible region, else their frame), over the page:
@@ -562,7 +730,7 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   await new Promise((r) => setTimeout(r, 5));
   const first = canvas.ctx.calls.filter((c) => c[0] === 'clearRect' || c[0] === 'drawImage').map((c) => c.slice(0, c[0] === 'drawImage' ? 5 : 5).map((v) => (typeof v === 'object' ? 'surface' : v)).join(' '));
   canvas.ctx.calls.length = 0;
-  wk.onmessage({ data: { t: 'rect', x: 0, y: 0, w: 450, h: 120, cw: 450, ch: 120, px: new Uint8Array(450 * 120 * 4) } });   // a bitmap over window 1 and outside
+  wk.onmessage({ data: { t: 'rects', rects: [{ x: 0, y: 0, w: 450, h: 120, cw: 450, ch: 120, px: new Uint8Array(450 * 120 * 4) }] } });   // a bitmap over window 1 and outside
   await new Promise((r) => setTimeout(r, 5));
   const copied = canvas.ctx.calls.filter((c) => c[0] === 'drawImage').map((c) => c.slice(1, 9).map((v) => (typeof v === 'object' ? 'surface' : v)).join(' '));
   op({ op: 'window', id: 1, show: 2 });                // minimized
@@ -914,6 +1082,53 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   s.stop();
 }
 {
+  // several screens: this window hidden (minimized, covered by another program, another tab) while another screen's window
+  // is in view: what changed reached that window only on this page's frames, which a hidden page does not get (it froze
+  // until this one was seen again). Now on the frames of a window in view, also a change waiting as this one hid
+  const docL = {}, add0 = document.addEventListener, raf0 = globalThis.requestAnimationFrame;
+  document.addEventListener = (t, f) => (docL[t] ||= []).push(f);
+  const { s, wk } = await session({ conn: { id: 'c', resize: 'dynamic' } });
+  document.addEventListener = add0;
+  s.setMonitors([{ vx: 0, vy: 0, w: 1920, h: 1080, primary: true }, { vx: 1920, vy: 0, w: 1920, h: 1080, primary: false }], 0);
+  const asked = [];
+  const win = { innerWidth: 1000, innerHeight: 700, addEventListener() {}, requestAnimationFrame: (f) => { asked.push('other'); setTimeout(f, 0); } };
+  const other = new El();
+  other.ownerDocument = { hidden: false, addEventListener() {}, defaultView: win };
+  s.addView(other, new El(), 1);
+  wk.onmessage({ data: { t: 'frame', type: 5, d: new Uint8Array(0) } });   // Display Control, then the monitors taken
+  await tick();
+  wk.onmessage({ data: { t: 'frame', type: 2, d: new Uint8Array([2024 & 255, 2024 >> 8, 768 & 255, 768 >> 8, 32]) } });
+  await tick();
+  await tick();
+  const ctx = other.getContext('2d'), drawn = () => ctx.calls.filter((c) => c[0] === 'drawImage').length;
+  const change = () => wk.onmessage({ data: { t: 'rects', rects: [{ x: 1030, y: 10, w: 4, h: 4, cw: 4, ch: 4, px: new Uint32Array(16) }] } });
+  globalThis.requestAnimationFrame = () => asked.push('this');   // this page's frames: they do not come while it is hidden
+  document.hidden = true;
+  docL.visibilitychange?.forEach((g) => g());
+  let n = drawn();
+  asked.length = 0;
+  change();                                               // in the other screen's part of the desktop
+  await tick();
+  await tick();
+  const hidden = [asked.join(' '), drawn() - n];
+  document.hidden = false;
+  docL.visibilitychange?.forEach((g) => g());
+  n = drawn();
+  asked.length = 0;
+  change();                                               // asked from this page, which hides before its frame
+  await tick();
+  document.hidden = true;
+  docL.visibilitychange?.forEach((g) => g());
+  await tick();
+  await tick();
+  const waiting = [asked.join(' '), drawn() - n];
+  globalThis.requestAnimationFrame = raf0;
+  document.hidden = false;
+  check('screens: this window hidden, the other screen\'s window in view keeps changing, also with a change waiting as this one hid',
+    JSON.stringify([hidden, waiting]) === JSON.stringify([['this other', 1], ['this other', 1]]), JSON.stringify([hidden, waiting]));
+  s.stop();
+}
+{
   // a touch the browser cancels (a system gesture starting on the screen) was sent as a click
   const { s, canvas } = await session();
   const f = sent.length;
@@ -977,6 +1192,63 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   s.stop();
 }
 
+// ------------------------------------------------------------ graphics ops of several areas
+
+{
+  // an op of several areas (fill, cache to surface, surface to surface, video) draws them all on the surface before it copies
+  // them to the desktop: a surface written after a copy of it in the same task is copied whole first (a fill of four
+  // rectangles on 1920 x 1080 took 18 ms, 0.2 ms this way); an area drawn over one not copied yet has it copied first. A
+  // video frame is drawn once through all its areas (each drawing converts the whole frame: 7 ms at 1920 x 1080)
+  const { s } = await session();
+  const log = [];
+  const rec = (tag) => new Proxy({}, { get: (o, k) => (k in o ? o[k] : (...a) => log.push(tag + k)), set: (o, k, v) => { o[k] = v; return true; } });
+  s.gfx.apply({ op: 'create', id: 3, w: 512, h: 512 });
+  s.gfx.apply({ op: 'create', id: 4, w: 512, h: 512 });
+  s.gfx.apply({ op: 'map', id: 3, x: 0, y: 0 });
+  s.gfx.cache.set(1, Object.assign(new El(), { width: 32, height: 32 }));
+  s.gfx.surfaces.get(3).ctx = rec('s.');
+  s.sctx = rec('d.');
+  const run = (o) => { log.length = 0; s.gfx.apply(o); return log.filter((x) => /drawImage|fillRect|clip/.test(x)).join(' '); };
+  const a = (l, t, w, h) => ({ l, t, r: l + w, b: t + h });
+  let closed = 0;
+  const got = {
+    fill: run({ op: 'fill', id: 3, color: 0x123456, rects: [a(0, 0, 10, 10), a(20, 0, 10, 10), a(40, 0, 10, 10)] }),
+    overlap: run({ op: 'fill', id: 3, color: 0x123456, rects: [a(0, 0, 10, 10), a(5, 5, 10, 10), a(40, 0, 10, 10)] }),
+    c2s: run({ op: 'c2s', id: 3, slot: 1, pts: [[0, 0], [100, 0]] }),
+    s2s: run({ op: 's2s', src: 4, dst: 3, rect: a(0, 0, 16, 16), pts: [[0, 0], [100, 0]] }),
+    video: run({ op: 'video', id: 3, frame: { close: () => closed++ }, rects: [a(0, 0, 16, 16), a(64, 0, 16, 16), a(0, 64, 16, 16)] }),
+  };
+  const want = {
+    fill: 's.fillRect s.fillRect s.fillRect d.drawImage d.drawImage d.drawImage',
+    overlap: 's.fillRect d.drawImage s.fillRect s.fillRect d.drawImage d.drawImage',
+    c2s: 's.drawImage s.drawImage d.drawImage d.drawImage',
+    s2s: 's.drawImage s.drawImage d.drawImage d.drawImage',
+    video: 's.clip s.drawImage d.drawImage d.drawImage d.drawImage',
+  };
+  check('graphics: an op of several areas draws them all on the surface, then copies them to the desktop; a video frame drawn once',
+    JSON.stringify(got) === JSON.stringify(want) && closed === 1, JSON.stringify({ got, closed }));
+  s.stop();
+}
+{
+  // ... a video frame that cannot be drawn (closed, or of another size) leaves its surface unclipped, and is closed (before,
+  // every later drawing on the surface stayed inside the frame's areas, and the frame held the decoder's memory)
+  const { s } = await session();
+  s.gfx.apply({ op: 'create', id: 3, w: 512, h: 512 });
+  const log = [];
+  s.gfx.surfaces.get(3).ctx = new Proxy({}, { get: (o, k) => (k in o ? o[k] : k === 'drawImage' ? () => { throw new Error('InvalidStateError'); } : () => log.push(k)),
+    set: (o, k, v) => { o[k] = v; return true; } });
+  let thrown = '', closed = 0;
+  try {
+    s.gfx.apply({ op: 'video', id: 3, frame: { close: () => closed++ }, rects: [{ l: 0, t: 0, r: 16, b: 16 }, { l: 64, t: 0, r: 80, b: 16 }] });
+  } catch (e) {
+    thrown = e.message;
+  }
+  const n = (k) => log.filter((x) => x === k).length;
+  check('graphics: a video frame that cannot be drawn leaves its surface unclipped, and is closed',
+    n('save') === 1 && n('restore') === 1 && closed === 1 && thrown === 'InvalidStateError', JSON.stringify({ log, closed, thrown }));
+  s.stop();
+}
+
 // ------------------------------------------------------------ graphics of no size
 
 {
@@ -987,7 +1259,7 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   globalThis.ImageData = class { constructor(data, w, h) { if (!w || !h) throw new Error('IndexSizeError'); Object.assign(this, { data, w, h }); } };
   const thrown = [];
   const run = (f) => { try { f(); } catch (e) { thrown.push(e.message); } };
-  run(() => wk.onmessage({ data: { t: 'rect', x: 0, y: 0, w: 0, h: 64, cw: 0, ch: 64, px: new Uint8Array(0) } }));
+  run(() => wk.onmessage({ data: { t: 'rects', rects: [{ x: 0, y: 0, w: 0, h: 64, cw: 0, ch: 64, px: new Uint8Array(0) }] } }));
   run(() => s.gfx.apply({ op: 'create', id: 7, w: 64, h: 64 }));
   const surf = s.gfx.surfaces.get(7);
   if (surf) surf.ctx = new Proxy({ calls: [] }, { get: (o, k) => (k in o ? o[k] : k === 'getImageData' ? (x, y, w, h) => { if (!w || !h) throw new Error('IndexSizeError'); return { data: [] }; } : () => {}) });
@@ -1054,6 +1326,302 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
     JSON.stringify(got[0]) === '[1,68,172,0,0,1]' && waiting.length === 1 && waiting[0].join() === '15,3,3,4,4,5,5,6,6'
       && mics.length === 1 && mics[0] === '3,3,4,4,5,5,6,6' && got.includes('stop'),
     JSON.stringify({ got, waiting, mics }));
+  s.stop();
+}
+
+// ------------------------------------------------------------ multitouch: the fingers as touch frames while the gateway says so
+
+{
+  // before the gateway says so, a tap is a mouse click; then each change is a frame with every finger on the screen: ids from
+  // 0 (the lowest free one again later), down / moved or still / lifted, a finger put down and lifted at once sent down then
+  // up; the gateway's {"touch": false} brings the mouse back
+  Object.defineProperty(navigator, 'maxTouchPoints', { value: 5, configurable: true });
+  const { s, canvas: c, wk } = await session();
+  const n0 = sent.length;
+  c.fire('pointerdown', touch(1, 10, 10));
+  c.fire('pointerup', touch(1, 10, 10));
+  await tick();
+  const asMouse = sent.slice(n0).every((x) => x.payload[0] === 1);
+  const frame = (wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode('{"touch":true}') } }), () => {});
+  frame();
+  const n1 = sent.length;
+  c.fire('pointerdown', touch(1, 100, 100));
+  c.fire('pointerdown', touch(2, 300, 300));
+  await tick();
+  c.fire('pointermove', touch(1, 140, 100));
+  await tick();
+  c.fire('pointerup', touch(2, 300, 300));
+  await tick();
+  c.fire('pointerdown', touch(3, 50, 50));
+  c.fire('pointerup', touch(3, 50, 50));
+  await tick();
+  c.fire('pointercancel', touch(1, 140, 100));
+  await tick();
+  const frames = sent.slice(n1).filter((x) => x.payload[0] === 16).map(({ payload: p }) => {
+    const out = [];
+    for (let i = 0; i < p[1]; i++) {
+      const o = 2 + i * 6, x = (p[o + 2] | (p[o + 3] << 8)) << 16 >> 16;
+      out.push(`${p[o]}:${['down', 'still', 'up', 'cancel'][p[o + 1]]}@${x}`);
+    }
+    return out;
+  });
+  const shape = frames.map((f) => f.map((x) => x.replace(/@.*/, ''))).map((f) => f.join(' ')).join(' | ');
+  const xs = frames.map((f) => Number((f.find((x) => x.startsWith('0:')) || '0:@-1').split('@')[1]));
+  wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode('{"touch":false}') } });
+  const n2 = sent.length;
+  c.fire('pointerdown', touch(4, 10, 10));
+  c.fire('pointerup', touch(4, 10, 10));
+  await tick();
+  const mouseAgain = sent.slice(n2).length > 0 && sent.slice(n2).every((x) => x.payload[0] === 1);
+  check('multitouch: a mouse until the gateway says so; then frames of every finger (ids, states, a quick tap down then up, cancel); a mouse again after',
+    asMouse && shape === '0:down 1:down | 0:still 1:still | 0:still 1:up | 0:still 1:down | 0:still 1:up | 0:cancel' && xs[1] > xs[0] && mouseAgain,
+    JSON.stringify({ asMouse, frames, mouseAgain }));
+  s.stop();
+}
+
+// ------------------------------------------------------------ Wake-on-LAN: the page says the computer is being turned on
+
+{
+  // the gateway's {"waking": true} between connecting and connected: its own state, so the page can say it (two minutes can pass)
+  const states = [];
+  const s = new RdpSession({ container: new El(), canvas: new El(), keyboard: new El(), conn: { id: 'c' }, csrf: 'x', retries: 0, onState: (st) => states.push(st) });
+  s.start();
+  await tick();
+  const wk = workers.at(-1);
+  const status = (j) => wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify(j)) } });
+  status({ token: 't' });
+  status({ waking: true });
+  status({ connected: true });
+  await tick();
+  check('Wake-on-LAN: the session goes connecting, waking (the computer being turned on), connected', states.join() === 'connecting,waking,connected', states.join());
+  s.stop();
+}
+
+{ // the Remote Desktop Gateway's messages: its consent message shown while connecting and the answer sent (message 17: 1
+  // accepted, 0 declined, also when the dialog is closed without an answer); a service message shown, nothing sent back
+  const shown = [];
+  let answer = true;
+  const s = new RdpSession({ container: new El(), canvas: new El(), keyboard: new El(), conn: { id: 'c' }, csrf: 'x', retries: 0, onState: () => {} });
+  s.onGatewayMessage = (text, consent) => { shown.push([text, consent]); return Promise.resolve(answer); };
+  s.start();
+  await tick();
+  const wk = workers.at(-1), from = sent.length;
+  const status = (j) => wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify(j)) } });
+  status({ token: 't' });
+  status({ gateway_message: 'Solo uso autorizado', consent: true });
+  await tick();
+  answer = null;                                       // (the dialog closed without an answer: declined)
+  status({ gateway_message: 'Otra vez', consent: true });
+  await tick();
+  status({ connected: true });
+  status({ gateway_message: 'Mantenimiento a las 22:00' });
+  await tick();
+  const answers = sent.slice(from).filter((r) => r.payload[0] === 17).map((r) => r.payload.join(','));
+  check('gateway messages: the consent message shown and its answer sent (accepted, then closed without one: declined); a service message shown, nothing sent',
+    JSON.stringify(shown) === JSON.stringify([['Solo uso autorizado', true], ['Otra vez', true], ['Mantenimiento a las 22:00', false]])
+    && answers.join(' ') === '17,1 17,0', JSON.stringify({ shown, answers }));
+  s.stop();
+}
+
+
+// ------------------------------------------------------------ a shared session: the guest's page and the owner's
+
+{
+  // a guest that only watches: its stream through the link, nothing sent (no input, acknowledgement, size or visibility); the
+  // owner's mouse shown where it is, with the remote pointer's picture
+  const states = [], container = new El(), canvas = new El(), keyboard = new El();
+  const g = new RdpSession({ container, canvas, keyboard, conn: { id: '', name: '' }, csrf: 'x', retries: 0, guest: { link: 'abc.SECRET' },
+    onState: (st, i) => states.push(st + (i.watch ? ':' + i.watch : '')) });
+  g.start();
+  await tick();
+  const wk = workers.at(-1), req = wk.msgs.at(-1);
+  const status = (j) => wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify(j)) } });
+  status({ watch: 'view', owner: 'ana', conn: 'PC', sid: 'abc' });
+  await tick();
+  const n0 = sent.length;
+  canvas.fire('pointerdown', mouse(0, 1));
+  canvas.fire('pointerup', mouse(0, 0));
+  tap(keyboard, 'KeyA');
+  g.gfx.ack(1, 1);
+  g.refresh();
+  container.fire('resize');
+  await tick();
+  wk.onmessage({ data: { t: 'frame', type: 15, d: Uint8Array.of(100, 0, 50, 0) } });
+  const markAt = g.mark?.style.transform;
+  check('sharing, a guest that watches: the stream through the link, nothing sent, the owner\'s mouse shown',
+    req.url.endsWith('rdp.php?a=watch') && JSON.parse(req.body).link === 'abc.SECRET' && states.join() === 'connecting,connected:view' && g.sid === 'abc'
+      && sent.length === n0 && markAt === 'translate(100px, 50px)' && canvas.style.cursor === undefined,
+    JSON.stringify({ req, states, sent: sent.length - n0, markAt }));
+  g.stop();
+}
+{
+  // a guest given control: keyboard, mouse and touch only, with the link's secret (never a session token), one request at a time
+  const canvas = new El(), keyboard = new El();
+  const g = new RdpSession({ container: new El(), canvas, keyboard, conn: { id: '', name: '' }, csrf: 'x', retries: 0, guest: { link: 'abc.SECRET' }, onState: () => {} });
+  g.start();
+  await tick();
+  const wk = workers.at(-1);
+  wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify({ watch: 'control', owner: 'ana', conn: 'PC', sid: 'abc' })) } });
+  await tick();
+  const n0 = sent.length;
+  hold = [];
+  tap(keyboard, 'KeyA');
+  await tick();
+  tap(keyboard, 'KeyB');
+  g.gfx.ack(1, 1);
+  g.refresh();
+  await tick();
+  const inFlight = sent.length - n0;
+  while (hold.length) { hold.shift()({ ok: true }); await tick(); }
+  await tick();
+  hold = null;
+  const mine = sent.slice(n0);
+  check('sharing, a guest with control: keyboard and mouse only, with the link\'s secret, one request at a time',
+    inFlight === 1 && events(n0).join(' ') === 'KeyA↓ KeyA↑ KeyB↓ KeyB↑' && mine.every((x) => x.payload[0] === 1 && x.headers['X-MuDesk-Share'] === 'SECRET'
+      && !('X-MuDesk-Token' in x.headers) && x.url === 'rdp.php?a=send&sid=abc'),
+    JSON.stringify({ inFlight, ev: events(n0), mine }));
+  g.stop();
+}
+{
+  // the owner: told how many guests watch; connected again for one (frame 14): new surfaces and caches, and an acknowledgement
+  // of the old connection's frames no longer goes out
+  const { s, wk, from } = await session();
+  let viewers = null;
+  s.onViewers = (n) => { viewers = n; };
+  wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode('{"viewers":2}') } });
+  const old = s.gfx;
+  s.bcache.set(1, 'x');
+  wk.onmessage({ data: { t: 'frame', type: 14, d: new Uint8Array(0) } });
+  old.ack(5, 5);
+  await tick();
+  const afterOld = sent.length - from;
+  s.gfx.ack(6, 6);
+  await tick();
+  const acks = sent.slice(from).filter((x) => x.payload[0] === 10).map((x) => x.payload[1]);
+  check('sharing, the owner: told how many watch; connected again for a guest, everything drawn anew, no old acknowledgement',
+    viewers === 2 && s.gfx !== old && s.bcache.size === 0 && afterOld === 0 && JSON.stringify(acks) === '[6]', JSON.stringify({ viewers, afterOld, acks }));
+  s.stop();
+}
+
+// ------------------------------------------------------------ a recorded session, and its recording played
+
+{
+  // the page is told the connection is recorded; a recording played: asked for with its point and speed, nothing sent,
+  // paused from the page, its position told
+  const { s, wk } = await session();
+  let rec = null;
+  s.onRecording = (on) => { rec = on; };
+  wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode('{"recording":true}') } });
+  s.stop();
+  const p = new RdpSession({ container: new El(), canvas: new El(), keyboard: new El(), conn: { id: '', name: '' }, csrf: 'x', retries: 0,
+    replay: { sid: 'abc', from: 5000, speed: 2 }, onState: () => {} });
+  p.keyboard = p.keyboard;
+  let pos = null, told = null;
+  p.onReplayPos = (ms) => { pos = ms; };
+  p.onRecording = () => { told = true; };
+  p.start();
+  await tick();
+  const pw = workers.at(-1), req = pw.msgs.at(-1);
+  const n0 = sent.length;
+  pw.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode('{"connected":true,"recording":true}') } });
+  pw.onmessage({ data: { t: 'pos', ms: 6000 } });
+  p.replayCmd('pause');
+  p.refresh();
+  p.gfx.ack(1, 1);
+  await tick();
+  const tabKey = p.keyboard.fire('keydown', { code: 'Tab', key: 'Tab', getModifierState: () => false });
+  check('recording: the player does not take the keys (Tab reaches its controls)', !tabKey.prevented);
+  check('recording: the page told; played from a point at a speed, nothing sent, paused, its position told',
+    rec === true && req.url.endsWith('rdp.php?a=replay') && JSON.parse(req.body).sid === 'abc' && req.timed === true && req.from === 5000 && req.speed === 2
+      && req.headers['X-CSRF'] === 'x' && sent.length === n0 && pos === 6000 && pw.msgs.at(-1)?.cmd === 'pause' && told === null,
+    JSON.stringify({ rec, req, sent: sent.length - n0, pos, last: pw.msgs.at(-1), told }));
+  p.stop();
+}
+
+{
+  // the camera and this computer's folder: the gateway's frames to them (F_CAM 16, F_DRIVE 17); their pictures and answers on
+  // the out-of-order lane (no sequence number: no key waits behind them), two requests out at most, the folder's answers
+  // first and only the newest picture waiting; the folder shared again when the session connects again
+  const { s, wk } = await session();
+  const lane = [], fetch0 = globalThis.fetch;
+  globalThis.fetch = (url, o) => {
+    lane.push([new DataView(o.body.buffer).getUint32(0, true), o.body[4], o.body.length - 5, o.body[5]]);
+    return fetch0(url, o);
+  };
+  const got = { cam: [], drive: [] };
+  s.cam = { onMessage: (d) => got.cam.push([...d]), stop() {} };
+  s.folder = { onRequest: (d) => got.drive.push(d.length), reset() {}, shared: true, name: 'Fotos', readonly: false };
+  wk.onmessage({ data: { t: 'frame', type: 16, d: Uint8Array.of(1, 128, 2, 224, 1, 30, 4) } });
+  wk.onmessage({ data: { t: 'frame', type: 17, d: new Uint8Array(56) } });
+  hold = [];
+  const n0 = lane.length;
+  s.sendCam(new Uint8Array(100), 4);                 // out at once
+  s.sendFolderReply(70, new Uint8Array(17));         // out at once (two out)
+  s.sendCam(new Uint8Array(200), 4);                 // waits...
+  s.sendCam(new Uint8Array(300), 4);                 // ... in place of the one before
+  s.sendFolderReply(71, new Uint8Array(5));          // waits, before the picture
+  const out1 = lane.slice(n0).map((x) => x.join(':'));
+  const release = () => { const h = hold; hold = []; h.forEach((r) => r({ ok: true })); };
+  release();
+  await tick(); await tick();
+  release();
+  await tick(); await tick();
+  hold = null;
+  const out2 = lane.slice(n0 + out1.length).map((x) => x.join(':'));
+  const seqs = new Set(lane.slice(n0).map((x) => x[0]));
+  // connected again: the folder shared again (in order, with a sequence number)
+  const m0 = lane.length;
+  wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify({ connected: true })) } });
+  await tick();
+  const again = lane.slice(m0).filter((x) => x[1] === 19);
+  check('camera and folder: their frames to them; pictures and answers out of order, two out, answers first, only the newest picture; the folder shared again',
+    JSON.stringify(got.cam) === '[[1,128,2,224,1,30,4]]' && JSON.stringify(got.drive) === '[56]'
+    && JSON.stringify(out1) === JSON.stringify(['4294967295:18:101:4', '4294967295:20:21:70']) && JSON.stringify(out2) === JSON.stringify(['4294967295:20:9:71', '4294967295:18:301:4'])
+    && seqs.size === 1 && again.length === 1 && again[0][0] !== 0xFFFFFFFF && again[0][2] === 2 + 5,
+    JSON.stringify({ cam: got.cam, drive: got.drive, out1, out2, again }));
+
+  // a folder's answer lost on the way (the network, the gateway busy) sent again, 3 times at most (the program there waited
+  // for ever); a picture or an answer to a session gone (404) not; connected again for a guest (frame 14): the camera let
+  // go, the answers waiting to go left out (no longer waited for)
+  let fail = null;
+  globalThis.fetch = (url, o) => {
+    lane.push([new DataView(o.body.buffer).getUint32(0, true), o.body[4], o.body.length - 5, o.body[5]]);
+    return fail === 'network' ? Promise.reject(new TypeError('network')) : Promise.resolve({ ok: fail === null, status: fail ?? 200 });
+  };
+  const clock = testClock(), advance = (ms) => clock.advance(ms);   // (the retries' delays on the test's clock)
+  const r0 = lane.length;
+  fail = 'network';
+  s.sendFolderReply(80, new Uint8Array(3));
+  s.sendCam(new Uint8Array(10), 4);
+  await advance(6000);                               // (again after 0.5, 1 and 1.5 s; a fourth would come at 5 s)
+  const lost = lane.slice(r0).map((x) => `${x[1]}:${x[3]}`);
+  const g0 = lane.length;
+  fail = 503;
+  s.sendFolderReply(81, new Uint8Array(3));
+  await advance(700);
+  fail = 404;
+  s.sendFolderReply(82, new Uint8Array(3));
+  await advance(700);
+  const busy = lane.slice(g0).map((x) => `${x[1]}:${x[3]}`);
+  clock.restore();
+  fail = null;
+  let camStops = 0;
+  s.cam = { onMessage() {}, stop: () => camStops++ };
+  hold = [];
+  globalThis.fetch = (url, o) => { lane.push([0, o.body[4], 0, o.body[5]]); return new Promise((r) => hold.push(r)); };
+  const h0 = lane.length;
+  s.sendFolderReply(90, new Uint8Array(3));
+  s.sendFolderReply(91, new Uint8Array(3));
+  s.sendFolderReply(92, new Uint8Array(3));          // waits (two out)
+  wk.onmessage({ data: { t: 'frame', type: 14, d: new Uint8Array(0) } });
+  hold.splice(0).forEach((r) => r({ ok: true }));
+  await tick(); await tick();
+  hold = null;
+  const reset = lane.slice(h0).map((x) => x[3]);
+  globalThis.fetch = fetch0;
+  check('the lane: a folder\'s answer lost sent again 3 times at most, a picture not; again when the gateway was busy, not to a session gone; connected again for a guest: the camera let go, answers waiting left out',
+    JSON.stringify(lost) === JSON.stringify(['20:80', '18:4', '20:80', '20:80', '20:80']) && JSON.stringify(busy) === JSON.stringify(['20:81', '20:81', '20:82'])
+    && camStops === 1 && JSON.stringify(reset) === '[90,91]', JSON.stringify({ lost, busy, camStops, reset }));
   s.stop();
 }
 

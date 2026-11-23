@@ -9,6 +9,9 @@ use MuDesk\{Audit, Files, Settings, Text};
 /**
  * Device redirection (MS-RDPEFS / MS-RDPEPC):
  *  - drive: the user's shared folder appears as the "MuDesk" drive in the remote session;
+ *  - a folder of this computer, chosen in the browser while the session runs (with the shared folder's option): another drive,
+ *    whose requests the browser answers (localdrive.js) and the gateway only passes on, keeping the files read, written,
+ *    deleted and renamed for the audit;
  *  - printer: the "MuDeskPDF" printer (driver "Microsoft Print To PDF"); each job is offered to the browser to print or download.
  */
 final class Rdpdr implements Channel
@@ -29,6 +32,9 @@ final class Rdpdr implements Channel
     private const NOT_DIRECTORY = 0xC0000103;
     private const DRIVE = 1;
     private const PRINTER = 2;
+    private const LOCAL = 3;
+    /** Requests to this computer's folder the browser may owe at once (each answered, or the session's devices stall) */
+    private const LOCAL_WAIT_MAX = 4096;
     private const PRINT_DRIVER = 'Microsoft Print To PDF';
     private const PRINT_MAX = 200 * 1048576;   // all the print jobs of a session together (kept until it ends)
     /** Quota taken from the user's counter at a time (shared with the other sessions and the file manager: a lock at every write was slow) */
@@ -46,7 +52,31 @@ final class Rdpdr implements Channel
     private int $device = self::DRIVE;
     private array $jobs = [];
     private int $jobNo = 0;
+    private int $listed = 0;                 // names of the folder listings kept (all handles)
+    private const LIST_MAX = 200000;
+    private const JOBS_MAX = 500;            // print jobs of a session (each one a file)
     private int $printed = 0;            // bytes of all the print jobs of the session
+    /** @var array{name:string, readonly:bool}|null this computer's folder, shared from the browser */
+    private ?array $local = null;
+    private bool $listSent = false;      // the devices were announced: another one is announced on its own
+    /**
+     * @var array<int, array{m:int, f:int, p:?string, r:int, x:mixed}> its requests the browser has not answered: completion id =>
+     * major, file id, path (a create's, a rename's), the number it went to the browser with, what the audit takes if it is done
+     */
+    private array $localWaiting = [];
+    /** @var array<int, int> its change notifications, never answered (as the shared folder's): completion id => file id */
+    private array $localNotify = [];
+    /** @var array<int, array{path:string, read:int, written:int, created:bool, overwritten:bool, delete:bool}> its files open, for the audit */
+    private array $localFiles = [];
+    /** @var array<int, array{class:int, entries:list<string>, i:int, bytes:int}> its folders' listings the browser gave, by FileId */
+    private array $localLists = [];
+    private int $localListed = 0;        // names of those listings kept (all of them: LIST_MAX at most)
+    private int $localListBytes = 0;     // ... and their bytes (LIST_BYTES_MAX at most)
+    private const LIST_BYTES_MAX = 32 * 1048576;
+    /** A path kept for the audit (bytes of UTF-16): it cuts them to 512 characters; a server's 64 KB paths held hundreds of MB */
+    private const LOCAL_PATH_MAX = 2048;
+    /** Each request to the browser numbered (in this process: also across the connections made again); its answer must say it */
+    private static int $localNo = 0;
 
     /**
      * Windows shows the shared folder as "<drive name> on <client name>" ("en" in Spanish, its own word): "Carpeta compartida
@@ -95,6 +125,8 @@ final class Rdpdr implements Channel
         }
         switch ($id) {
             case 0x496E: // server announce
+                $this->drive   = $this->drive && !in_array('drive', $this->c->denied, true);       // (forbidden by the
+                $this->printer = $this->printer && !in_array('printer', $this->c->denied, true);   // gateway's policy)
                 $r->skip(4);
                 $clientId = $r->u32();
                 $this->send(0x4343, pack('vvV', 1, 0x000C, $clientId));
@@ -117,7 +149,11 @@ final class Rdpdr implements Channel
                 $this->announced = true;
                 break;
             case 0x4952: // I/O request
-                $this->io($r);
+                if (strlen($data) >= 24 && unpack('V', $data, 4)[1] === self::LOCAL) {
+                    $this->localIo($data);
+                } else {
+                    $this->io($r);
+                }
                 break;
         }
     }
@@ -138,8 +174,240 @@ final class Rdpdr implements Channel
             $data   = pack('VVVVVV', 0, 0, 0, strlen($driver), strlen($name), 0) . $driver . $name;
             $list[] = pack('VV', 0x04, self::PRINTER) . str_pad('PRN2', 8, "\0") . pack('V', strlen($data)) . $data;
         }
+        if ($this->drive && $this->local !== null) {
+            $list[] = $this->localEntry();
+        }
         if ($list) {
             $this->send(0x4441, pack('V', count($list)) . implode('', $list));
+            $this->listSent = true;
+        }
+    }
+
+    // ------------------------------------------------------------ this computer's folder (answered by the browser)
+
+    /** Its DEVICE_ANNOUNCE: a drive named as the folder ("<name> on MuDesk" in Windows), 8-bit text as the shared folder's. */
+    private function localEntry(): string
+    {
+        $label = $this->local['name'] . "\0";
+        return pack('VV', 0x08, self::LOCAL) . str_pad('LOCAL', 8, "\0") . pack('V', strlen($label)) . $label;
+    }
+
+    /**
+     * A folder of this computer chosen in the browser (its name; read only where the browser cannot write it): announced
+     * now, or with the devices when the server asks for them. Only with the shared folder's option (and the gateway's
+     * policy that allows drives); one at a time, a new one in place of the one before. Returns whether it was taken.
+     */
+    public function addLocal(string $name, bool $readonly): bool
+    {
+        $allowed = $this->drive && !in_array('drive', $this->c->denied, true);
+        if (!$allowed) {
+            return false;
+        }
+        $this->removeLocal();
+        $name        = trim((string)preg_replace('/[^\x20-\x7E]+/', '', $name)) ?: 'Folder';
+        $this->local = ['name' => substr($name, 0, 64), 'readonly' => $readonly];
+        $this->audit('local_folder_shared', ['folder' => $this->local['name'], 'read_only' => $readonly]);
+        if ($this->listSent) {
+            $this->send(0x4441, pack('V', 1) . $this->localEntry());
+        }
+        return true;
+    }
+
+    /**
+     * The folder no longer shared (or another one in its place): what it owed answered, then the drive removed. With
+     * $connected false (the session ended, or its connection is made again), only its files still open audited: the browser
+     * saves what they wrote all the same.
+     */
+    public function removeLocal(bool $connected = true): void
+    {
+        if ($this->local === null) {
+            return;
+        }
+        if ($connected) {
+            foreach ($this->localWaiting + array_fill_keys(array_keys($this->localNotify), ['m' => 0x0C]) as $cid => $w) {
+                $this->send(0x4943, pack('VVV', self::LOCAL, $cid, self::NO_SUCH_DEVICE) . (in_array($w['m'], [0x03, 0x05, 0x0A], true) ? pack('V', 0) : pack('VC', 0, 0)));
+            }
+        }
+        foreach ($this->localFiles as $f) {
+            $this->localAudit($f);
+        }
+        if ($connected && $this->listSent) {
+            $this->send(0x444D, pack('VV', 1, self::LOCAL));    // DEVICELIST_REMOVE
+        }
+        $this->audit('local_folder_unshared', ['folder' => $this->local['name']]);
+        [$this->local, $this->localWaiting, $this->localNotify, $this->localFiles, $this->localLists, $this->localListed, $this->localListBytes] = [null, [], [], [], [], 0, 0];
+    }
+
+    /**
+     * A request to the folder: passed to the browser (F_DRIVE: u32 its number, then the request from its DeviceId on), what
+     * the audit needs kept. A change notification is left waiting here, as for the shared folder.
+     */
+    private function localIo(string $data): void
+    {
+        ['f' => $fileId, 'c' => $cid, 'm' => $major, 'n' => $minor] = unpack('Vf/Vc/Vm/Vn', $data, 8);
+        $this->c->trace?->count(sprintf('rdpdr:local:irp%02x.%x', $major, $minor), strlen($data) - 24);
+        $this->device = self::LOCAL;
+        if ($this->local === null) {
+            $this->reply($cid, self::NO_SUCH_DEVICE, str_repeat("\0", 5));
+            return;
+        }
+        if ($major === 0x0C && $minor === 0x02) {
+            // a change notification: never answered, as for the shared folder (the browser could not say when a folder
+            // changes); kept only to be answered if the folder goes, forgotten when its file closes, and not counted with
+            // the requests the browser owes (a program watching thousands of folders stopped the drive)
+            if (count($this->localNotify) < self::LOCAL_WAIT_MAX) {
+                $this->localNotify[$cid] = $fileId;
+            }
+            return;
+        }
+        if (count($this->localWaiting) >= self::LOCAL_WAIT_MAX) {
+            $this->reply($cid, self::TOO_MANY_FILES, str_repeat("\0", 5));
+            return;
+        }
+        $path = $extra = null;
+        if ($major === 0x00 && strlen($data) >= 56) {       // create: its path, for the audit; deleted when closed (option)
+            $len   = unpack('V', $data, 52)[1];
+            $path  = Text::fromUtf16(substr($data, 56, min($len, self::LOCAL_PATH_MAX)));
+            $extra = (unpack('V', $data, 48)[1] & 0x1000) !== 0;   // FILE_DELETE_ON_CLOSE
+        } elseif ($major === 0x06 && strlen($data) >= 32 && isset($this->localFiles[$fileId])) {   // set information
+            ['k' => $class, 'l' => $len] = unpack('Vk/Vl', $data, 24);
+            if ($class === 13) {                             // disposition: deleted when closed (no byte, or not 0)
+                $extra = ['delete' => $len === 0 || strlen($data) < 57 || ord($data[56]) !== 0];
+            } elseif ($class === 20 && strlen($data) >= 64) {   // end of file: emptied at 0
+                $extra = ['emptied' => unpack('P', $data, 56)[1] === 0];
+            } elseif ($class === 10 && strlen($data) >= 62) {   // rename: ReplaceIfExists, RootDirectory, the new path
+                $path = Text::fromUtf16(substr($data, 62, min(unpack('V', $data, 58)[1], self::LOCAL_PATH_MAX)));
+            }
+        }
+        if ($major === 0x0C && $minor === 0x01 && strlen($data) >= 29) {   // a folder listed: one name a request
+            $class = unpack('V', $data, 24)[1];
+            $l     = $this->localLists[$fileId] ?? null;
+            if (ord($data[28]) !== 0) {
+                $this->dropList($fileId);                    // (listed anew: the browser gives the new listing)
+            } elseif ($l !== null && $l['class'] === $class) {
+                // the next name of the listing the browser gave with the first one, answered here: a request each name was a
+                // round trip to the browser (a folder of 1,000 files took a minute at 60 ms); at its end, no more names
+                $e = $l['entries'][$l['i']] ?? null;
+                if ($e !== null) {
+                    $this->localLists[$fileId]['i']++;
+                }
+                $e === null ? $this->reply($cid, self::NO_MORE_FILES, pack('VC', 0, 0)) : $this->reply($cid, self::OK, pack('V', strlen($e)) . $e);
+                return;
+            }
+        } elseif ($major === 0x02) {                         // closed: its listing and its notifications go
+            $this->dropList($fileId);
+            if ($this->localNotify) {
+                $this->localNotify = array_filter($this->localNotify, static fn(int $f): bool => $f !== $fileId);
+            }
+        }
+        $no = self::$localNo = self::$localNo % 0xFFFFFFFF + 1;
+        $this->localWaiting[$cid] = ['m' => $major, 'f' => $fileId, 'p' => $path, 'r' => $no, 'x' => $extra];
+        $this->c->emit(Client::F_DRIVE, pack('V', $no) . substr($data, 4));
+    }
+
+    private function dropList(int $fileId): void
+    {
+        if (isset($this->localLists[$fileId])) {
+            $this->localListed    -= count($this->localLists[$fileId]['entries']);
+            $this->localListBytes -= $this->localLists[$fileId]['bytes'];
+            unset($this->localLists[$fileId]);
+        }
+    }
+
+    /**
+     * The browser's answer to the first request of a folder's listing, with the rest of its names (u32 the request's number,
+     * u32 answer's length, the answer, u32 FileId, u32 information class, u32 count, each name's information as u32 length +
+     * bytes): the names kept for the next requests of that listing, answered here; then the answer, as any other.
+     */
+    public function localList(string $m): void
+    {
+        if (strlen($m) < 8 || strlen($m) < 8 + ($n = unpack('V', $m, 4)[1]) + 12) {
+            return;
+        }
+        $no   = unpack('V', $m)[1];
+        $resp = substr($m, 8, $n);
+        $r    = new Reader(substr($m, 8 + $n));
+        try {
+            [$fileId, $class, $count] = [$r->u32(), $r->u32(), $r->u32()];
+            $cid = strlen($resp) >= 8 ? unpack('V', $resp, 4)[1] : -1;
+            $w   = $this->localWaiting[$cid] ?? null;
+            if ($w !== null && $w['r'] === $no && $w['m'] === 0x0C && $w['f'] === $fileId && $this->localListed + $count <= self::LIST_MAX) {
+                [$entries, $bytes] = [[], 0];
+                for ($i = 0; $i < $count; $i++) {
+                    $bytes += strlen($entries[] = $r->bytes($r->u32()));
+                }
+                if ($this->localListBytes + $bytes <= self::LIST_BYTES_MAX) {
+                    $this->dropList($fileId);
+                    $this->localLists[$fileId] = ['class' => $class, 'entries' => $entries, 'i' => 0, 'bytes' => $bytes];
+                    $this->localListed        += $count;
+                    $this->localListBytes     += $bytes;
+                }
+            }
+        } catch (ProtocolException) {                        // (cut short: the names asked for one by one, as before)
+        }
+        $this->localAnswer($no, $resp);
+    }
+
+    /** The browser's answer to one of them: u32 the request's number, then a Device I/O Response from its DeviceId on. */
+    public function localReply(string $m): void
+    {
+        if (strlen($m) >= 4) {
+            $this->localAnswer(unpack('V', $m)[1], substr($m, 4));
+        }
+    }
+
+    /**
+     * Sent to the server if it answers a request waiting, by the number it went with (an answer of a folder shared before, or
+     * of a connection before, is left out: the server may have given its CompletionId to another request since). The files
+     * read, written, created, emptied and deleted are audited when closed, a rename when made; a deletion when the browser
+     * took it.
+     */
+    private function localAnswer(int $no, string $resp): void
+    {
+        if (strlen($resp) < 12 || $this->local === null) {
+            return;
+        }
+        ['d' => $dev, 'c' => $cid, 's' => $status] = unpack('Vd/Vc/Vs', $resp);
+        $w = $this->localWaiting[$cid] ?? null;
+        if ($dev !== self::LOCAL || $w === null || $w['r'] !== $no) {
+            return;
+        }
+        unset($this->localWaiting[$cid]);
+        ['m' => $major, 'f' => $fileId, 'p' => $path, 'x' => $extra] = $w;
+        $ok   = $status === self::OK;
+        $open = isset($this->localFiles[$fileId]);
+        if ($major === 0x00 && $ok && strlen($resp) >= 17 && $path !== null) {         // created: FileId, Information
+            ['i' => $id, 'x' => $info] = unpack('Vi/Cx', $resp, 12);
+            $this->localFiles[$id] = ['path' => '/' . ltrim(str_replace('\\', '/', $path), '/'), 'read' => 0, 'written' => 0, 'created' => $info === 2,
+                                      'overwritten' => $info === 3, 'delete' => $extra === true];
+        } elseif ($major === 0x03 && $ok && $open && strlen($resp) >= 16) {
+            $this->localFiles[$fileId]['read'] += unpack('V', $resp, 12)[1];
+        } elseif ($major === 0x04 && $ok && $open && strlen($resp) >= 16) {
+            $this->localFiles[$fileId]['written'] += unpack('V', $resp, 12)[1];
+        } elseif ($major === 0x06 && $ok && $open && isset($extra['delete'])) {   // (one refused, a folder not empty: not deleted)
+            $this->localFiles[$fileId]['delete'] = $extra['delete'];
+        } elseif ($major === 0x06 && $ok && $open && !empty($extra['emptied'])) {
+            $this->localFiles[$fileId]['overwritten'] = true;
+        } elseif ($major === 0x06 && $ok && $open && $path !== null) {
+            $to = '/' . ltrim(str_replace('\\', '/', $path), '/');
+            $this->audit('local_rename', ['folder' => $this->local['name'], 'from' => $this->localFiles[$fileId]['path'], 'to' => $to]);
+            $this->localFiles[$fileId]['path'] = $to;
+        } elseif ($major === 0x02 && $open) {                                       // closed (a deletion that failed: not done)
+            $this->localAudit($this->localFiles[$fileId], $ok);
+            unset($this->localFiles[$fileId]);
+        }
+        $this->c->trace?->count('rdpdr:local:reply', strlen($resp));
+        $this->send(0x4943, $resp);
+    }
+
+    /** A file of this computer's folder closed: audited if it was read, written, created, emptied or deleted (not when only looked at). */
+    private function localAudit(array $f, bool $ok = true): void
+    {
+        if ($f['delete']) {
+            $this->audit('local_delete', ['folder' => $this->local['name'], 'path' => $f['path']], $ok);
+        } elseif ($f['read'] || $f['written'] || $f['created'] || $f['overwritten']) {
+            $this->audit('local_file', ['folder' => $this->local['name'], 'path' => $f['path'], 'created' => $f['created'],
+                                        'overwritten' => $f['overwritten'], 'read' => $f['read'], 'written' => $f['written']]);
         }
     }
 
@@ -313,8 +581,12 @@ final class Rdpdr implements Channel
                 return;
             }
         } elseif (!$isDir && in_array($disposition, [0, 4, 5], true)) {
-            $this->charge(-(int)filesize($p));
-            file_put_contents($p, '');
+            $was = (int)@filesize($p);                     // emptied first, then its size given back (a file that could not be
+            if (@file_put_contents($p, '') === false) {    // emptied gave it back on every open: the quota went to 0)
+                $this->reply($cid, self::ACCESS_DENIED, $fail);
+                return;
+            }
+            $this->charge(-$was);
             $info = 3;
         }
         $id                 = $this->nextId++;
@@ -361,6 +633,7 @@ final class Rdpdr implements Channel
                 $this->audit('drive_file', ['path' => $this->rel($h['path']), 'created' => $h['new'], 'overwritten' => $h['truncated'],
                                             'read' => $h['read'], 'written' => $h['written'], 'size' => (int)@filesize($h['path'])]);
             }
+            $this->listed -= count($h['list']['names'] ?? []);
             unset($this->handles[$id]);
         }
         $this->reply($cid, self::OK, str_repeat("\0", 5));
@@ -389,7 +662,7 @@ final class Rdpdr implements Channel
             $this->reply($cid, self::INVALID_PARAMETER, pack('V', 0));
             return;
         }
-        $data                          = (string)fread($fh, max(1, $len));
+        $data                          = $len > 0 ? (string)fread($fh, $len) : '';
         $this->handles[$id]['read']   += strlen($data);
         $this->reply($cid, self::OK, pack('V', strlen($data)) . $data);
     }
@@ -479,7 +752,7 @@ final class Rdpdr implements Channel
                 break;
             case 13: // disposition (delete)
                 $del = $len === 0 || $r->u8() !== 0;
-                if ($del && is_dir($h['path']) && count(scandir($h['path']) ?: []) > 2) {
+                if ($del && is_dir($h['path']) && count(@scandir($h['path']) ?: []) > 2) {
                     $status = self::NOT_EMPTY;
                 } else {
                     $this->handles[$id]['delete'] = $del;
@@ -553,22 +826,31 @@ final class Rdpdr implements Channel
                 $mask = "\0";
             }
             $dir    = $this->local(dirname($norm) === '.' ? '' : dirname($norm));
-            $names  = $dir !== null && is_dir($dir) ? (scandir($dir) ?: []) : [];
-            $regex  = '/^' . str_replace(['\*', '\?'], ['.*', '.'], preg_quote($mask, '/')) . '$/i';
-            $list   = [];
-            foreach ($names as $n) {
-                if (preg_match($regex, $n)) {
-                    $list[] = [$n, $dir . '/' . $n];
-                }
+            $names  = $dir !== null && is_dir($dir) ? (@scandir($dir) ?: []) : [];
+            $regex  = '/^' . str_replace(['\*', '\?'], ['.*', '.'], preg_quote($mask, '/')) . '$/iD';
+            $this->listed -= count($this->handles[$id]['list']['names'] ?? []);
+            $list   = array_values(array_filter($names, static fn($n) => (bool)preg_match($regex, $n)));
+            if ($this->listed + count($list) > self::LIST_MAX) {   // listings kept across handles: a server listing one big folder
+                $this->handles[$id]['list'] = null;              // on 1,000 handles held gigabytes
+                $this->reply($cid, self::TOO_MANY_FILES, pack('VC', 0, 0));
+                return;
             }
-            $this->handles[$id]['list'] = $list;
+            $this->listed += count($list);
+            $this->handles[$id]['list'] = ['dir' => $dir, 'names' => $list, 'i' => 0];   // names walked by index (array_shift was O(n))
         }
-        $entry = array_shift($this->handles[$id]['list']);
-        if ($entry === null) {
+        $l    = &$this->handles[$id]['list'];
+        $name = $l['names'][$l['i']] ?? null;
+        if ($name === null) {
+            $this->listed -= count($l['names']);
+            $l['names'] = [];                              // done: its names go
+            $l['i'] = 0;
+            unset($l);
             $this->reply($cid, self::NO_MORE_FILES, pack('VC', 0, 0));
             return;
         }
-        [$name, $p] = $entry;
+        $l['i']++;
+        $p = $l['dir'] . '/' . $name;
+        unset($l);
         $n    = Text::toUtf16($name);
         $t    = self::filetime((int)@filemtime($p));
         $size = is_file($p) ? (int)filesize($p) : 0;
@@ -589,12 +871,24 @@ final class Rdpdr implements Channel
     {
         switch ($major) {
             case 0x00: // create: a new print job
+                if ($this->jobNo === 0) {               // numbered after those of this session before a reconnection (not overwritten)
+                    foreach (glob($this->printDir . '/print-*') ?: [] as $f) {
+                        $this->jobNo = max($this->jobNo, (int)substr((string)strrchr($f, '-'), 1));
+                    }
+                }
+                if (count($this->jobs) >= 32 || $this->jobNo >= self::JOBS_MAX) {
+                    $this->reply($cid, self::TOO_MANY_FILES, pack('VC', 0, 0));
+                    break;
+                }
                 $id              = ++$this->jobNo;
                 $path            = $this->printDir . '/print-' . $id;
                 if (!is_dir($this->printDir)) {
-                    mkdir($this->printDir, 0700, true);
+                    @mkdir($this->printDir, 0700, true);
                 }
-                file_put_contents($path, '');
+                if (@file_put_contents($path, '') === false) {
+                    $this->reply($cid, self::ACCESS_DENIED, pack('VC', 0, 0));
+                    break;
+                }
                 $this->jobs[$id] = $path;
                 $this->reply($cid, self::OK, pack('VC', $id, 2));
                 break;
@@ -607,7 +901,7 @@ final class Rdpdr implements Channel
                     $this->reply($cid, self::DISK_FULL, pack('VC', 0, 0));
                     break;
                 }
-                file_put_contents($path, $data, FILE_APPEND);
+                @file_put_contents($path, $data, FILE_APPEND);
                 $this->printed += strlen($data);
                 $this->reply($cid, self::OK, pack('VC', strlen($data), 0));
                 break;
@@ -617,7 +911,7 @@ final class Rdpdr implements Channel
                 if ($path !== null) {
                     clearstatcache(true, $path);
                 }
-                if ($path !== null && filesize($path) > 0) {
+                if ($path !== null && (int)@filesize($path) > 0) {
                     $head = (string)file_get_contents($path, false, null, 0, 64);
                     $type = match (true) {
                         str_starts_with($head, '%PDF')                                     => 'pdf',

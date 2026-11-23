@@ -1,0 +1,13 @@
+# What never goes into the image: the local configuration and data, the history, tests and documents
+.git
+.github
+config.php
+data/*
+!data/.gitignore
+!data/.htaccess
+!data/web.config
+tests
+docs
+vendor
+*.zip
+compose.yaml

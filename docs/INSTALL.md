@@ -14,6 +14,8 @@ MuDeskClient is **copy and paste**: nothing to build, no database, no programs t
 4. Check that `https://your-site/mudesk/data/web-check.txt` answers 403 or 404.
 5. The web server must reach the RDP port of each remote computer (3389 by default): outgoing firewall of the hosting, the router's and the Windows one.
 
+With Docker, one command and nothing else to install: [section 12](#12-option-d-docker-to-try-it-or-on-a-server-with-docker).
+
 More technical details (Nginx, IIS, PHP-FPM, capacity): [HOSTING](HOSTING.md).
 
 ## 1. What you need
@@ -37,6 +39,9 @@ Server requirements:
 | Web server | Apache or LiteSpeed (everything works by itself with them); Nginx and IIS need a few settings: see [HOSTING](HOSTING.md) |
 | HTTPS | Required. On a hosting it is usually free (Let's Encrypt); on the local network a self-signed certificate works |
 | Outgoing connection | From the web server to the RDP port of each remote computer |
+| OPcache | Recommended (see below) |
+
+**OPcache** is PHP's code cache, part of PHP. With it, each keystroke, mouse move and acknowledgement of the screen costs the server about 5 ms instead of 15 (measured on Windows with PHP's built-in server). To turn it on: on a hosting, in its PHP settings (in cPanel, *Select PHP Version*, the `opcache` extension); in XAMPP, in `C:\xampp\php\php.ini`, the lines `zend_extension=opcache` and `opcache.enable=1` without a `;` in front, then restart Apache; on Ubuntu or Debian, `sudo apt install php-opcache` (it may be installed already) and `sudo systemctl restart apache2`. The Docker image has it on.
 
 ## 2. Download MuDeskClient
 
@@ -190,7 +195,7 @@ On each computer you want to connect to:
 3. **Write down its address**: its IP (command `ipconfig`, for example `192.168.1.30`) or its name.
 4. **Write down the port**: **3389** unless someone changed it. If it was changed, use that computer's port in the MuDeskClient connection and in the `check.php` test.
 5. **Do not turn it off or let it sleep**: a computer that is off or asleep does not answer.
-6. **Only if you will use the microphone** (the box *This computer's microphone on the remote one*, off by default): Windows 10 and 11 allow it as they come; on Windows Server start its *Windows Audio* service, and if a policy forbids it, allow it. Step by step in [HOSTING › Remote computers](HOSTING.md#remote-computers). The browser only gives the microphone to pages opened with `https://`.
+6. **Only if you will use the microphone or the camera** (the box *This computer's microphone and camera on the remote one*, off by default): Windows 10 and 11 allow both as they come (the camera from Windows 10 1803 / Server 2019); on Windows Server start its *Windows Audio* service for the microphone, and if a policy forbids either, allow it. Step by step in [HOSTING › Remote computers](HOSTING.md#remote-computers). The browser only gives the microphone and the camera to pages opened with `https://`.
 
 To connect from an **Internet hosting** to a computer of your office or home, the router there must let the connection through: see the next section.
 
@@ -237,9 +242,39 @@ Everything of yours is in the **`data`** folder: users, connections, audit, shar
 | Red warning: the data folder can be downloaded | Your server does not apply `.htaccess`: [3.5](#35-check-that-the-data-is-protected) |
 | "Wrong setup code." | Copy the whole second line of `data/setup-code.php`, with its hyphens |
 | "Cannot reach the remote computer" | Computer on, address, **port** and [firewalls](#7-firewalls-that-must-let-it-through) |
-| "Wrong remote username or password." | The **Windows** user and password of the remote computer (not the MuDeskClient ones). For a local account, type `.\user` |
+| "Wrong remote username or password." | The **Windows** user and password of the remote computer (not the MuDeskClient ones). For a local account, type `.\user`; for a domain account, `DOMAIN\user` (a domain that blocks NTLM needs Kerberos: the domain by its DNS name; README, *Limitations*) |
+| "The server only supports legacy RDP security (Windows XP, Server 2003)…" | Set the connection's *Security* to *Automatic* (in *Advanced options*); its risks are in [SECURITY](../SECURITY.md) |
+| "The server does not encrypt the connection…" | The computer is set to encrypt nothing, or someone on the network poses as it: check its encryption level ([HOSTING](HOSTING.md#remote-computers)) and the network in between |
 | "The server is busy: too many sessions are open" | The limit of sessions at once was reached: try later, or raise it in *Administration → Settings* if the hosting allows ([HOSTING](HOSTING.md), *Capacity*) |
 | The session drops every minute and a half and connects again | A proxy in front (for example Cloudflare) cuts long connections: use a direct connection |
 | Blank page or error 500 | Look at the hosting's PHP error log (on XAMPP, `C:\xampp\php\logs\php_error_log`) |
 
 If none of this solves it, the *Diagnostic mode* of the connect window saves a technical trace of the session that the administrator can download ([USAGE](USAGE.md)).
+
+## 12. Option D: Docker (to try it, or on a server with Docker)
+
+The image `ghcr.io/miguelenred/mudeskclient` has Apache, PHP 8.4 and MuDeskClient ready, with HTTPS. One command:
+
+```bash
+docker run -d --name mudesk --restart unless-stopped -p 8443:443 -v mudesk-data:/var/www/mudesk/data ghcr.io/miguelenred/mudeskclient
+```
+
+1. Open **`https://localhost:8443`** (or `https://SERVER-ADDRESS:8443` from another computer) and accept the certificate warning: it is a self-signed certificate made at the first start.
+2. The setup code: `docker exec mudesk cat /var/www/mudesk/data/setup-code.php` (its second line).
+3. Your data stays in the `mudesk-data` volume: updating is `docker pull ghcr.io/miguelenred/mudeskclient`, then removing the container (`docker rm -f mudesk`) and running the same command again.
+
+**With Docker Compose**: the project has a `compose.yaml` (in the zip and in the repository) with the same settings: port 8443, the data in the `mudesk-data` volume, the certificate in `mudesk-tls`, started again on its own. In its folder:
+
+```bash
+docker compose up -d
+```
+
+The setup code: `docker compose exec mudesk cat /var/www/mudesk/data/setup-code.php`. Updating: `docker compose pull`, then `docker compose up -d`. It runs the published image; to build the image from the code of that folder instead, uncomment the line `build: .` in `compose.yaml` and start it with `docker compose up -d --build`. The name for the certificate (`MUDESK_HOSTNAME`) and your own certificate are set in that file too.
+
+Options:
+
+- **Your own certificate**: mount a folder with `cert.pem` and `key.pem` at `/etc/mudesk/tls` (`-v /path/to/tls:/etc/mudesk/tls:ro`). Without one, `-e MUDESK_HOSTNAME=name` puts that name in the self-signed certificate (also as its subjectAltName, which browsers check). That folder is a volume of its own, so the self-signed certificate stays when the container is made again for an update (give it a name, `-v mudesk-tls:/etc/mudesk/tls`, to keep it with `docker rm`). The code is read-only for the web server (only `data/` is its to write), and OPcache is on.
+- **Behind your reverse proxy** (Nginx, Caddy, Traefik): point it to `https://container:443`. Put its address in `trusted_proxies` of a `config.php` mounted at `/var/www/mudesk/config.php`, and keep long requests open (see [HOSTING](HOSTING.md)).
+- **A version**: `ghcr.io/miguelenred/mudeskclient:1.1.0` instead of the latest.
+
+The container must reach the RDP port of the remote computers; Wake-on-LAN broadcasts only leave it with `--network host` (Linux).

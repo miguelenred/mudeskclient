@@ -14,10 +14,21 @@ function rd(src, bit, n) {
   return v;
 }
 
+const NZ = new Uint16Array(4096);                   // where the last rlgr() call wrote, in increasing order
+
 /** RLGR1 (mode 1) or RLGR3 (mode 3) decoding of one component into out (Int16Array, zero-filled beforehand). */
 export function rlgrDecode(src, mode, out) {
+  rlgr(src, mode, out);
+  return out;
+}
+
+/**
+ * rlgrDecode, also listing in NZ each position written (every other one stays 0): dequantization then only visits those.
+ * Returns how many there are.
+ */
+function rlgr(src, mode, out) {
   const total = src.length * 8, n = out.length;
-  let p = 0, bit = 0, k = 1, kp = 8, kr = 1, krp = 8;
+  let p = 0, bit = 0, k = 1, kp = 8, kr = 1, krp = 8, m = 0;
   while (bit < total && p < n) {
     if (k) {                                          // run-length mode
       let run = 0;
@@ -42,7 +53,7 @@ export function rlgrDecode(src, mode, out) {
       kr = krp >> LSGR;
       mag++;
       p += run;
-      if (p < n) out[p++] = sign ? -mag : mag;
+      if (p < n) { NZ[m++] = p; out[p++] = sign ? -mag : mag; }
       kp = Math.max(0, kp - DN_GR);
       k = kp >> LSGR;
     } else {
@@ -55,6 +66,7 @@ export function rlgrDecode(src, mode, out) {
       else if (vk !== 1) krp = Math.min(KPMAX, krp + vk);
       kr = krp >> LSGR;
       if (mode === 1) {                               // Golomb-Rice mode, RLGR1
+        NZ[m++] = p;
         out[p++] = mag & 1 ? -((mag + 1) >> 1) : mag >> 1;
         kp = mag ? Math.max(0, kp - DQ_GR) : Math.min(KPMAX, kp + UQ_GR);
         k = kp >> LSGR;
@@ -65,12 +77,13 @@ export function rlgrDecode(src, mode, out) {
         if (v1 && v2) kp = Math.max(0, kp - 2 * DQ_GR);
         else if (!v1 && !v2) kp = Math.min(KPMAX, kp + 2 * UQ_GR);
         k = kp >> LSGR;
+        NZ[m++] = p;
         out[p++] = v1 & 1 ? -((v1 + 1) >> 1) : v1 >> 1;
-        if (p < n) out[p++] = v2 & 1 ? -((v2 + 1) >> 1) : v2 >> 1;
+        if (p < n) { NZ[m++] = p; out[p++] = v2 & 1 ? -((v2 + 1) >> 1) : v2 >> 1; }
       }
     }
   }
-  return out;
+  return m;
 }
 
 // band layout of a 64x64 tile: HL1 LH1 HH1 (32x32), HL2 LH2 HH2 (16x16), HL3 LH3 HH3 LL3 (8x8)
@@ -83,6 +96,21 @@ export function dequantize(buf, q) {
     const s = q[i] - 1;
     if (s > 0) for (let j = off; j < off + len; j++) buf[j] <<= s;
   }
+}
+
+/** The quantizer index (of a band list) of each coefficient. */
+const bandOf = (list) => { const t = new Uint8Array(4096); for (const [off, len, i] of list) t.fill(i, off, off + len); return t; };
+const RFX_BAND = bandOf(BANDS), SHIFT = new Int32Array(10);
+
+/**
+ * dequantize() after rlgr() (its m positions in NZ): every other coefficient is 0, except LL3 (4032 on, made whole by
+ * its differential decoding), shifted in full. The same result, without visiting the thousands of zeros.
+ */
+function dequantizeDecoded(buf, q, m) {
+  for (let i = 0; i < 10; i++) SHIFT[i] = q[i] > 1 ? q[i] - 1 : 0;
+  for (let i = 0; i < m; i++) { const j = NZ[i]; if (j >= 4032) break; buf[j] <<= SHIFT[RFX_BAND[j]]; }
+  const s0 = SHIFT[RFX_BAND[4032]];
+  if (s0) for (let j = 4032; j < 4096; j++) buf[j] <<= s0;
 }
 
 const tmp = new Int16Array(4096);
@@ -191,9 +219,9 @@ export class RfxDecoder {
           for (let c = 0; c < 3; c++) {
             const n = dv.getUint16(t + 13 + c * 2, true);
             const pl = this.planes[c].fill(0);
-            rlgrDecode(s.subarray(d, d + n), this.mode, pl);
+            const m = rlgr(s.subarray(d, d + n), this.mode, pl);
             for (let j = 4033; j < 4096; j++) pl[j] += pl[j - 1];          // LL3 is differentially coded
-            dequantize(pl, quants[q[c]]);
+            dequantizeDecoded(pl, quants[q[c]], m);
             idwt(pl);
             d += n;
           }
@@ -218,6 +246,7 @@ const half = (v) => (v + (v >>> 31)) >> 1;          // v / 2 rounded toward zero
 const PLAIN = [[4032, 64], [3840, 64], [3904, 64], [3968, 64], [3072, 256], [3328, 256], [3584, 256], [0, 1024], [1024, 1024], [2048, 1024]];
 const EXTRA = [[4015, 81], [3807, 72], [3879, 72], [3951, 64], [3007, 272], [3279, 272], [3551, 256], [0, 1023], [1023, 1023], [2046, 961]];
 const UPGRADE_ORDER = [7, 8, 9, 4, 5, 6, 1, 2, 3, 0];   // HL1 LH1 HH1 HL2 LH2 HH2 HL3 LH3 HH3 LL3
+const PLAIN_BAND = bandOf(PLAIN.map(([off, len], i) => [off, len, i])), EXTRA_BAND = bandOf(EXTRA.map(([off, len], i) => [off, len, i]));
 
 const quantRead = (s, p) => {
   const q = new Array(10);
@@ -264,18 +293,46 @@ function idwtLine(L, lo, ls, H, ho, hs, O, oo, os, nL, nH) {
 
 const ptmp = new Int16Array(4096);
 
-function idwtExtrapolateLevel(buf, off, level) {
+/** True when buf[from, to) is all 0; b32: an Int32Array over buf, to test two coefficients at a time. */
+function zeros(buf, b32, from, to) {
+  if (from & 1) { if (buf[from]) return false; from++; }
+  if (to & 1) { if (buf[to - 1]) return false; to--; }
+  for (let w = from >> 1, e = to >> 1; w < e; w++) if (b32[w]) return false;
+  return true;
+}
+
+/**
+ * A level whose three high bands are all 0 (at level 1, over half the tiles of a Windows animation): idwtLine with H = 0
+ * is O[2k] = L[k], O[2k + 1] = half(L[k] + L[k + 1]), and no clamp can act, so the rows of LL, then the columns, are
+ * interpolated. The same result as the whole transform, without its high-band rows and clamps.
+ */
+function idwtInterpolate(buf, off, W, nL, LL) {
+  for (let r = 0; r < nL; r++) {
+    let l = LL + r * nL, o = r * W, a = buf[l];
+    for (let k = W >> 1; k > 0; k--) { const b = buf[++l]; ptmp[o++] = a; ptmp[o++] = half(a + b); a = b; }
+    if (W & 1) ptmp[o] = a;
+  }
+  for (let m = 0; m < W; m++) {
+    const o = off + m * W, k = (m >> 1) * W;
+    if (m & 1) for (let c = 0; c < W; c++) buf[o + c] = half(ptmp[k + c] + ptmp[k + W + c]);
+    else for (let c = 0; c < W; c++) buf[o + c] = ptmp[k + c];
+  }
+}
+
+function idwtExtrapolateLevel(buf, b32, off, level) {
   const nL = (64 >> level) + 1, nH = level === 1 ? 31 : (64 + (1 << (level - 1))) >> level, W = nL + nH;
   const HL = off, LH = HL + nH * nL, HH = LH + nL * nH, LL = HH + nH * nH;
+  if (zeros(buf, b32, HL, LL)) { idwtInterpolate(buf, off, W, nL, LL); return; }
   for (let r = 0; r < nL; r++) idwtLine(buf, LL + r * nL, 1, buf, HL + r * nH, 1, ptmp, r * W, 1, nL, nH);
   for (let r = 0; r < nH; r++) idwtLine(buf, LH + r * nL, 1, buf, HH + r * nH, 1, ptmp, (nL + r) * W, 1, nL, nH);
   for (let c = 0; c < W; c++) idwtLine(ptmp, c, W, ptmp, nL * W + c, W, buf, off + c, W, nL, nH);
 }
 
-function idwtExtrapolate(buf) {
-  idwtExtrapolateLevel(buf, 3807, 3);
-  idwtExtrapolateLevel(buf, 3007, 2);
-  idwtExtrapolateLevel(buf, 0, 1);
+/** buf: a component of 4096 coefficients; b32: an Int32Array over the same memory (made when not given). */
+export function idwtExtrapolate(buf, b32 = new Int32Array(buf.buffer, buf.byteOffset, 2048)) {
+  idwtExtrapolateLevel(buf, b32, 3807, 3);
+  idwtExtrapolateLevel(buf, b32, 3007, 2);
+  idwtExtrapolateLevel(buf, b32, 0, 1);
 }
 
 /** SRL (sign/run-length) reader of upgrade passes. */
@@ -314,23 +371,30 @@ export class ProgressiveDecoder {
   constructor() {
     this.surfaces = new Map();                         // surfaceId -> Map(tileKey -> tile state)
     this.buf = [new Int16Array(4096), new Int16Array(4096), new Int16Array(4096)];
+    this.b32 = this.buf.map((b) => new Int32Array(b.buffer));   // (for idwtExtrapolate)
   }
 
   deleteSurface(id) { this.surfaces.delete(id); }
 
   #component(c, data, q, t, extrapolate, diff) {
     const b = this.buf[c].fill(0);
-    rlgrDecode(data, 1, b);
+    const m = rlgr(data, 1, b);
     t.sign[c].set(b);
-    const bands = extrapolate ? EXTRA : PLAIN, cur = t.current[c];
-    for (let j = bands[0][0] + 1, e = bands[0][0] + bands[0][1]; j < e; j++) b[j] += b[j - 1];
-    for (let i = 0; i < 10; i++) {                       // dequantization (and the differential pass): only non-zero values change
-      const sh = q[i] > 0 ? q[i] : 0, off = bands[i][0], end = off + bands[i][1];
-      if (diff) { for (let j = off; j < end; j++) if (b[j]) cur[j] += b[j] << sh; }
-      else if (sh) for (let j = off; j < end; j++) if (b[j]) b[j] <<= sh;
+    const ll = extrapolate ? EXTRA[0][0] : PLAIN[0][0], band = extrapolate ? EXTRA_BAND : PLAIN_BAND, cur = t.current[c];
+    for (let i = 0; i < 10; i++) SHIFT[i] = q[i] > 0 ? q[i] : 0;
+    for (let j = ll + 1; j < 4096; j++) b[j] += b[j - 1];   // LL3, the last band, is differentially coded
+    // dequantization (and the differential pass): only the values decoded (NZ) can be other than 0, and LL3, made whole
+    const s0 = SHIFT[0];
+    if (diff) {
+      for (let i = 0; i < m; i++) { const j = NZ[i]; if (j >= ll) break; cur[j] += b[j] << SHIFT[band[j]]; }
+      for (let j = ll; j < 4096; j++) cur[j] += b[j] << s0;
+      b.set(cur);
+    } else {
+      for (let i = 0; i < m; i++) { const j = NZ[i]; if (j >= ll) break; b[j] <<= SHIFT[band[j]]; }
+      if (s0) for (let j = ll; j < 4096; j++) b[j] <<= s0;
+      cur.set(b);
     }
-    if (diff) b.set(cur); else cur.set(b);
-    if (extrapolate) idwtExtrapolate(b); else idwt(b);
+    if (extrapolate) idwtExtrapolate(b, this.b32[c]); else idwt(b);
   }
 
   #upgrade(c, srlData, rawData, shift, numBits, t, extrapolate) {
@@ -350,7 +414,7 @@ export class ProgressiveDecoder {
     }
     const b = this.buf[c];
     b.set(cur);
-    if (extrapolate) idwtExtrapolate(b); else idwt(b);
+    if (extrapolate) idwtExtrapolate(b, this.b32[c]); else idwt(b);
   }
 
   /**

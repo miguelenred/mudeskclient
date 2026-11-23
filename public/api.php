@@ -2,7 +2,7 @@
 // MuDeskClient - https://miguelenred.es/mudeskclient - Apache License 2.0
 declare(strict_types=1);
 
-use MuDesk\{Access, Audit, Auth, Connections, Crypto, Http, Sessions, Settings, Text, Totp, Users, WebAuthn};
+use MuDesk\{Access, Audit, Auth, Connections, Crypto, Http, Oidc, Recording, Sessions, Settings, Text, Totp, Users, WebAuthn, WindowsLogin};
 use MuDesk\Rdp\Trace;
 
 require __DIR__ . '/../src/bootstrap.php';
@@ -53,12 +53,16 @@ function state(): never
         'build'   => Http::build(__DIR__ . '/assets'),   // the page compares it with its own: an older page says so
         'second'  => ($p = $_SESSION['pending'] ?? null) === null || !($pu = Users::get($p['uid'])) ? null
                      : ['totp' => !empty($pu['totp']['enabled']), 'passkey' => !empty($pu['passkeys'])],
-        'user'    => $u === null ? null : Users::view($u) + ['totp_required' => Settings::get('totp_required'),
-                     'reconnect' => Settings::get('reconnect_attempts'), 'save_passwords' => Settings::get('save_passwords')]
+        // (signed in with OpenID Connect, the provider's own second step counts: nothing to add here)
+        'user'    => $u === null ? null : Users::view($u) + ['totp_required' => Settings::get('totp_required') && ($_SESSION['via'] ?? '') !== 'oidc',
+                     'reconnect' => Settings::get('reconnect_attempts'), 'save_passwords' => Settings::get('save_passwords') && Auth::dek() !== null,
+                     'no_key' => Settings::get('save_passwords') && Auth::dek() === null,   // (a session opened with OpenID Connect)
+                     'create_conns' => Auth::createsConns($u)]
                      + ($u['role'] === 'admin' ? ['targets_all' => Settings::get('targets')['mode'] === 'all'] : []),   // warned in the panel
         'previous' => $u === null ? null : Auth::takePrevious(),   // right after signing in: last sign-in and failures since
         'session'  => $u === null ? null : ['idle' => Settings::get('session_idle_minutes') * 60, 'max' => Auth::maxLeft()],   // when it expires
         'closed'   => Auth::closedReason(),               // closed by this request: why (idle, max_duration...)
+        'oidc'     => $u === null && Oidc::enabled() ? Oidc::label() : null,   // the sign-in screen offers it
     ]);
 }
 
@@ -190,6 +194,9 @@ switch ($action) {
     // ---------- own profile ----------
     case 'profile.password':
         $u   = Auth::require(false, true);
+        if (isset($u['source'])) {             // a Windows or OpenID Connect account: its password is changed there
+            Http::fail('external_password');
+        }
         $old = $raw('old');
         $new = $raw('new');
         if (!Auth::confirmPassword($u, $old)) {
@@ -230,6 +237,33 @@ switch ($action) {
         Sessions::kill($str('sid'));
         Audit::log('session_kill', ['sid' => $str('sid'), 'conn' => $info['conn'] ?? '', 'by' => 'owner'], null, true);
         Http::json(['ok' => true]);
+
+    case 'session.share':          // a link to the user's running session for a guest without an account: view, or control
+    case 'session.shares':         // the session's links
+    case 'session.unshare':        // a link revoked (id): its guests stop seeing the session at once
+        $u    = Auth::require();
+        $sid  = $str('sid');
+        $info = Sessions::info($sid);
+        if (($info['uid'] ?? null) !== $u['id']) {
+            Http::fail('not_found', 404);
+        }
+        $list = static fn(array $i): array => array_values(array_map(static fn($id, $x) => ['id' => (string)$id, 'mode' => $x['mode'], 'created' => $x['created']],
+            array_keys((array)($i['shares'] ?? [])), (array)($i['shares'] ?? [])));
+        if ($action === 'session.unshare') {
+            if (!Sessions::unshare($sid, $str('id'))) {
+                Http::fail(isset((Sessions::info($sid)['shares'] ?? [])[$str('id')]) ? 'share_failed' : 'not_found', 404);
+            }
+            Audit::log('share_revoke', ['sid' => $sid, 'conn' => $info['conn'] ?? '', 'share' => $str('id')], null, true);
+        } elseif ($action === 'session.share') {
+            if (!empty($info['app']) || count((array)($info['shares'] ?? [])) >= Sessions::MAX_SHARES) {
+                Http::fail(empty($info['app']) ? 'too_many_shares' : 'share_unavailable');
+            }
+            $mode = $str('mode') === 'control' ? 'control' : 'view';
+            $new  = Sessions::share($sid, $mode) ?? Http::fail((string)@file_get_contents(MuDesk\Config::dir('run/' . $sid . '.mode')) === 'file' ? 'share_unavailable' : 'share_failed');
+            Audit::log('share_create', ['sid' => $sid, 'conn' => $info['conn'] ?? '', 'share' => $new['id'], 'mode' => $mode], null, true);
+            Http::json(['id' => $new['id'], 'mode' => $mode, 'link' => $sid . '.' . $new['secret'], 'shares' => $list(Sessions::info($sid) ?? [])]);
+        }
+        Http::json(['shares' => $list(Sessions::info($sid) ?? [])]);
 
     case 'profile.browser.forget': // one known browser (id) or every one but this (others)
         $u    = Auth::require(false, true);
@@ -277,15 +311,27 @@ switch ($action) {
         $u = Auth::require();
         $c = array_map([Connections::class, 'view'], array_values(Connections::all($u['id'])));
         usort($c, static fn($a, $b) => strnatcasecmp($a['group'] . "\0" . $a['name'], $b['group'] . "\0" . $b['name']));
-        Http::json(['conns' => $c, 'keyboards' => Connections::KEYBOARDS]);
+        Http::json(['conns' => $c, 'keyboards' => Connections::KEYBOARDS,       // (and this web session's occasional ones,
+            'occasional' => array_map([Connections::class, 'view'], array_values(Connections::occasionals($u['id'])))]);   // for their tabs)
+
+    case 'conns.occasional':        // a connection to connect once, not saved (kept in this web session): for whoever may make them
+        $u = Auth::require();
+        if (!Auth::createsConns($u)) {
+            Http::fail('conns_locked', 403);
+        }
+        $r = Connections::occasional($obj('conn'), $u['id']);
+        if (is_string($r)) {
+            Http::fail($r);
+        }
+        Http::json(['conn' => Connections::view($r)]);
 
     case 'conns.save':
         $u    = Auth::require();
         $conn = $obj('conn');
         $old  = empty($conn['id']) || is_array($conn['id']) ? [] : (Connections::all($u['id'])[(string)$conn['id']] ?? []);
-        $r    = Connections::save($u['id'], $conn, Auth::dek());
+        $r    = Connections::save($u['id'], $conn, Auth::dek(), Auth::createsConns($u));
         if (is_string($r)) {
-            Http::fail($r);
+            Http::fail($r, $r === 'conns_locked' ? 403 : 400);
         }
         $skip = ['id' => 0, 'created' => 0, 'updated' => 0];
         Audit::log($old === [] ? 'conn_create' : 'conn_update', ['conn' => $r['name'], 'host' => $r['host']] + ($old === []
@@ -312,7 +358,7 @@ switch ($action) {
         }
         $c = Connections::get($u['id'], $str('id')) ?? [];       // the stored (validated) values of the options sent
         Audit::log('conn_options', ['conn' => $c['name'] ?? '', 'options' => array_intersect_key($c,
-            array_flip(['audio', 'mic', 'clipboard', 'drive', 'printer', 'ask', 'gfx', 'paste', 'bpp']), $obj('opts'))], null, true);
+            array_flip(['audio', 'mic', 'clipboard', 'drive', 'printer', 'ask', 'gfx', 'paste', 'bpp', 'full', 'multi']), $obj('opts'))], null, true);
         Http::json(['ok' => true]);
 
     case 'conns.password':         // saves the password typed in the connect dialog (the user ticked "save", not recommended)
@@ -354,18 +400,23 @@ switch ($action) {
             Audit::log('user_create', ['target' => $u['username'], 'role' => $u['role']], null, true);
         }
         $target = Users::get($id) ?? Http::fail('not_found', 404);
-        $role   = $str('role') === 'admin' ? 'admin' : 'user';
+        $role   = in_array($str('role'), ['admin', 'auditor'], true) ? $str('role') : 'user';
         $on     = (bool)($in['enabled'] ?? true);
         $max    = max(0, min(50, $int('max_sessions')));
-        $u = Users::updateKeepingAdmin($id, static function (array &$x) use ($role, $on, $max): void {
+        $hours  = Users::hours($in['hours'] ?? null);
+        if ($hours === false) {
+            Http::fail('invalid_hours');
+        }
+        $u = Users::updateKeepingAdmin($id, static function (array &$x) use ($role, $on, $max, $hours): void {
             $x['role']         = $role;
             $x['enabled']      = $on;
             $x['max_sessions'] = $max;
+            $x['hours']        = $hours;
         }) ?? Http::fail('not_found', 404);
         if ($u === 'last_admin') {   // no enabled administrator would be left (counted under the lock of the users)
             Http::fail('last_admin');
         }
-        $changes = Audit::changes($target, array_intersect_key($u, array_flip(['role', 'enabled', 'max_sessions'])));
+        $changes = Audit::changes($target + ['hours' => null], array_intersect_key($u, array_flip(['role', 'enabled', 'max_sessions', 'hours'])));
         if ($changes !== []) {
             Audit::log('user_update', ['target' => $u['username'], 'changes' => $changes], null, true);
         }
@@ -388,6 +439,9 @@ switch ($action) {
     case 'admin.user.password':
         Auth::require(true);
         $target = Users::get($str('id')) ?? Http::fail('not_found', 404);
+        if (isset($target['source'])) {
+            Http::fail('external_password');
+        }
         if (!Users::validPassword($raw('password'), $target['username'])) {
             Http::fail('weak_password');
         }
@@ -433,6 +487,16 @@ switch ($action) {
                 : ['changes' => Audit::changes(array_diff_key($old, $skip) + ['users' => $who($old['users'] ?? [])], array_diff_key($r, $skip) + ['users' => $who($r['users'])])]),
             null, true);
         Http::json(['conn' => Connections::view($r)]);
+
+    case 'admin.conns.import':             // body: csv, the text of a CSV file (Connections::importCsv)
+        Auth::require(true);
+        $r = Connections::importCsv($raw('csv'));
+        if (is_string($r)) {
+            Http::fail($r);
+        }
+        Audit::log('admin_conns_import', ['created' => count($r['created']), 'rows_refused' => count($r['errors']),
+            'conns' => array_slice($r['created'], 0, 50)], null, true);
+        Http::json($r);
 
     case 'admin.conn.delete':
         Auth::require(true);
@@ -481,18 +545,26 @@ switch ($action) {
                 Http::fail($new);
             }
             if (!Access::clientAllowed(Http::clientIp())) {   // the list would shut everybody out, the administrator too
-                Settings::save($old);
+                Settings::restore($old);                       // (as stored: saved again, the secret was encrypted twice)
                 Http::fail('client_lockout');
             }
-            Audit::log('settings_update', ['changes' => Audit::changes($old, $new)], null, true);
+            Audit::log('settings_update', ['changes' => Audit::changes($old, $new, ['oidc_secret'])], null, true);
+            // the computer that checks Windows accounts: its certificate pinned when it is set or changed, or when asked again
+            if ($new['ad_host'] === '' && $new['ad_cert'] !== '') {
+                Settings::pin('ad_cert', '');
+            } elseif ($new['ad_host'] !== '' && ($new['ad_host'] !== $old['ad_host'] || $new['ad_port'] !== $old['ad_port'] || !empty($set['ad_repin']) || $new['ad_cert'] === '')) {
+                $fp = WindowsLogin::fingerprint() ?? '';
+                Settings::pin('ad_cert', $fp);
+                Audit::log('ad_cert_pinned', ['host' => $new['ad_host'], 'fingerprint' => $fp !== '' ? $fp : null], null, $fp !== '');
+            }
             if ($old['save_passwords'] && !$new['save_passwords']) {   // no longer allowed: the saved RDP passwords are erased
                 Audit::log('rdp_passwords_erased', ['connections' => Connections::forgetAllPasswords()], null, true);
             }
         }
-        Http::json(['settings' => Settings::all()]);
+        Http::json(['settings' => Settings::view(), 'server_timezone' => date_default_timezone_get(), 'oidc_redirect' => Oidc::redirectUri()]);
 
     case 'admin.audit':            // search; export = the same search with up to 20,000 rows, sent as they are found
-        Auth::require(true);
+        Auth::requireAuditor();
         $f = array_intersect_key($obj('filter'), array_flip(['from', 'to', 'user', 'event', 'ip', 'q', 'ok']));
         if (array_filter($f, 'is_array') !== []) {
             Http::fail('invalid_input');
@@ -520,11 +592,11 @@ switch ($action) {
         Http::json($res + ['days' => Audit::days(), 'retention' => Settings::get('audit_retention_days')]);
 
     case 'admin.audit.key':        // public key of the signed exports
-        Auth::require(true);
+        Auth::requireAuditor();
         Http::json(['key' => $signKey()]);
 
     case 'admin.audit.verify':
-        Auth::require(true);
+        Auth::requireAuditor();
         @set_time_limit(600);      // about 5 s per million lines
         $v = Audit::verify();
         Audit::log('audit_verify', ['lines' => $v['lines'], 'problems' => $v['problem_count']], null, $v['ok']);
@@ -559,8 +631,13 @@ switch ($action) {
         }
         Http::json(['name' => 'mudesk-trace-' . $str('sid') . '.log', 'text' => (string)file_get_contents($file)]);
 
-    case 'admin.sessions':
-        Auth::require(true);
+    case 'admin.recording':                // a session's recording: who, which connection, when, how long (played with rdp.php?a=replay)
+        Auth::requireAuditor();
+        Recording::cleanup();
+        Http::json(['recording' => Recording::info($str('sid')) ?? Http::fail('not_found', 404)]);
+
+    case 'admin.sessions':                 // seen by auditors too; ended only by an administrator
+        Auth::requireAuditor();
         Http::json(['sessions' => Sessions::active()]);
 
     case 'admin.sessions.kill':

@@ -41,6 +41,42 @@ jobs:
             exit 1
           fi
 
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Image built and started; it answers over HTTPS with the setup screen, keeps the private folders out of reach, refuses a body over 8 MB and has no local files
+        run: |
+          docker build -t mudesk .
+          docker run -d --name mudesk -p 8443:443 mudesk
+          for i in $(seq 1 30); do curl -sk -o /dev/null https://localhost:8443/ && break; sleep 1; done
+          curl -sk https://localhost:8443/ | grep -q '<title>MuDeskClient</title>'
+          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost:8443/api.php | grep -q '"setup":true'
+          test "$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/data/web-check.txt)" = 404
+          test "$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/src/bootstrap.php)" = 404
+          test "$(head -c 9000000 /dev/zero | curl -sk -o /dev/null -w '%{http_code}' -H 'Content-Type: application/octet-stream' --data-binary @- 'https://localhost:8443/rdp.php?a=send&sid=x')" = 413
+          docker exec mudesk test -s /var/www/mudesk/data/setup-code.php
+          docker exec mudesk test ! -e /var/www/mudesk/config.php
+          docker exec mudesk test ! -e /var/www/mudesk/tests
+          docker exec mudesk sh -c 'test "$(stat -c %U /var/www/mudesk/data)" = www-data'
+          docker logs mudesk 2>&1 | grep -q 'self-signed certificate made'
+      - name: The same with Docker Compose (compose.yaml, its image built from this code)
+        run: |
+          docker rm -f mudesk
+          sed -i 's|^    # build: \.$|    build: .|' compose.yaml
+          grep -q '^    build: \.$' compose.yaml
+          docker compose up -d --build
+          for i in $(seq 1 30); do curl -sk -o /dev/null https://localhost:8443/ && break; sleep 1; done
+          curl -sk https://localhost:8443/ | grep -q '<title>MuDeskClient</title>'
+          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost:8443/api.php | grep -q '"setup":true'
+          docker compose exec -T mudesk test -s /var/www/mudesk/data/setup-code.php
+          docker compose exec -T mudesk test ! -e /var/www/mudesk/compose.yaml
+          docker volume ls --format '{{.Name}}' | grep -q 'mudesk-data$'
+          docker compose down
+      - name: Container log
+        if: always()
+        run: docker logs mudesk || true
+
   js:
     strategy:
       fail-fast: false

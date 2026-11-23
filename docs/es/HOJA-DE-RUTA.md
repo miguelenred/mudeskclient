@@ -4,7 +4,7 @@
 
 ## 1. Validación con Windows
 
-Hecho con Windows 11 Pro (ver [PRUEBAS.md › Windows 11 Pro](PRUEBAS.md#windows-11-pro-23h2-nla)): NLA, Display Control, compresión, órdenes de dibujo, canal gráfico con H.264, dos monitores, portapapeles, unidad, audio y micrófono, con cinco fallos corregidos. Falta: Windows Server con licencias RDS, MuDeskPDF y versiones anteriores.
+Hecho con Windows 11 Pro (ver [PRUEBAS.md › Windows 11 Pro](PRUEBAS.md#windows-11-pro-23h2-nla)): NLA, Display Control, compresión, órdenes de dibujo, canal gráfico con H.264, dos monitores, portapapeles, unidad, audio, micrófono, cámara y una carpeta de este equipo, con cinco fallos corregidos. Falta: Windows Server con licencias RDS, MuDeskPDF y versiones anteriores: desde la 1.1 se admiten Windows XP y Server 2003 (seguridad RDP estándar) y Windows 7 y Server 2008 R2 (TLS 1.0, CredSSP 3), probados contra servidores que hablan sus protocolos, aún no contra esos Windows.
 
 ## 2. Velocidad de pantalla
 
@@ -18,8 +18,9 @@ Ya hecho:
 - Tipo de conexión LAN: Windows envía un 20 % más de fotogramas.
 - RemoteFX progresivo 5,6 veces más rápido de decodificar (79 → 14 ms por fotograma a pantalla completa) y bloques opacos del canal gráfico pintados sin mezclar (2,6 veces más rápido).
 - Medidas por códec y calidad separando PHP y navegador: [RENDIMIENTO](RENDIMIENTO.md).
+- La revisión de velocidad de la 1.1: la descompresión de la pasarela de 1,2 a 2,5 veces más rápida y su RC4 de 1,35 a 1,86 veces, los decodificadores del navegador de un 9 a un 54 % menos de tiempo, los mapas de bits de una actualización entregados juntos a la página y una operación de varias zonas pintada una sola vez; en un equipo limitado a la sexta parte de la CPU una animación pasa de 9,7 a 12,3 fotogramas por segundo ([RENDIMIENTO](RENDIMIENTO.md#cuarta-revisión-11-decodificadores-entrega-a-la-página-y-equipos-lentos)). Queda ahí: una ráfaga de cientos de desplazamientos a pantalla completa de un servidor antiguo se acumula en la página (frenar al servidor costaba un 12–25 % de rendimiento).
 
-- Modo de gráficos automático (por defecto): la versión de Windows que llega en el desafío NTLM decide; Windows 8.1 o posterior → canal gráfico con H.264 si el navegador lo admite; xrdp, solo TLS y Windows antiguos → mapas de bits. Una conexión RemoteApp usa siempre mapas de bits y órdenes de dibujo (sin canal gráfico).
+- Modo de gráficos automático (por defecto): la versión de Windows que llega en el desafío NTLM decide (con Kerberos, que no la da: un Windows de dominio, el canal gráfico); Windows 8.1 o posterior → canal gráfico con H.264 si el navegador lo admite; xrdp, solo TLS y Windows antiguos → mapas de bits. Una conexión RemoteApp usa siempre mapas de bits y órdenes de dibujo (sin canal gráfico).
 
 Siguiente: AVC444 con el color a resolución completa.
 
@@ -61,10 +62,14 @@ Pendiente:
 
 ## 5. Lo siguiente y otras ideas
 
-- **Hecho: el micrófono** en las sesiones RDP (entrada de audio, el canal dinámico AUDIO_INPUT): una casilla más en las opciones de la conexión, desmarcada de serie; el Windows remoto tiene que permitir la redirección de grabación de audio ([HOSTING](HOSTING.md#equipos-remotos)). Queda: un formato comprimido (IMA ADPCM enviaría una cuarta parte de los 176 KB/s del PCM) y la cámara.
-- **Más adelante: la grabación de sesiones**, reproducida en el navegador con los mismos decodificadores (lo que envía la pasarela: dibujo, vídeo y sonido), abierta desde la auditoría. Antes hay que decidir: espacio en disco, aviso al usuario, cuánto tiempo se guarda, cifrado y quién puede verla.
+- **Hecho: el micrófono** en las sesiones RDP (entrada de audio, el canal dinámico AUDIO_INPUT): una casilla más en las opciones de la conexión, desmarcada de serie; el Windows remoto tiene que permitir la redirección de grabación de audio ([HOSTING](HOSTING.md#equipos-remotos)). Queda: un formato comprimido (IMA ADPCM enviaría una cuarta parte de los 176 KB/s del PCM).
+- **Hecho: la cámara** (1.1), con el micrófono en una sola casilla (MS-RDPECAM, Motion JPEG desde la cámara de la propia página, en Chrome, Edge y Firefox), y **una carpeta de este equipo** como unidad de la sesión (lectura y escritura en Chrome y Edge, solo lectura en los demás; ver [USO](USO.md#una-carpeta-de-este-equipo)). Decidido: la cámara va con el micrófono (una sola decisión sobre los dispositivos de este equipo, desmarcada de serie); la carpeta necesita la carpeta compartida de la conexión, así que un administrador que la desactive desactiva las dos. Queda fuera: imágenes H.264 de la cámara (menos ancho de banda; Motion JPEG funciona en todos los navegadores) y avisar a Windows de los cambios de la carpeta según ocurren (el navegador no puede vigilar una carpeta).
+- **Hecho: la grabación de sesiones** (1.1), reproducida en el navegador con los mismos decodificadores, abierta desde la auditoría. Decidido: desactivada salvo que el administrador grabe una conexión; al usuario se le avisa antes de mostrar nada y mientras dura la sesión; solo la imagen (ni el teclado, ni el portapapeles, ni el sonido); cifrada con una clave del servidor; se guarda 30 días (un ajuste) y como mucho 2 GB cada una (`record_max_mb`); solo la ven administradores y auditores, y cada visionado queda en la auditoría. Queda: el sonido, y saltarse los tramos sin cambios.
+- **Hecho: compartir una sesión** (1.1) con un enlace, solo ver o con control (ver [USO](USO.md#compartir-una-sesión)).
+- **Hecho: puerta de enlace de Escritorio remoto y agente de conexión** (1.1): una conexión a través de una RD Gateway (MS-TSGU sobre WebSocket, sobre dos conexiones HTTPS o RPC sobre HTTP para Windows Server 2008 y 2008 R2; en PHP puro) y con la información de equilibrio de carga de una granja, siguiendo las redirecciones del agente (su contraseña para el equipo siguiente, entregada con RDSTLS); probado a través de una puerta de enlace de código abierto delante de Windows 11 (RPC sobre HTTP, contra una puerta de enlace escrita según las especificaciones), aún no contra la puerta de enlace de Windows Server ni contra un agente real.
+- **Hecho: Windows antiguos** (1.1): la seguridad RDP estándar para Windows XP y Server 2003 (solo con la seguridad *Automática*), TLS 1.0 y CredSSP 3 para Windows 7 y Server 2008 R2, Kerberos con RC4 para los dominios de Windows Server 2003; sus límites, en [SECURITY](../../SECURITY.md).
 
-Otras ideas: tarjetas inteligentes, RD Gateway, redirección del agente de conexión, Kerberos, caché persistente de mapas de bits, copia de la auditoría a un servidor syslog externo (prueba más fuerte que la cadena HMAC, cuya clave está en el mismo servidor).
+Otras ideas: caché persistente de mapas de bits, copia de la auditoría a un servidor syslog externo (prueba más fuerte que la cadena HMAC, cuya clave está en el mismo servidor). Las tarjetas inteligentes no son posibles: un navegador no puede dejar que la pasarela use la clave privada de la tarjeta.
 
 ## Decisiones tomadas (y por qué)
 
@@ -73,7 +78,8 @@ Otras ideas: tarjetas inteligentes, RD Gateway, redirección del agente de conex
 | Una petición HTTP larga por sesión | Hosting compartido: sin demonios ni WebSocket |
 | Mapas de bits reenviados y decodificados en JavaScript | Poco consumo de CPU y memoria en el hosting |
 | Extensión OpenSSL obligatoria | RDP exige TLS; TLS en PHP puro sería lento e inseguro. OpenSSL viene de serie con PHP |
-| Solo NTLM | Kerberos necesita un KDC y no es posible desde un hosting |
+| Kerberos si se llega a un controlador de dominio; si no, NTLM | Desde un hosting los controladores de dominio no suelen estar a mano: entonces NTLM, como Windows sin KDC (no donde el dominio lo bloquea). Kerberos con AES y, para los dominios de Windows Server 2003 y las contraseñas anteriores a las claves AES de su dominio, RC4 (ofrecido el último), solo si el administrador lo permite (desactivado de serie: quien se ponga en medio podría forzarlo, y la contraseña se rompe entonces mucho antes); solo contraseñas (sin tarjetas inteligentes) |
+| La seguridad RDP estándar solo con la seguridad *Automática* | Windows XP y Server 2003 no tienen otra, pero no demuestra nada del servidor y su RC4 es débil: nunca la usa una conexión en *Solo NLA* o *Solo TLS*, la clave del servidor se fija como un certificado (un equipo con TLS que cae a ella es un certificado cambiado) y un servidor que no cifra nada se rechaza |
 | Contraseñas remotas cifradas con la contraseña del usuario | Ni el administrador puede leerlas |
 | Confianza en el primer uso para los certificados | Los servidores RDP usan certificados autofirmados |
 | Listas blancas de IPs cliente y destinos | Pedido: «IPs y dominios en lista blanca o todo permitido» |

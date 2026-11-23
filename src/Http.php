@@ -138,14 +138,16 @@ final class Http
 
     /**
      * The body of a JSON request, up to BODY_MAX (413 past it). PHP's post_max_size does not limit php://input: an 8 MB
-     * list of zeros, decoded twice by api.php before signing in, took 150 MB and ended the request with a fatal error.
+     * list of zeros, decoded twice by api.php before signing in, took 150 MB and ended the request with a fatal error. Read as
+     * long as the request says: PHP 8.1 and 8.2 take the memory of the most asked for at once (4 MB for each request).
      */
     public static function body(): string
     {
         static $raw = null;
         if ($raw === null) {
-            $raw = (string)@file_get_contents('php://input', false, null, 0, self::BODY_MAX + 1);
-            if (strlen($raw) > self::BODY_MAX) {
+            $len = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
+            $raw = $len > self::BODY_MAX ? '' : (string)@file_get_contents('php://input', false, null, 0, $len > 0 ? $len : self::BODY_MAX + 1);
+            if ($len > self::BODY_MAX || strlen($raw) > self::BODY_MAX) {
                 self::fail('too_large', 413);
             }
         }

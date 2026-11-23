@@ -9,11 +9,11 @@ import { drawPattern, drawRop, drawText, glyphPath } from './orders.js';
 
 const FATAL = new Set(['app_not_opened', 'auth_failed', 'password_expired', 'account_locked', 'account_disabled', 'account_restricted',
   'account_expired', 'logon_not_granted', 'target_denied', 'too_many_sessions', 'cert_changed', 'nla_required',
-  'nla_unavailable', 'rdp_security', 'tls_required', 'license', 'license_rds', 'user', 'killed', 'idle', 'invalid_request',
-  'redirect', 'mitm', 'unreachable', 'auth', 'csrf', 'pending', 'signed_out', 'app_not_allowed', 'app_not_found', 'app_failed', 'app_locked',
-  'app_unsupported']);
+  'nla_unavailable', 'rdp_security', 'rdp_unencrypted', 'tls_required', 'license', 'license_rds', 'user', 'killed', 'idle', 'invalid_request',
+  'redirect', 'routing_token', 'gateway_auth', 'gateway_denied', 'gateway_not_allowed', 'gateway_unsupported', 'gateway_consent', 'gateway_unreachable', 'mitm', 'unreachable', 'auth', 'csrf', 'pending', 'signed_out', 'app_not_allowed', 'app_not_found', 'app_failed', 'app_locked',
+  'app_unsupported', 'record_failed', 'outside_hours']);
 // while reconnecting: the lost session may still count for a minute on the gateway, the computer may be restarting
-const RETRY_ON_RECONNECT = new Set(['too_many_sessions', 'unreachable']);
+const RETRY_ON_RECONNECT = new Set(['too_many_sessions', 'unreachable', 'gateway_unreachable']);
 const NO_RECONNECT_ERRORINFO = new Set([0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x9, 0xa, 0xb, 0xc]);
 // H.264 decoding in this browser (WebCodecs): the server only gets AVC420 offered when it works
 const AVC = typeof VideoDecoder === 'undefined' ? Promise.resolve(false)
@@ -58,13 +58,18 @@ function contain(c, w, h) {
   c.style.width = Math.floor(c.width * scale) + 'px';
   c.style.height = Math.floor(c.height * scale) + 'px';
 }
-const MSG = { INPUT: 1, RESIZE: 2, VISIBLE: 3, CLIP: 4, QUIT: 5, REFRESH: 6, TEXT: 7, PASTE: 8, GFX_ACK: 10, DIAG: 11, CLIP_PASTE: 12, MONITORS: 13, RAIL: 14, MIC: 15 };
+const MSG = { INPUT: 1, RESIZE: 2, VISIBLE: 3, CLIP: 4, QUIT: 5, REFRESH: 6, TEXT: 7, PASTE: 8, GFX_ACK: 10, DIAG: 11, CLIP_PASTE: 12, MONITORS: 13, RAIL: 14, MIC: 15, TOUCH: 16, GW_CONSENT: 17,
+  CAM: 18, FOLDER: 19, FOLDER_IO: 20, FOLDER_LIST: 21 };
+const LANE = 0xFFFFFFFF;                                 // out of order (Sessions::OUT_OF_BAND): camera pictures, the folder's answers
+const GUEST_MSG = new Set([MSG.INPUT, MSG.TEXT, MSG.PASTE, MSG.TOUCH]);   // what a guest given control sends (Sessions::GUEST_TYPES)
 const SC = { minimize: 0xF020, maximize: 0xF030, restore: 0xF120, close: 0xF060 };   // RemoteApp window commands (SC_*)
 const DIAG_MAX = 300;                                    // browser notes per session in diagnostic mode
 
 export class RdpSession {
   /**
-   * @param {object} o {container, canvas, keyboard (textarea), conn, csrf, retries (automatic reconnections), onState(state, info)}
+   * @param {object} o {container, canvas, keyboard (textarea), conn, csrf, retries (automatic reconnections), onState(state, info)};
+   *   guest: {link} to watch a session shared with a link (view only, or with control when the owner gave it);
+   *   replay: {sid, from (ms), speed} to play a session's recording (administrators and auditors)
    */
   constructor(o) {
     Object.assign(this, o);
@@ -89,6 +94,8 @@ export class RdpSession {
     this.pointers = new Map();
     this.counts = { frames: 0, bytes: 0, bytesAt: 0, rtt: 0 };   // quality indicator: painted frames, bytes received (and when), input latency (ms)
     this.tap = { at: 0, x: -1, y: -1, keyboard: null };   // last touch tap: the text cursor after it opens the keyboard
+    this.touchOn = false;                                // multitouch to Windows (the gateway's {"touch": true})
+    this.contacts = new Map();                           // pointerId -> {id, x, y, state, after}
     this.down = new Set();
     this.events = [];
     this.move = null;
@@ -109,6 +116,9 @@ export class RdpSession {
     this.clipboard = null;                               // set by the clipboard bridge
     this.audio = null;                                   // AudioPlayer when audio is enabled
     this.mic = null;                                     // MicCapture when the microphone is offered
+    this.cam = null;                                     // CamCapture when the camera is offered (with the microphone)
+    this.folder = null;                                  // LocalFolder: a folder of this computer shared in the session
+    this.lane = { busy: 0, cam: null, folder: [] };      // the out-of-order lane: what waits to go, how many requests are out
     this.#bindPointer(this.canvas, this.views[0]);
     this.#bindKeyboard(this.keyboard);
     this.#bindWindow();
@@ -128,8 +138,17 @@ export class RdpSession {
   stop() {
     this.stopped = true;
     this.mic?.stop();
+    this.cam?.stop();
     if (this.sid) this.#post([MSG.QUIT]);
+    if (this.replay || this.guest) { this.worker?.postMessage({ cmd: 'stop' }); return; }   // (nothing of theirs to say goodbye with)
     setTimeout(() => this.worker?.postMessage({ cmd: 'stop' }), 300);
+  }
+
+  /** The page is done with this session: its window listeners go, and its worker (no more memory held by the tab). */
+  dispose() {
+    this.leaveWindow?.abort();
+    this.resizeObs?.disconnect();
+    if (this.stopped) { this.worker?.terminate(); this.worker = null; }
   }
 
   viewSize() {
@@ -146,19 +165,71 @@ export class RdpSession {
     const { w, h } = one ? { w: one.w, h: one.h } : this.viewSize();
     // (gen: requests of the connection before still in flight no longer count; locks: synced again on the next key)
     Object.assign(this, { sid: null, token: null, seq: 0, inflight: 0, gen: (this.gen || 0) + 1, outbox: [], events: [], move: null, ack: null, ackOwed: false,
-      locks: -1, inView: true, disp: false, ended: null, bcache: new Map(), gcache: new Map() });
+      locks: -1, inView: true, disp: false, ended: null, bcache: new Map(), gcache: new Map(), lane: { busy: 0, cam: null, folder: [] } });
     if (this.rail) {                                     // the server sends its windows again
       clearTimeout(this.rail.closing);
       Object.assign(this.rail, { active: 0, ready: false, seen: false, closing: 0, asked: 0 });
       this.rail.wins.clear();
     }
     this.resumed = !!(this.rail && this.hadApp);
-    this.gfx = new GfxSurfaces({
+    this.#newGfx();
+    this.pendingSid = sid;
+    this.onState(this.attempt ? 'reconnecting' : 'connecting', { attempt: this.attempt, quiet: this.quiet || undefined });
+    this.worker?.terminate();
+    const wk = this.worker = new Worker(new URL('./stream-worker.js', import.meta.url), { type: 'module' });
+    wk.onmessage = ({ data: m }) => {
+      if (wk !== this.worker) { m.op?.frame?.close?.(); return; }   // (a video frame of a worker replaced: freed)
+      if (m.t === 'rects') {                             // bitmaps of an update
+        for (const r of m.rects) {
+          if (r.w && r.h) {                              // a bitmap of no size draws nothing (ImageData of 0 threw)
+            this.sctx.putImageData(new ImageData(new Uint8ClampedArray(r.px.buffer), r.w, r.h), r.x, r.y, 0, 0, r.cw, r.ch);
+            this.#dirty(r.x, r.y, r.cw, r.ch);
+          }
+        }
+      }
+      else if (m.t === 'op') this.#order(m.cmd);
+      else if (m.t === 'gfx') this.gfx.apply(m.op);
+      else if (m.t === 'frame') this.#frame(m.type, m.d);
+      else if (m.t === 'log') this.#log(m.msg);
+      else if (m.t === 'diag') this.diag(m.d);
+      else if (m.t === 'bytes') Object.assign(this.counts, { bytes: m.n, bytesAt: m.at });
+      else if (m.t === 'pos') this.onReplayPos?.(m.ms, !!m.done);
+      else if (m.t === 'end') {
+        wk.terminate();
+        this.worker = null;
+        this.sid = this.token = null;
+        if (!this.ended) this.ended = { end: m.end || (this.stopped ? 'user' : 'network'), reason: m.reason };   // m.end: the gateway's refusal ('auth', 'csrf'...)
+        this.#finish();
+      }
+    };
+    if (this.replay) {                                   // a recording: its frames at their pace, nothing sent
+      wk.postMessage({ url: new URL('rdp.php?a=replay', location.href).href, headers: { 'Content-Type': 'application/json', 'X-CSRF': this.csrf },
+        body: JSON.stringify({ sid: this.replay.sid }), timed: true, from: this.replay.from || 0, speed: this.replay.speed || 1 });
+      return;
+    }
+    if (this.guest) {                                    // a shared session: its stream from the owner's, through the link
+      wk.postMessage({ url: new URL('rdp.php?a=watch', location.href).href, headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ link: this.guest.link }) });
+      return;
+    }
+    wk.postMessage({
+      url: new URL('rdp.php?a=stream', location.href).href,
+      headers: { 'Content-Type': 'application/json', 'X-CSRF': this.csrf },
+      body: JSON.stringify({ c: this.conn.id, sid, w, h, tz: new Date().getTimezoneOffset(), lang: document.documentElement?.lang, avc: this.avc, diag: this.#browserInfo(), ...this.extra, mons: this.multi && !one ? this.mons.map((m) => [m.vx, m.vy, m.w, m.h, m.primary ? 1 : 0]) : undefined,
+        // RemoteApp: again, reconnected after the connection dropped; resume, the program was open in this page: either way
+        // it is started only if its windows do not come back (no second one)
+        again: this.rail && this.connectedOnce ? true : undefined, resume: this.resumed || undefined }),
+    });
+  }
+
+  /** The graphics pipeline's surfaces and cache, new (a new connection, or the same stream connected again). */
+  #newGfx() {
+    const g = this.gfx = new GfxSurfaces({
       out: () => ({ ctx: this.sctx }),
       dirty: (x, y, w, h) => this.#dirty(x, y, w, h),
       reset: (w, h) => this.#resize(w, h),
       ack: (frame, decoded) => {                 // only the latest acknowledgement is kept: it covers the earlier frames
-        if (this.stopped) return;
+        if (this.stopped || this.guest || g !== this.gfx) return;   // (a guest's page does not pace the server)
         const m = new Uint8Array(9);
         const dv = new DataView(m.buffer);
         m[0] = MSG.GFX_ACK;
@@ -170,44 +241,14 @@ export class RdpSession {
       log: (msg) => this.#log(msg),
       note: (msg) => this.diag({ note: msg }),
     });
-    this.pendingSid = sid;
-    this.onState(this.attempt ? 'reconnecting' : 'connecting', { attempt: this.attempt, quiet: this.quiet || undefined });
-    this.worker?.terminate();
-    const wk = this.worker = new Worker(new URL('./stream-worker.js', import.meta.url), { type: 'module' });
-    wk.onmessage = ({ data: m }) => {
-      if (wk !== this.worker) return;
-      if (m.t === 'rect') {
-        if (m.w && m.h) {                                // a bitmap of no size draws nothing (ImageData of 0 threw)
-          this.sctx.putImageData(new ImageData(new Uint8ClampedArray(m.px.buffer), m.w, m.h), m.x, m.y, 0, 0, m.cw, m.ch);
-          this.#dirty(m.x, m.y, m.cw, m.ch);
-        }
-      }
-      else if (m.t === 'op') this.#order(m.cmd);
-      else if (m.t === 'gfx') this.gfx.apply(m.op);
-      else if (m.t === 'frame') this.#frame(m.type, m.d);
-      else if (m.t === 'log') this.#log(m.msg);
-      else if (m.t === 'diag') this.diag(m.d);
-      else if (m.t === 'bytes') Object.assign(this.counts, { bytes: m.n, bytesAt: m.at });
-      else if (m.t === 'end') {
-        wk.terminate();
-        this.worker = null;
-        this.sid = this.token = null;
-        if (!this.ended) this.ended = { end: m.end || (this.stopped ? 'user' : 'network'), reason: m.reason };   // m.end: the gateway's refusal ('auth', 'csrf'...)
-        this.#finish();
-      }
-    };
-    wk.postMessage({
-      url: new URL('rdp.php?a=stream', location.href).href,
-      headers: { 'Content-Type': 'application/json', 'X-CSRF': this.csrf },
-      body: JSON.stringify({ c: this.conn.id, sid, w, h, tz: new Date().getTimezoneOffset(), lang: document.documentElement?.lang, avc: this.avc, diag: this.#browserInfo(), ...this.extra, mons: this.multi && !one ? this.mons.map((m) => [m.vx, m.vy, m.w, m.h, m.primary ? 1 : 0]) : undefined,
-        // RemoteApp: again, reconnected after the connection dropped; resume, the program was open in this page: either way
-        // it is started only if its windows do not come back (no second one)
-        again: this.rail && this.connectedOnce ? true : undefined, resume: this.resumed || undefined }),
-    });
   }
 
   #finish() {
     this.mic?.stop();                                    // a new connection opens it again if a program there records
+    this.cam?.stop();                                    // ... or uses the camera
+    this.folder?.reset();                                // its open files went with the connection (the folder stays chosen)
+    this.lane.cam = null;
+    this.lane.folder = [];
     // the program closed: said so, and the next connection is a new one (the program is started again there)
     let e = this.appClosed ? { end: 'app_closed' } : this.appNotOpened ? { end: 'app_not_opened' } : this.ended || { end: 'network' };
     if (this.appClosed) this.connectedOnce = false;
@@ -250,6 +291,16 @@ export class RdpSession {
       case 5: this.disp = true; this.#checkSize(); break;
       case 7: this.audio?.onMessage(d); break;
       case 13: this.mic?.onMessage(d); break;
+      case 16: this.cam?.onMessage(d); break;
+      case 17: this.folder?.onRequest(d); break;
+      case 14:                                           // connected again for a guest: everything is drawn anew
+        this.#newGfx();
+        Object.assign(this, { bcache: new Map(), gcache: new Map(), ack: null });
+        this.cam?.stop();                                // (the camera and its pictures of before: asked for again if still used)
+        this.folder?.reset();                            // (the folder announced again by the gateway: its files opened anew)
+        Object.assign(this.lane, { cam: null, folder: [] });   // (answers to the connection before: no longer waited for)
+        break;
+      case 15: this.#ownerPointer(d[0] | (d[1] << 8), d[2] | (d[3] << 8)); break;
       case 8: this.onPrint?.(JSON.parse(new TextDecoder().decode(d))); break;
       case 12: {                                         // RemoteApp: a window cloaked or shown again
         const m = JSON.parse(new TextDecoder().decode(d)), w = this.rail?.wins.get(m.cloak);
@@ -264,14 +315,35 @@ export class RdpSession {
       this.token = s.token;
       this.sid = this.pendingSid;
       this.#pump();
+      this.#lanePump();
       if (this.pendingLayout) { this.pendingLayout = false; this.#sizeSoon(); }   // a window opened or closed while connecting
     }
     if (s.trace) { this.diagLeft = DIAG_MAX; this.worker?.postMessage({ cmd: 'diag' }); }
+    if (s.waking) this.onState('waking', s);           // Wake-on-LAN: the computer did not answer and is being turned on
+    if (s.watch && this.guest) {                       // a guest: watching (with control, its input goes with the link's secret)
+      this.guest.mode = s.watch;
+      this.sid = s.sid;
+      this.token = s.watch === 'control' ? this.guest.link.split('.')[1] : null;
+      this.connectedOnce = true;
+      this.onState('connected', s);
+    }
+    if ('gateway_message' in s && !this.replay && !this.guest) {   // the Remote Desktop Gateway's message: one to accept
+      const consent = !!s.consent;                     // before connecting (its answer sent), or one to read
+      Promise.resolve(this.onGatewayMessage?.(String(s.gateway_message), consent)).then((ok) => consent && this.#post([MSG.GW_CONSENT, ok === true ? 1 : 0]));
+    }
+    if ('viewers' in s) this.onViewers?.(s.viewers);   // the owner: how many guests watch
+    if (s.local_folder === 'refused') this.folder?.refused();   // no shared folder in this session (or the gateway's policy)
+    if ('recording' in s && !this.replay) this.onRecording?.(!!s.recording);   // the administrator records this connection: said
+    if ('touch' in s) {                                // multitouch ready (or suspended, or gone): the fingers go as touch
+      this.touchOn = !!s.touch && navigator.maxTouchPoints > 0 && !this.replay && !(this.guest && this.guest.mode !== 'control');
+      if (!this.touchOn) this.contacts.clear();
+    }
     if (s.connected) {
       this.attempt = 0;
       this.connectedOnce = true;
       this.onState('connected', s);
       this.#post([MSG.VISIBLE, document.hidden ? 0 : 1]);
+      if (this.folder?.shared) this.shareFolder(this.folder.name, this.folder.readonly);   // connected again: shared again
     }
     if (s.errorInfo) this.lastErrorInfo = s.errorInfo;
     if (s.end) this.ended = { ...s, errorInfo: s.errorInfo || this.lastErrorInfo || 0 };
@@ -367,6 +439,9 @@ export class RdpSession {
    * visibility was sent, so hiding it froze the other screens' windows still in view. Said only when it changes.
    */
   #visibility() {
+    // what waits for a frame of a window just hidden: asked again from one in view (the first to come draws it)
+    if (this.dirtyRect) this.#onFrame(() => this.#copyDirty());
+    if (this.rail?.soon) this.#onFrame(() => this.#railSoon());
     const seen = [document, ...this.views.map((v) => v.canvas.ownerDocument || document)].some((d) => !d.hidden);
     if (seen === this.inView) return;
     this.inView = seen;
@@ -406,18 +481,32 @@ export class RdpSession {
     if (d) { const r = Math.max(d.x + d.w, x + w), b = Math.max(d.y + d.h, y + h); d.x = Math.min(d.x, x); d.y = Math.min(d.y, y); d.w = r - d.x; d.h = b - d.y; }
     else {
       this.dirtyRect = { x, y, w, h };
-      requestAnimationFrame(() => {
-        const r = this.dirtyRect;
-        this.dirtyRect = null;
-        if (this.rail) { this.#railCopy(r); return; }
-        for (const v of this.views) {
-          if (v.x === null) continue;                    // its monitor is not there yet
-          const ix = Math.max(r.x, v.x), iy = Math.max(r.y, v.y);
-          const iw = Math.min(r.x + r.w, v.x + v.canvas.width) - ix, ih = Math.min(r.y + r.h, v.y + v.canvas.height) - iy;
-          if (iw > 0 && ih > 0) v.ctx.drawImage(this.surface, ix, iy, iw, ih, ix - v.x, iy - v.y, iw, ih);
-        }
-      });
+      this.#onFrame(() => this.#copyDirty());
     }
+  }
+
+  /** The changed area, from the surface to each window it is in (once: it may have been asked from two windows). */
+  #copyDirty() {
+    const r = this.dirtyRect;
+    if (!r) return;
+    this.dirtyRect = null;
+    if (this.rail) { this.#railCopy(r); return; }
+    for (const v of this.views) {
+      if (v.x === null) continue;                        // its monitor is not there yet
+      const ix = Math.max(r.x, v.x), iy = Math.max(r.y, v.y);
+      const iw = Math.min(r.x + r.w, v.x + v.canvas.width) - ix, ih = Math.min(r.y + r.h, v.y + v.canvas.height) - iy;
+      if (iw > 0 && ih > 0) v.ctx.drawImage(this.surface, ix, iy, iw, ih, ix - v.x, iy - v.y, iw, ih);
+    }
+  }
+
+  /**
+   * f on the next frame of a window of the session in view: this page's, else another screen's. A hidden page (minimized,
+   * covered, another tab) gets no frames, and the other screens' windows, still in view, stopped changing with it.
+   */
+  #onFrame(f) {
+    const v = document.hidden && this.views.find((x) => x.canvas.ownerDocument && !x.canvas.ownerDocument.hidden);
+    if (v) v.canvas.ownerDocument.defaultView.requestAnimationFrame(f);
+    else requestAnimationFrame(f);
   }
 
   /**
@@ -515,8 +604,9 @@ export class RdpSession {
         c.width = p.w;
         c.height = p.h;
         if (p.w && p.h) c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(p.rgba.buffer), p.w, p.h), 0, 0);
-        const css = p.w && p.h ? `url(${c.toDataURL()}) ${Math.min(p.x, p.w - 1)} ${Math.min(p.y, p.h - 1)}, default` : 'none';
-        const ptr = { css, text: isTextCursor(p) };
+        const url = p.w && p.h ? c.toDataURL() : null;
+        const css = url ? `url(${url}) ${Math.min(p.x, p.w - 1)} ${Math.min(p.y, p.h - 1)}, default` : 'none';
+        const ptr = { css, text: isTextCursor(p), url, hx: p.x, hy: p.y };
         this.pointers.set(p.index, ptr);
         this.#cursor(ptr);
         break;
@@ -527,9 +617,26 @@ export class RdpSession {
 
   /** Shows the remote pointer; the text cursor right after a tap opens the phone keyboard (Windows shows it over text boxes). */
   #cursor(ptr) {
-    for (const v of this.views) v.canvas.style.cursor = ptr.css;
+    this.ptr = ptr;
+    for (const v of this.views) v.canvas.style.cursor = this.guest?.mode === 'view' ? 'default' : ptr.css;   // (a guest that only watches: its own)
+    if (this.mark) this.#ownerPointer(...this.pointerAt);
     this.textCursor = !!ptr.text;
     if (this.textCursor && performance.now() - this.tap.at < 1000) { this.tap.at = 0; this.showKeyboard(this.tap.keyboard); }
+  }
+
+  /** A recording being played: pause, play, or speed (v: 1, 2, 4, 8). */
+  replayCmd(cmd, v) { this.worker?.postMessage({ cmd, v }); }
+
+  /** A guest: where the owner's mouse is on the remote desktop, shown with the remote pointer's picture. */
+  #ownerPointer(x, y) {
+    this.pointerAt = [x, y];
+    const m = this.mark ??= this.container.appendChild(Object.assign(document.createElement('div'), { className: 'owner-pointer' }));
+    const c = this.canvas.getBoundingClientRect(), b = this.container.getBoundingClientRect(), k = c.width / this.canvas.width || 1;
+    const p = this.ptr, hidden = p?.css === 'none';
+    m.classList.toggle('hidden', hidden);
+    m.classList.toggle('picture', !!p?.url);
+    m.style.backgroundImage = p?.url ? `url(${p.url})` : '';
+    m.style.transform = `translate(${Math.round(c.left - b.left + x * k - (p?.url ? p.hx : 0))}px, ${Math.round(c.top - b.top + y * k - (p?.url ? p.hy : 0))}px)`;
   }
 
   /** Opens the on-screen keyboard of phones and tablets (needs a tap or click just before). */
@@ -606,7 +713,15 @@ export class RdpSession {
       r.closing = 0;
     }
     else if (r.seen && !r.closing) r.closing = setTimeout(() => this.#railGone(), r.goneMs);
-    if (!r.soon) r.soon = requestAnimationFrame(() => { r.soon = 0; this.#railPaint(); this.onRail?.(this.railWindows()); });
+    if (!r.soon) { r.soon = 1; this.#onFrame(() => this.#railSoon()); }
+  }
+
+  /** The program's windows painted again and listed, once on the next frame after they changed. */
+  #railSoon() {
+    if (!this.rail?.soon) return;
+    this.rail.soon = 0;
+    this.#railPaint();
+    this.onRail?.(this.railWindows());
   }
 
   /**
@@ -767,7 +882,7 @@ export class RdpSession {
   }
 
   #post(bytes) {
-    if (!this.token) return;
+    if (!this.token || (this.guest && !GUEST_MSG.has(bytes[0]))) return;   // a guest: only its keyboard, mouse and touch
     this.outbox.push(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
     this.#pump();
   }
@@ -803,6 +918,84 @@ export class RdpSession {
   }
 
   /**
+   * A picture of the camera (JPEG; empty: it could not be opened) of the start numbered `no` (F_CAM): the newest waits, in
+   * place of an older one not sent yet.
+   */
+  sendCam(jpeg, no) {
+    if (!this.token || this.guest) return;
+    const m = new Uint8Array(jpeg.length + 2);
+    m[0] = MSG.CAM;
+    m[1] = no;
+    m.set(jpeg, 2);
+    this.lane.cam = m;
+    this.#lanePump();
+  }
+
+  /** A folder of this computer shared in the session (its name; read only where the browser cannot write it). */
+  shareFolder(name, readonly) {
+    this.#post([MSG.FOLDER, 1, readonly ? 1 : 0, ...new TextEncoder().encode(String(name).slice(0, 64))]);   // (64 kept there)
+  }
+
+  unshareFolder() { this.#post([MSG.FOLDER, 0]); }
+
+  /** The folder's answer to the request numbered `no` (F_DRIVE), from its DeviceId on. */
+  sendFolderReply(no, bytes) {
+    if (!this.token || this.guest) return;
+    const m = new Uint8Array(bytes.length + 5), v = new DataView(m.buffer);
+    m[0] = MSG.FOLDER_IO;
+    v.setUint32(1, no, true);
+    m.set(bytes, 5);
+    this.lane.folder.push(m);
+    this.#lanePump();
+  }
+
+  /** The first answer of a folder's listing with its other names, which the gateway then answers itself (Rdpdr::localList). */
+  sendFolderList(no, answer, rest) {
+    if (!this.token || this.guest) return;
+    const m = new Uint8Array(1 + 8 + answer.length + rest.length), v = new DataView(m.buffer);
+    m[0] = MSG.FOLDER_LIST;
+    v.setUint32(1, no, true);
+    v.setUint32(5, answer.length, true);
+    m.set(answer, 9);
+    m.set(rest, 9 + answer.length);
+    this.lane.folder.push(m);
+    this.#lanePump();
+  }
+
+  /**
+   * The out-of-order lane: the gateway takes each one as it arrives, so no key or click waits behind a picture of the camera
+   * (some 40 KB) or a piece of a file read (up to 1 MB). Two requests out at most; the folder's answers first (Windows waits
+   * for them), then the newest picture. A folder's answer lost on the way (the network, the gateway busy) is sent again, up
+   * to 3 times: else the program there waited for it for ever (the gateway takes only the first of two).
+   */
+  #lanePump() {
+    const gen = this.gen;
+    while (this.token && this.lane.busy < 2 && (this.lane.folder.length || this.lane.cam)) {
+      const payload = this.lane.folder.length ? this.lane.folder.shift() : this.lane.cam;
+      if (payload === this.lane.cam) this.lane.cam = null;
+      const body = new Uint8Array(payload.length + 4);
+      new DataView(body.buffer).setUint32(0, LANE, true);
+      body.set(payload, 4);
+      this.lane.busy++;
+      let again = 0;
+      fetch(`rdp.php?a=send&sid=${this.sid}`, { method: 'POST', body, cache: 'no-store', headers: { 'X-MuDesk-Token': this.token } })
+        .then((r) => { if (r?.status >= 500) throw new Error('busy'); })
+        .catch(() => {
+          if (payload[0] !== MSG.CAM && (payload.tries = (payload.tries ?? 0) + 1) <= 3) again = 500 * payload.tries;
+        }).finally(() => {
+          if (gen !== this.gen) return;
+          this.lane.busy--;
+          if (!again) { this.#lanePump(); return; }
+          setTimeout(() => {
+            if (gen !== this.gen) return;
+            this.lane.folder.unshift(payload);
+            this.#lanePump();
+          }, again);
+        });
+    }
+  }
+
+  /**
    * Sends queued messages, up to 4 requests in flight; the server reorders them by sequence number. Mouse moves and frame
    * acknowledgements take 3 of them at most, so a key or a click never waits behind them, and an acknowledgement owed
    * goes out between two batches of moves: sent only when nothing else waited, a mouse kept moving delayed them up to
@@ -810,7 +1003,8 @@ export class RdpSession {
    */
   #pump() {
     const gen = this.gen;
-    while (this.token && this.inflight < 4 && (this.outbox.length || this.events.length || ((this.move || this.ack) && this.inflight < 3))) {
+    const most = this.guest ? 1 : 4;                    // a guest's requests are taken as they come: one at a time keeps their order
+    while (this.token && this.inflight < most && (this.outbox.length || this.events.length || ((this.move || this.ack) && this.inflight < Math.max(1, most - 1)))) {
       if (!this.outbox.length) {
         if (this.events.length || (this.move && !(this.ack && this.ackOwed))) { this.#packEvents(); this.ackOwed = !!this.ack; }
         else { this.outbox.push(this.ack); this.ack = null; this.ackOwed = false; }
@@ -824,7 +1018,7 @@ export class RdpSession {
       const keepalive = this.keepalive + body.length <= 65536;   // browsers refuse more than 64 KiB of these in flight
       if (keepalive) this.keepalive += body.length;
       // the token in a header: in the URL it ended up in the web server's and proxies' access logs
-      fetch(`rdp.php?a=send&sid=${this.sid}`, { method: 'POST', body, cache: 'no-store', keepalive, headers: { 'X-MuDesk-Token': this.token } })
+      fetch(`rdp.php?a=send&sid=${this.sid}`, { method: 'POST', body, cache: 'no-store', keepalive, headers: { [this.guest ? 'X-MuDesk-Share' : 'X-MuDesk-Token']: this.token } })
         .then(() => { const c = this.counts, d = performance.now() - t0; c.rtt = c.rtt ? c.rtt * 0.8 + d * 0.2 : d; })
         .catch(() => {}).finally(() => {
           if (keepalive) this.keepalive -= body.length;
@@ -952,6 +1146,7 @@ export class RdpSession {
 
     c.addEventListener('contextmenu', (e) => e.preventDefault());
     c.addEventListener('pointermove', (e) => {
+      if (e.pointerType === 'touch' && this.touchOn) { this.#touch(e, 1); return; }
       if (e.pointerType === 'touch') {
         touch.pts.set(e.pointerId, e);
         if (touch.pts.size === 2) this.#twoFingers(touch, e);
@@ -981,6 +1176,7 @@ export class RdpSession {
     });
     c.addEventListener('pointerdown', (e) => {
       view.keyboard.focus({ preventScroll: true });
+      if (e.pointerType === 'touch' && this.touchOn) { this.#touch(e, 0); return; }
       if (e.pointerType === 'touch') {
         touch.pts.set(e.pointerId, e);
         if (touch.pts.size === 2) {
@@ -1007,6 +1203,7 @@ export class RdpSession {
       e.preventDefault();
     });
     const up = (e) => {
+      if (e.pointerType === 'touch' && this.touchOn) { this.#touch(e, 2); return; }
       if (e.pointerType === 'touch') {
         touch.pts.delete(e.pointerId);
         if (e.pointerId !== touch.id) return;
@@ -1029,6 +1226,7 @@ export class RdpSession {
     };
     c.addEventListener('pointerup', up);
     c.addEventListener('pointercancel', (e) => {
+      if (e.pointerType === 'touch' && this.touchOn) { this.#touch(e, 3); return; }
       if (e.pointerType !== 'touch') { up(e); return; }
       // the browser took the touch (a system gesture starting on the screen): never a click; a drag under way ends there
       touch.pts.delete(e.pointerId);
@@ -1045,9 +1243,62 @@ export class RdpSession {
 
   }
 
+  /**
+   * Multitouch: a finger down (0), moved (1), lifted (2) or taken by the system (3). Each finger is a contact (ids 0-9,
+   * the lowest free); what changed in this task goes in one frame with every finger on the screen, as MS-RDPEI wants.
+   * A lifted finger keeps its last position; one put down and lifted before its frame went is sent down, then up.
+   */
+  #touch(e, state) {
+    this.inputSeen = true;                              // in use: the web session is kept alive
+    let c = this.contacts.get(e.pointerId);
+    const p = this.#pos(e);
+    if (state === 0) {
+      if (c || !p || this.contacts.size >= 10) return;
+      let id = 0;
+      while ([...this.contacts.values()].some((x) => x.id === id)) id++;
+      c = { id, x: p[0], y: p[1], state: 0 };
+      this.contacts.set(e.pointerId, c);
+      e.target?.setPointerCapture?.(e.pointerId);
+    } else if (!c) return;
+    else if (state === 1) {
+      if (p) [c.x, c.y] = p;
+    } else if (c.state === 0) c.after = state;          // not sent yet: down first
+    else c.state = state;
+    if (!this.touchQueued) {
+      this.touchQueued = true;
+      queueMicrotask(() => { this.touchQueued = false; this.#touchFrame(); });
+    }
+  }
+
+  #touchFrame() {
+    const list = [...this.contacts.entries()];
+    if (!list.length) return;
+    const m = new Uint8Array(2 + list.length * 6), dv = new DataView(m.buffer);
+    m[0] = MSG.TOUCH;
+    m[1] = list.length;
+    list.forEach(([, c], i) => {
+      const o = 2 + i * 6;
+      m[o] = c.id;
+      m[o + 1] = c.state;
+      dv.setInt16(o + 2, c.x, true);
+      dv.setInt16(o + 4, c.y, true);
+    });
+    if (this.move || this.events.length) this.#packEvents();   // the keys and clicks before it go first
+    this.#post(m);
+    let again = false;
+    for (const [k, c] of list) {
+      if (c.state >= 2) this.contacts.delete(k);
+      else if (c.after !== undefined) { c.state = c.after; delete c.after; again = true; }
+      else c.state = 1;
+    }
+    if (again) this.#touchFrame();
+  }
+
   #bindKeyboard(k) {
-    k.addEventListener('keydown', (e) => this.#keydown(e));
+    const mute = () => !this.token && (this.replay || this.guest);   // nothing to send: the keys stay the page's
+    k.addEventListener('keydown', (e) => { if (!mute()) this.#keydown(e); });
     k.addEventListener('keyup', (e) => {
+      if (mute()) return;
       if (e.code === 'Pause' || !SCANCODES[e.code]) { if (!e.isComposing) e.preventDefault(); return; }
       e.preventDefault();
       if (this.pasting) this.deferred.push([e.code, true]);   // keep Ctrl held until the paste reaches the server
@@ -1090,7 +1341,8 @@ export class RdpSession {
   }
 
   #bindWindow() {
-    document.addEventListener('visibilitychange', () => this.#visibility());
+    const signal = (this.leaveWindow = new AbortController()).signal;
+    document.addEventListener('visibilitychange', () => this.#visibility(), { signal });
     // the phone keyboard hidden without leaving the field (Android's Back): once the view, shrunk by the keyboard, is as
     // tall as before again, the desktop follows the window's size again (it stayed as it was until the field lost focus)
     globalThis.visualViewport?.addEventListener('resize', () => {
@@ -1098,11 +1350,12 @@ export class RdpSession {
       const h = globalThis.visualViewport.height;
       if (h < this.kbBase - 50) this.kbShrunk = true;
       else if (this.kbShrunk && h >= this.kbBase - 2) { this.softKeyboard = false; this.#sizeSoon(); }
-    });
-    new ResizeObserver(() => {
+    }, { signal });
+    this.resizeObs = new ResizeObserver(() => {
       this.fit();
       this.#sizeSoon();
-    }).observe(this.container);
+    });
+    this.resizeObs.observe(this.container);
   }
 
   /** The remote size follows the windows once they stop changing. */
@@ -1255,7 +1508,11 @@ export class RdpSession {
   focus() { this.keyboard.focus({ preventScroll: true }); }
 
   #checkSize() {
-    if (!this.sid) return;
+    if (this.guest) return;                             // (a guest sees the desktop as the owner has it)
+    // connecting, several screens: a window took another size meanwhile (Firefox gives the other screen's window the size of
+    // its screen just after it opens, and the request had gone with its first one, 400 x 300): checked once connected
+    // (before, that monitor kept the first size until the server opened Display Control, a minute later in Windows 11)
+    if (!this.sid) { if (this.multi && this.worker) this.pendingLayout = true; return; }
     if (this.multi) { this.#checkMonitors(); return; }
     if (this.conn.resize !== 'dynamic' || this.softKeyboard) return;
     const { w, h } = this.viewSize();

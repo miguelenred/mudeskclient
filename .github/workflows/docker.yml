@@ -1,0 +1,34 @@
+# MuDeskClient - https://miguelenred.es/mudeskclient - Apache License 2.0
+# The Docker image of each released version, published in GitHub's container registry as
+# ghcr.io/miguelenred/mudeskclient:<version> and :latest (the image is tested by the "docker" job of tests.yml on every push).
+name: docker
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Image built and pushed with its version and as latest
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          image=ghcr.io/miguelenred/mudeskclient
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          # :latest only for a release (not for one such as 1.2.0-rc1)
+          tags="-t $image:$v"
+          case "$v" in *-*) ;; *) tags="$tags -t $image:latest" ;; esac
+          docker build $tags \
+            --label org.opencontainers.image.source=https://github.com/miguelenred/mudeskclient \
+            --label org.opencontainers.image.version="$v" \
+            --label org.opencontainers.image.licenses=Apache-2.0 .
+          docker push "$image:$v"
+          case "$v" in *-*) ;; *) docker push "$image:latest" ;; esac

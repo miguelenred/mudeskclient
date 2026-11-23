@@ -6,6 +6,17 @@
 const COMPRESSED = 0x20, AT_FRONT = 0x40, FLUSHED = 0x80;
 const MAX_UPDATE = 1 << 24;                         // the MaxRequestSize the gateway announces (multifragment capability)
 
+/** The 32 bits of src from bit on, most significant first, zero padded past the end. */
+function top(src, bit) {
+  const o = bit >> 3, r = bit & 7;
+  if (o + 4 < src.length) {
+    const w = (src[o] << 24 | src[o + 1] << 16 | src[o + 2] << 8 | src[o + 3]) >>> 0;
+    return r ? ((w << r) | (src[o + 4] >> (8 - r))) >>> 0 : w;
+  }
+  const w = ((src[o] ?? 0) << 24 | (src[o + 1] ?? 0) << 16 | (src[o + 2] ?? 0) << 8 | (src[o + 3] ?? 0)) >>> 0;
+  return r ? ((w << r) | ((src[o + 4] ?? 0) >> (8 - r))) >>> 0 : w;
+}
+
 export class Mppc {
   constructor() {
     this.hist = new Uint8Array(65536);
@@ -14,6 +25,12 @@ export class Mppc {
 
   /** Decompresses one block (flags: the compression byte sent with it). */
   decompress(src, flags) {
+    const r = this.inPlace(src, flags);
+    return r === src ? src : r.slice();
+  }
+
+  /** decompress(), but a view of the history (valid until the next block) instead of a copy. */
+  inPlace(src, flags) {
     if (flags & (AT_FRONT | FLUSHED)) {
       this.pos = 0;
       if (flags & FLUSHED) this.hist.fill(0);
@@ -21,13 +38,8 @@ export class Mppc {
     if (!(flags & COMPRESSED)) return src;
     const h = this.hist, start = this.pos, n = src.length, total = n * 8;
     let pos = start, bit = 0;
-    const top = () => {                            // next 32 bits from the bit position, zero padded past the end
-      const o = bit >> 3, r = bit & 7;
-      const w = ((src[o] ?? 0) << 24 | (src[o + 1] ?? 0) << 16 | (src[o + 2] ?? 0) << 8 | (src[o + 3] ?? 0)) >>> 0;
-      return r ? ((w << r) | ((src[o + 4] ?? 0) >> (8 - r))) >>> 0 : w;
-    };
     while (total - bit >= 8) {
-      let t = top();
+      let t = top(src, bit);                       // (local state and a top-level reader: no closure in the hot loop)
       if (!(t & 0x80000000)) { h[pos++] = t >>> 24; bit += 8; continue; }
       if ((t & 0xc0000000) >>> 0 === 0x80000000) { h[pos++] = ((t >>> 23) & 0x7f) | 0x80; bit += 9; continue; }
       let off;
@@ -36,7 +48,7 @@ export class Mppc {
       else if ((t & 0xf0000000) >>> 0 === 0xe0000000) { off = ((t >>> 17) & 0x7ff) + 320; bit += 15; }
       else if ((t & 0xe0000000) >>> 0 === 0xc0000000) { off = ((t >>> 13) & 0xffff) + 2368; bit += 19; }
       else throw new Error('MPPC: bad copy offset');
-      t = top();
+      t = top(src, bit);
       const k = Math.clz32(~t);                    // length: k ones, a zero, k + 1 value bits
       let len;
       if (k === 0) { len = 3; bit += 1; }
@@ -53,7 +65,7 @@ export class Mppc {
     }
     if (pos > 65536) throw new Error('MPPC: history overflow');   // literals past the end were lost (checked once, not per byte)
     this.pos = pos;
-    return h.slice(start, pos);
+    return h.subarray(start, pos);
   }
 }
 
@@ -141,42 +153,59 @@ export class Ncrush {
     if (!(flags & COMPRESSED)) return src;
     const n = src.length, cache = this.cache, start = this.pos;
     if (n < 4) throw new Error('NCRUSH: short block');
-    let bits = (src[0] | src[1] << 8 | src[2] << 16 | src[3] << 24) >>> 0, nbits = 32, sp = 4, pos = start;
-    const take = (k) => {                          // drops k bits, then refills to at least 16
-      bits >>>= k;
-      nbits -= k;
+    let bits = (src[0] | src[1] << 8 | src[2] << 16 | src[3] << 24) >>> 0, nbits = 32, sp = 4, pos = start, k = 0;
+    // each "take" below drops k bits, then refills to at least 16 (written out: a closure kept the reader out of registers)
+    for (;;) {
+      let e = LEC[bits & 0x1fff];
+      if (!e) throw new Error('NCRUSH: bad code');
+      k = e >> 12;
+      bits >>>= k; nbits -= k;                      // take
       if (nbits < 16) {
         if (sp + 1 < n) { bits = (bits | ((src[sp] | src[sp + 1] << 8) << nbits)) >>> 0; nbits += 16; sp += 2; }
         else if (sp < n) { bits = (bits | (src[sp++] << nbits)) >>> 0; nbits += 8; }
         else if (nbits < 0) throw new Error('NCRUSH: truncated block');
       }
-    };
-    for (;;) {
-      let e = LEC[bits & 0x1fff];
-      if (!e) throw new Error('NCRUSH: bad code');
-      take(e >> 12);
       const sym = e & 0xfff;
       if (sym < 256) { h[pos++] = sym; continue; }
       if (sym === 256) break;                       // end of stream
       let off;
       if (sym < 289) {                              // copy offset class: base + extra bits
-        const k = sym - 257, b = COPY_BITS[k];
-        off = COPY_BASE[k] - 1 + (b ? bits & ((1 << b) - 1) : 0);
-        if (b) take(b);
-        cache.unshift(off);
-        cache.pop();
+        const c = sym - 257, b = COPY_BITS[c];
+        off = COPY_BASE[c] - 1 + (b ? bits & ((1 << b) - 1) : 0);
+        if (b) {
+          bits >>>= b; nbits -= b;                  // take
+          if (nbits < 16) {
+            if (sp + 1 < n) { bits = (bits | ((src[sp] | src[sp + 1] << 8) << nbits)) >>> 0; nbits += 16; sp += 2; }
+            else if (sp < n) { bits = (bits | (src[sp++] << nbits)) >>> 0; nbits += 8; }
+            else if (nbits < 0) throw new Error('NCRUSH: truncated block');
+          }
+        }
+        cache[3] = cache[2]; cache[2] = cache[1]; cache[1] = cache[0]; cache[0] = off;
       } else if (sym < 293) {                       // offset cache entry, moved to the front
-        const k = sym - 289;
-        off = cache[k];
-        cache[k] = cache[0];
+        const c = sym - 289;
+        off = cache[c];
+        cache[c] = cache[0];
         cache[0] = off;
       } else throw new Error('NCRUSH: bad symbol');
       e = LOM[bits & 0x1ff];
       if (!e || (e & 0xfff) >= 30) throw new Error('NCRUSH: bad length');
-      take(e >> 12);
+      k = e >> 12;
+      bits >>>= k; nbits -= k;                      // take
+      if (nbits < 16) {
+        if (sp + 1 < n) { bits = (bits | ((src[sp] | src[sp + 1] << 8) << nbits)) >>> 0; nbits += 16; sp += 2; }
+        else if (sp < n) { bits = (bits | (src[sp++] << nbits)) >>> 0; nbits += 8; }
+        else if (nbits < 0) throw new Error('NCRUSH: truncated block');
+      }
       const b = LOM_BITS[e & 0xfff];
       const len = LOM_BASE[e & 0xfff] + (b ? bits & ((1 << b) - 1) : 0);
-      if (b) take(b);
+      if (b) {
+        bits >>>= b; nbits -= b;                    // take
+        if (nbits < 16) {
+          if (sp + 1 < n) { bits = (bits | ((src[sp] | src[sp + 1] << 8) << nbits)) >>> 0; nbits += 16; sp += 2; }
+          else if (sp < n) { bits = (bits | (src[sp++] << nbits)) >>> 0; nbits += 8; }
+          else if (nbits < 0) throw new Error('NCRUSH: truncated block');
+        }
+      }
       if (len < 2 || pos + len >= 65535) throw new Error('NCRUSH: history overflow');
       let from = (pos - off) & 0xffff;
       if (off >= len && from + len <= pos) { h.copyWithin(pos, from, from + len); pos += len; }
@@ -200,7 +229,7 @@ export class Xcrush {
     const l1 = src[0], l2 = src[1], h = this.hist;
     if (flags & FLUSHED) { h.fill(0); this.pos = 0; }
     let d = src.subarray(2);
-    if (l2 & COMPRESSED) d = this.l2.decompress(d, l2);
+    if (l2 & COMPRESSED) d = this.l2.inPlace(d, l2);    // (copied into this history below, before the next block)
     if (l1 & 0x04) this.pos = 0;                   // level 1 at front: writing starts again at offset 0
     const n = d.length, start = this.pos;
     let pos = start, lit = 0;

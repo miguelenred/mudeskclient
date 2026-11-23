@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import { Worker } from 'node:worker_threads';
 import { ClearCodec, GfxPipeline, Zgfx, fixColour, nscDecode } from '../public/assets/rdpgfx.js';
-import { ProgressiveDecoder, RfxDecoder } from '../public/assets/rfx.js';
+import { ProgressiveDecoder, RfxDecoder, idwtExtrapolate, rlgrDecode } from '../public/assets/rfx.js';
 
 let failed = 0;
 const check = (name, ok, info = '') => { console.log((ok ? 'OK   ' : 'FAIL ') + name + (info ? ' ' + info : '')); if (!ok) failed++; };
@@ -194,6 +194,13 @@ check('ClearCodec: subcodec beyond the right edge', attempt(() => new ClearCodec
 const sub9 = Buffer.alloc(54, 0xff);
 sub9.fill(0, 0, 27); sub9.writeUInt32LE(40, 10); sub9.writeUInt16LE(9, 18); sub9.writeUInt16LE(1, 20); sub9.writeUInt32LE(27, 22);
 check('ClearCodec: subcodec not within the rectangle left out', new ClearCodec().decode(new Uint8Array(sub9), 8, 8).px.every((v) => v === 0));
+// an NSCodec subcodec is opaque whatever its alpha plane says (NSCodec alone keeps it), in its place in the rectangle
+{
+  const nsc = [2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 100, 200, 0, 0, 0, 0, 0, 7];   // 2 x 1, raw planes Y Co Cg A
+  const msg = Uint8Array.from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 13 + nsc.length, 0, 0, 0, 1, 0, 1, 0, 2, 0, 1, 0, nsc.length, 0, 0, 0, 1, ...nsc]);
+  const got = [...new ClearCodec().decode(msg, 4, 2).px].map((v) => v.toString(16)), alone = [...nscDecode(Uint8Array.from(nsc), 2, 1)].map((v) => v.toString(16));
+  check('ClearCodec: NSCodec subcodec opaque', got.join() === '0,0,0,0,0,ff646464,ffc8c8c8,0' && alone.join() === '646464,7c8c8c8', `${got} | ${alone}`);
+}
 // a RemoteFX quantizer index past the list sent: an error of the decoder (TypeError before)
 const tq = Buffer.from(ts);
 tq.writeUInt16LE(0, 36); tq[33] = 1;                                                 // the tile at column 0, with quantizer 1 of 1
@@ -253,6 +260,109 @@ let got = boxes([[0, 0, 64, 64], [1856, 1016, 64, 64]], [simple(0, 0), simple(29
 check('progressive: rectangles far apart, a box each', got === '[[0,0,64,64,true],[1856,1016,64,64,true]]', got);
 got = boxes([[0, 0, 128, 64], [0, 64, 128, 64]], [simple(0, 0), simple(1, 0), simple(0, 1), simple(1, 1)]);
 check('progressive: rectangles filling their bounding box, one box', got === '[[0,0,128,128,true]]', got);
+// progressive dequantization, first and differential (RFX_TILE_DIFFERENCE) passes, plain and reduce-extrapolate layouts, a
+// different quantizer for each band: only the values the RLGR decoder wrote (and LL3, made whole) are visited; the
+// coefficients kept must be those of every band shifted in full, as before
+{
+  const PLAIN = [[4032, 64], [3840, 64], [3904, 64], [3968, 64], [3072, 256], [3328, 256], [3584, 256], [0, 1024], [1024, 1024], [2048, 1024]];
+  const EXTRA = [[4015, 81], [3807, 72], [3879, 72], [3951, 64], [3007, 272], [3279, 272], [3551, 256], [0, 1023], [1023, 1023], [2046, 961]];
+  const quant = [0x32, 0x54, 0x76, 0x98, 0x2a], shifts = [1, 2, 3, 4, 5, 6, 7, 8, 9, 1];   // nibbles - 1: LL3 HL3 LH3 HH3 HL2 ...
+  /** RLGR1 encoding of 4096 coefficients (MS-RDPRFX 3.1.8.1.7.3, as the decoder adapts k and kr). */
+  const rlgr1 = (coef) => {
+    const bits = [], put = (v, n) => { for (let i = n - 1; i >= 0; i--) bits.push((v >> i) & 1); };
+    let k = 1, kp = 8, kr = 1, krp = 8;
+    const gr = (v) => {
+      const vk = v >> kr;
+      for (let i = 0; i < vk; i++) bits.push(1);
+      bits.push(0);
+      put(v & ((1 << kr) - 1), kr);
+      if (vk === 0) krp = Math.max(0, krp - 2); else if (vk !== 1) krp = Math.min(80, krp + vk);
+      kr = krp >> 3;
+    };
+    for (let i = 0; i < 4096;) {
+      if (k) {                                    // run of zeros, then a value
+        let run = 0;
+        while (i + run < 4096 && !coef[i + run]) run++;
+        if (i + run === 4096) break;              // trailing zeros: none sent
+        i += run;
+        while (run >= 1 << k) { bits.push(0); run -= 1 << k; kp = Math.min(80, kp + 4); k = kp >> 3; }
+        bits.push(1); put(run, k); bits.push(coef[i] < 0 ? 1 : 0);
+        gr(Math.abs(coef[i++]) - 1);
+        kp = Math.max(0, kp - 6); k = kp >> 3;
+      } else {
+        const v = coef[i++], m = v < 0 ? -2 * v - 1 : 2 * v;
+        gr(m);
+        kp = m ? Math.max(0, kp - 3) : Math.min(80, kp + 3); k = kp >> 3;
+      }
+    }
+    while (bits.length & 7) bits.push(0);
+    return Array.from({ length: bits.length >> 3 }, (_, i) => bits.slice(i * 8, i * 8 + 8).reduce((a, b) => a * 2 + b, 0));
+  };
+  let seed = 11;
+  const rnd = (n) => { seed = (seed * 1103515245 + 12345) >>> 0; return (seed >>> 8) % n; };
+  const coefs = (ll) => Int16Array.from({ length: 4096 }, (_, j) => (j >= ll || !rnd(40) ? rnd(81) - 40 : 0));
+  const results = [];
+  for (const extrapolate of [1, 0]) {
+    const bands = extrapolate ? EXTRA : PLAIN, pd = new ProgressiveDecoder(), want = [0, 1, 2].map(() => new Int16Array(4096));
+    for (const diff of [0, 1, 1]) {
+      const values = [0, 1, 2].map(() => coefs(bands[0][0])), data = values.map(rlgr1);
+      const rest = [diff, 0xff, ...data.flatMap((d) => [d.length & 255, d.length >> 8]), 0, 0, ...data.flat()];
+      pd.decode(1, region([[0, 0, 64, 64]], quant, [], extrapolate, [tile(0xccc6, 0, 0, 0, rest)]), 64, 64);
+      values.forEach((b, c) => {
+        if (!rlgrDecode(Uint8Array.from(data[c]), 1, new Int16Array(4096)).every((v, j) => v === b[j])) results.push(false);   // (the encoder above)
+        for (let j = bands[0][0] + 1; j < 4096; j++) b[j] += b[j - 1];
+        bands.forEach(([off, len], i) => { for (let j = off; j < off + len; j++) want[c][j] = (diff ? want[c][j] : 0) + (b[j] << shifts[i]); });
+      });
+      const got = pd.surfaces.get(1).get(0).current;
+      results.push(want.every((w, c) => w.every((v, j) => v === got[c][j])));
+    }
+  }
+  check('progressive: dequantization of first and differential passes, both layouts', results.every(Boolean), results.join());
+}
+
+// reduce-extrapolate inverse DWT: a level whose three high bands are all 0 is interpolated from its LL band (most tiles of
+// an animation at level 1); the result must be the whole transform's (written out here as the decoder did it before), with
+// LL only, LL at the int16 limits, a single coefficient at each end of each level's high bands, and a few at random
+{
+  const clamp = (v) => (v < -32768 ? -32768 : v > 32767 ? 32767 : v), half = (v) => (v + (v >>> 31)) >> 1;
+  const line = (L, lo, ls, H, ho, hs, O, oo, os, nL, nH) => {
+    const l0 = lo;
+    let H0 = H[ho], X0 = clamp(L[lo] - H0), X2 = X0;
+    for (let j = 1; j < nH; j++, oo += 2 * os) {
+      lo += ls; ho += hs;
+      const H1 = H[ho];
+      X2 = clamp(L[lo] - half(H0 + H1));
+      O[oo] = X0; O[oo + os] = clamp(half(X0 + X2) + 2 * H0);
+      X0 = X2; H0 = H1;
+    }
+    O[oo] = X2;
+    if (nL <= nH) { O[oo + os] = clamp(X2 + 2 * H0); return; }
+    X0 = clamp(L[l0 + nH * ls] - (nL === nH + 1 ? H0 : half(H0)));
+    O[oo + os] = clamp(half(X0 + X2) + 2 * H0); O[oo + 2 * os] = X0;
+    if (nL > nH + 1) O[oo + 3 * os] = clamp(half(X0 + L[l0 + (nH + 1) * ls]));
+  };
+  const whole = (b) => {
+    const t = new Int16Array(4096);
+    for (const [off, level] of [[3807, 3], [3007, 2], [0, 1]]) {
+      const nL = (64 >> level) + 1, nH = level === 1 ? 31 : (64 + (1 << (level - 1))) >> level, W = nL + nH;
+      const LH = off + nH * nL, HH = LH + nL * nH, LL = HH + nH * nH;
+      for (let r = 0; r < nL; r++) line(b, LL + r * nL, 1, b, off + r * nH, 1, t, r * W, 1, nL, nH);
+      for (let r = 0; r < nH; r++) line(b, LH + r * nL, 1, b, HH + r * nH, 1, t, (nL + r) * W, 1, nL, nH);
+      for (let c = 0; c < W; c++) line(t, c, W, t, nL * W + c, W, b, off + c, W, nL, nH);
+    }
+    return b;
+  };
+  let seed = 7;
+  const rnd = (n) => { seed = (seed * 1103515245 + 12345) >>> 0; return (seed >>> 8) % n; };
+  const cases = [];
+  const ll = () => { const b = new Int16Array(4096); for (let j = 4015; j < 4096; j++) b[j] = rnd(4000) - 2000; return b; };
+  cases.push(ll(), Int16Array.from({ length: 4096 }, (_, j) => (j < 4015 ? 0 : j & 1 ? 32767 : -32768)));
+  for (const j of [0, 1, 3005, 3006, 3007, 3008, 3805, 3806, 3807, 3808, 4013, 4014]) { const b = ll(); b[j] = rnd(2) ? 1 : -300; cases.push(b); }
+  for (let k = 0; k < 20; k++) { const b = ll(), [from, to] = [[0, 3007], [3007, 3807], [3807, 4015]][k % 3]; for (let i = rnd(4); i >= 0; i--) b[from + rnd(to - from)] = rnd(600) - 300; cases.push(b); }
+  const bad = cases.filter((b) => { const got = b.slice(), want = whole(b.slice()); idwtExtrapolate(got); return got.some((v, j) => v !== want[j]); });
+  check('progressive: levels with no high bands interpolated, as the whole transform', bad.length === 0, `${bad.length} of ${cases.length} differ`);
+}
+
 // quantizer index or quality past the lists sent: an error of the decoder (TypeError before)
 const progErr = (t) => attempt(() => new ProgressiveDecoder().decode(1, region([[0, 0, 64, 64]], q6, [], 1, [t]), 64, 64));
 got = [progErr(tile(0xccc5, 1, 0, 0, Array(9).fill(0))), progErr(tile(0xccc6, 0, 0, 0, [0, 5, ...Array(8).fill(0)]))].join(' | ');
@@ -272,6 +382,16 @@ badClear.writeUInt32LE(13, 10); badClear.writeUInt16LE(8, 18); badClear.writeUIn
 let ops = [];
 attempt(() => new GfxPipeline((o) => ops.push(o.op)).onData(msg(create(1), w2s(1, 8, badClear), end(5))));
 check('a faulty PDU does not drop the rest of the message', ops.join() === 'create,log,end', ops.join());
+
+// uncompressed pixels (B, G, R, A, read a word at a time): alpha kept on an ARGB surface, 255 on the others; data cut in
+// the middle of a pixel gives what the bytes there say (the missing ones 0)
+{
+  const px = [];
+  const raw3 = (id) => { const b = Buffer.alloc(17); b.writeUInt16LE(id, 0); b[4] = 0x20; b.writeUInt16LE(3, 9); b.writeUInt16LE(1, 11); b.writeUInt32LE(10, 13); return pdu(1, Buffer.concat([b, Buffer.from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])])); };
+  new GfxPipeline((o) => { if (o.op === 'px') px.push([...o.px].map((v) => v.toString(16)).join(' ')); })
+    .onData(msg(pdu(9, [1, 0, 3, 0, 1, 0, 0x20]), pdu(9, [2, 0, 3, 0, 1, 0, 0x21]), raw3(1), raw3(2)));
+  check('uncompressed pixels, with and without alpha, data cut short', px.join(' | ') === 'ff010203 ff050607 ff090a00 | 4010203 8050607 90a00', px.join(' | '));
+}
 
 // sizes from the data: surfaces and output up to 32766 a side (RDP), each rectangle within its surface (one of 65535 x 65535
 // asked for 16 GB; with right < left it threw RangeError)

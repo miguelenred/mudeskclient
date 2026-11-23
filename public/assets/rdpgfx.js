@@ -17,6 +17,11 @@ const ZGFX_TOKENS = [
   [7, 125, 0, 0, 0x80], [8, 188, 20, 1, 1365664], [8, 189, 21, 1, 2414240], [8, 252, 0, 0, 0x0c], [8, 253, 0, 0, 0x38],
   [8, 254, 0, 0, 0x39], [8, 255, 0, 0, 0x66], [9, 380, 22, 1, 4511392], [9, 381, 23, 1, 8705696], [9, 382, 24, 1, 17094304],
 ];
+// the token of each 9-bit string the prefix can start (index + 1; 0: no token): one look-up instead of a bit-by-bit search
+const ZGFX_LOOKUP = new Uint8Array(512);
+ZGFX_TOKENS.forEach(([len, code], i) => { for (let v = 0; v < 1 << (9 - len); v++) ZGFX_LOOKUP[(code << (9 - len)) | v] ||= i + 1; });
+const ZGFX_LEN = Uint8Array.from(ZGFX_TOKENS, (t) => t[0]), ZGFX_BITS = Uint8Array.from(ZGFX_TOKENS, (t) => t[2]);
+const ZGFX_MATCH = Uint8Array.from(ZGFX_TOKENS, (t) => t[3]), ZGFX_BASE = Int32Array.from(ZGFX_TOKENS, (t) => t[4]);
 const HISTORY = 2500000;
 const ZGFX_MAX = 1 << 26;                          // largest decompressed message accepted (64 MB: a 4K picture uncompressed is 33 MB)
 const CACHE_MAX = 100 * 1048576;                   // the bitmap cache a server may fill (MS-RDPEGFX: 100 MB, 16 MB thin client)
@@ -50,38 +55,51 @@ export class Zgfx {
     if (!data.length) return at;
     const end = Math.min(buf.length, at + 65535), h = this.hist;
     let o = at, hpos = this.hpos, remaining = (data.length - 1) * 8 - data[data.length - 1];
-    let p = 0, cur = 0, curBits = 0;
-    const bits = (n) => {
-      while (curBits < n) { cur = ((cur << 8) | data[p++]) >>> 0; curBits += 8; }
-      curBits -= n;
-      remaining -= n;
-      const v = (cur >>> curBits) & ((1 << n) - 1);
-      cur &= (1 << curBits) - 1;
-      return v;
-    };
+    // bit reader in local variables (it is the hot loop): cur holds the curBits bits read ahead from data[p - 1] back,
+    // zeros past the end of the data; each read below is: refill, then take n bits, most significant first
+    let p = 0, cur = 0, curBits = 0, n = 0, v = 0;
     while (remaining > 0) {
-      let have = 0, prefix = 0, tok = null;
-      for (const t of ZGFX_TOKENS) {
-        while (have < t[0]) { prefix = (prefix << 1) | bits(1); have++; }
-        if (prefix === t[1]) { tok = t; break; }
+      while (curBits < 9) { cur = ((cur << 8) | data[p++]) >>> 0; curBits += 8; }
+      const t = ZGFX_LOOKUP[(cur >>> (curBits - 9)) & 511] - 1;   // the token its prefix (1 to 9 bits) starts
+      if (t < 0) throw new Error('ZGFX: bad token');
+      curBits -= ZGFX_LEN[t];
+      remaining -= ZGFX_LEN[t];
+      cur &= (1 << curBits) - 1;
+      n = ZGFX_BITS[t];
+      v = 0;
+      if (n) {
+        while (curBits < n) { cur = ((cur << 8) | data[p++]) >>> 0; curBits += 8; }
+        curBits -= n; remaining -= n; v = (cur >>> curBits) & ((1 << n) - 1); cur &= (1 << curBits) - 1;
       }
-      if (!tok) throw new Error('ZGFX: bad token');
-      if (tok[3] === 0) {
+      if (!ZGFX_MATCH[t]) {
         if (o === end) throw new Error('ZGFX: segment too long');
-        buf[o++] = h[hpos] = tok[4] + bits(tok[2]);
+        buf[o++] = h[hpos] = ZGFX_BASE[t] + v;
         if (++hpos === HISTORY) hpos = 0;
         continue;
       }
-      const dist = tok[4] + bits(tok[2]);
+      const dist = ZGFX_BASE[t] + v;
       if (dist) {
-        let count;
-        if (bits(1) === 0) count = 3;
-        else {
+        let count = 3;
+        if (!curBits) { cur = data[p++] | 0; curBits = 8; }
+        curBits--; remaining--;
+        if ((cur >>> curBits) & 1) {                   // count: 0 is 3; else ones, a zero, then that many bits plus 2
+          cur &= (1 << curBits) - 1;
           count = 4;
           let extra = 2;
-          while (bits(1) === 1) { count *= 2; extra++; }
-          count += bits(extra);
-        }
+          for (;;) {
+            if (!curBits) { cur = data[p++] | 0; curBits = 8; }
+            curBits--; remaining--;
+            const bit = (cur >>> curBits) & 1;
+            cur &= (1 << curBits) - 1;
+            if (!bit) break;
+            count *= 2;
+            extra++;
+          }
+          n = extra;
+          while (curBits < n) { cur = ((cur << 8) | data[p++]) >>> 0; curBits += 8; }
+          curBits -= n; remaining -= n; v = (cur >>> curBits) & ((1 << n) - 1); cur &= (1 << curBits) - 1;
+          count += v;
+        } else cur &= (1 << curBits) - 1;
         if (o + count > end) throw new Error('ZGFX: segment too long');
         let src = (hpos - dist + HISTORY) % HISTORY;
         for (let i = 0; i < count; i++) {                // byte by byte: the source may overlap what is written
@@ -90,7 +108,9 @@ export class Zgfx {
           if (++hpos === HISTORY) hpos = 0;
         }
       } else {                                       // literal run, byte aligned
-        const count = bits(15);
+        while (curBits < 15) { cur = ((cur << 8) | data[p++]) >>> 0; curBits += 8; }
+        curBits -= 15; remaining -= 15;
+        const count = (cur >>> curBits) & 0x7fff;        // (cur holds under a byte now: the run starts at data[p])
         remaining -= curBits + count * 8;
         cur = curBits = 0;
         if (o + count > end || p + count > data.length) throw new Error('ZGFX: bad literal run');
@@ -154,8 +174,8 @@ function nscRle(src, size) {
   return out;
 }
 
-/** NSCodec bitmap -> RGBA words (top-down). */
-export function nscDecode(src, width, height) {
+/** NSCodec bitmap -> RGBA words (top-down); opaque: alpha 255 (its plane is still decoded, and checked). */
+export function nscDecode(src, width, height, opaque = false) {
   const dv = new DataView(src.buffer, src.byteOffset, src.byteLength);
   const counts = [0, 1, 2, 3].map((i) => dv.getUint32(i * 4, true));
   const cll = src[16], cs = src[17];
@@ -171,15 +191,19 @@ export function nscDecode(src, width, height) {
     return plane;
   });
   const shift = cll - 1;
-  const out = new Uint32Array(width * height);
-  for (let y = 0; y < height; y++) {
+  const out = new Uint32Array(width * height), [Y, Co, Cg, A] = planes;
+  // (a plane shorter than its size reads undefined: NaN channels, which the | below makes 0, as Math.min/max did)
+  for (let y = 0, o = 0; y < height; y++) {
     const yRow = y * rw, cRow = cs ? (y >> 1) * (rw >> 1) : y * width;
-    for (let x = 0; x < width; x++) {
-      const yv = planes[0][yRow + x];
+    for (let x = 0; x < width; x++, o++) {
+      const yv = Y[yRow + x];
       const ci = cRow + (cs ? x >> 1 : x);
-      const co = ((planes[1][ci] << shift) << 24) >> 24, cg = ((planes[2][ci] << shift) << 24) >> 24;
-      const r = Math.max(0, Math.min(255, yv + co - cg)), g = Math.max(0, Math.min(255, yv + cg)), b = Math.max(0, Math.min(255, yv - co - cg));
-      out[y * width + x] = ((planes[3][y * width + x] << 24) | (b << 16) | (g << 8) | r) >>> 0;
+      const co = ((Co[ci] << shift) << 24) >> 24, cg = ((Cg[ci] << shift) << 24) >> 24;
+      let r = yv + co - cg, g = yv + cg, b = yv - co - cg;
+      r = r < 0 ? 0 : r > 255 ? 255 : r;
+      g = g < 0 ? 0 : g > 255 ? 255 : g;
+      b = b < 0 ? 0 : b > 255 ? 255 : b;
+      out[o] = (opaque ? 0xff000000 : A[o] << 24) | (b << 16) | (g << 8) | r;
     }
   }
   return out;
@@ -219,21 +243,24 @@ export class ClearCodec {
     return { px: out, glyph };
   }
 
+  #at = 0;                                               // where the last #run ended
+
   #run(s, p) {                                           // run length: u8, 0xff -> u16, 0xffff -> u32
     let n = s[p++];
     if (n === 0xff) {
       n = s[p] | (s[p + 1] << 8); p += 2;
       if (n === 0xffff) { n = (s[p] | (s[p + 1] << 8) | (s[p + 2] << 16) | (s[p + 3] << 24)) >>> 0; p += 4; }
     }
-    return [n, p];
+    this.#at = p;
+    return n;
   }
 
   #residual(s, out, total) {
     let p = 0, o = 0;
     while (p < s.length && o < total) {
       const c = bgr(s, p);
-      let n;
-      [n, p] = this.#run(s, p + 3);
+      const n = this.#run(s, p + 3);
+      p = this.#at;
       out.fill(c, o, Math.min(total, o + n));
       o += n;
     }
@@ -284,12 +311,15 @@ export class ClearCodec {
       const data = s.subarray(p + 13, p + 13 + len);
       p += 13 + len;
       if (x0 + w > width || y0 + h > height) continue;   // not within the rectangle (its size, from the data, asked for gigabytes)
+      if (id === 0) {                                    // uncompressed: straight into place
+        for (let y = 0, i = 0; y < h; y++) for (let x = 0, o = (y0 + y) * width + x0; x < w; x++, i += 3) out[o++] = bgr(data, i);
+        continue;
+      }
       let px;
-      if (id === 0) { px = new Uint32Array(w * h); for (let i = 0; i < w * h; i++) px[i] = bgr(data, i * 3); }
-      else if (id === 1) px = nscDecode(data, w, h).map((v) => (v | 0xff000000) >>> 0);
+      if (id === 1) px = nscDecode(data, w, h, true);
       else if (id === 2) px = this.#rlex(data, w * h);
       else throw new Error('ClearCodec: bad subcodec');
-      for (let y = 0; y < h; y++) out.set(px.subarray(y * w, y * w + w), (y0 + y) * width + x0);
+      for (let y = 0, i = 0; y < h; y++) for (let x = 0, o = (y0 + y) * width + x0; x < w; x++) out[o++] = px[i++];
     }
   }
 
@@ -303,8 +333,8 @@ export class ClearCodec {
     while (p < s.length && o < total) {
       const t = s[p++];
       const stop = t & ((1 << bitsN) - 1), depth = t >> bitsN;
-      let run;
-      [run, p] = this.#run(s, p);
+      const run = this.#run(s, p);
+      p = this.#at;
       const start = stop - depth;
       out.fill(pal[start], o, Math.min(total, o + run));
       o += run;
@@ -588,13 +618,16 @@ export class GfxPipeline {
     if (w < 0 || h < 0 || r.r > sw || r.b > sh) throw new Error('GFX: rectangle outside the surface');   // as FreeRDP checks
     let px;
     switch (codec) {
-      case 0x0000:                                     // uncompressed 32 bpp (B, G, R, A)
+      case 0x0000: {                                   // uncompressed 32 bpp (B, G, R, A): a word at a time, red and blue swapped
         px = new Uint32Array(w * h);
-        for (let i = 0, o = 0; i < px.length; i++, o += 4) px[i] = ((argb ? data[o + 3] << 24 : 0xff000000) | data[o + 2] | (data[o + 1] << 8) | (data[o] << 16)) >>> 0;
+        const whole = Math.min(px.length, data.length >> 2), dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+        if (argb) for (let i = 0; i < whole; i++) { const v = dv.getUint32(4 * i, true); px[i] = (v & 0xff00ff00) | ((v >> 16) & 0xff) | ((v & 0xff) << 16); }
+        else for (let i = 0; i < whole; i++) { const v = dv.getUint32(4 * i, true); px[i] = 0xff000000 | (v & 0xff00) | ((v >> 16) & 0xff) | ((v & 0xff) << 16); }
+        for (let i = whole, o = 4 * whole; i < px.length; i++, o += 4) px[i] = ((argb ? data[o + 3] << 24 : 0xff000000) | data[o + 2] | (data[o + 1] << 8) | (data[o] << 16)) >>> 0;
         break;
+      }
       case 0x000a:                                     // planar, rows top-down
-        px = planarDecode(data, w, h);
-        if (!argb) for (let i = 0; i < px.length; i++) px[i] = (px[i] | 0xff000000) >>> 0;
+        px = planarDecode(data, w, h, !argb);
         break;
       case 0x0008: {
         const c = this.clear.decode(data, w, h);

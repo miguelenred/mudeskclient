@@ -48,6 +48,71 @@ const bmp = (w, h, bpp) => { try { bitmapUpdate(update(w, h, bpp), new Uint32Arr
 msg = [bmp(64, 64, 16), bmp(65, 64, 16), bmp(4, 4, 5376)].join(' | ');
 check('bitmap: larger than the desktop or of no RDP depth refused', msg === 'drawn | bad size or depth (65 x 64 at 16 bpp) | bad size or depth (4 x 4 at 5376 bpp)', msg);
 
+// bitmaps decoded exactly as before the decoders were rewritten for speed (no closures, reused scratch buffers, one pass for
+// raw data and planar): random interleaved RLE at 8, 15, 16 and 24 bpp (every order, data cut anywhere), planar (raw and
+// RLE planes, with and without alpha) and raw rectangles at every depth, one after another (a bitmap after a larger one must
+// not show its leftovers); the digest of every pixel and error is the one the decoders gave before
+{
+  const { createHash } = await import('node:crypto');
+  const { planarDecode } = await import('../public/assets/gfx.js');
+  let seed = 5;
+  const rnd = (n) => { seed = (seed * 1103515245 + 12345) >>> 0; return (seed >>> 8) % n; };
+  const bytes = (n) => Array.from({ length: n }, () => rnd(256));
+  const rle = (Bpp) => {
+    const out = [];
+    for (let i = 4 + rnd(40); i > 0; i--) {
+      const kind = rnd(8);
+      if (kind === 0) out.push(rnd(5) << 5);                                       // regular order, length in the next byte
+      else if (kind === 1) out.push((rnd(2) ? 0xc0 : 0xe0) | rnd(16));             // lite: set foreground, dithered
+      else if (kind === 2) out.push(0xd0 | rnd(16));                               // lite FGBG with its foreground
+      else if (kind === 3) out.push([0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf6, 0xf7, 0xf8][rnd(8)], rnd(80), 0);   // mega mega
+      else if (kind === 4) out.push([0xf9, 0xfa, 0xfd, 0xfe][rnd(4)]);
+      else out.push(rnd(5) << 5 | (1 + rnd(31)));
+      out.push(...bytes(rnd(4) * Bpp + rnd(3)));
+    }
+    return out.slice(0, out.length - rnd(4));
+  };
+  const planar = (w, h) => {
+    const coded = rnd(4) > 0, noAlpha = rnd(2), out = [(coded ? 0x10 : 0) | (noAlpha ? 0x20 : 0)];
+    for (let plane = noAlpha ? 3 : 4; plane > 0; plane--) {
+      if (!coded) { out.push(...bytes(w * h - rnd(2) * rnd(w * h))); continue; }
+      for (let y = 0; y < h; y++) for (let x = 0; x < w;) { const raw = rnd(16), run = rnd(16); out.push(raw << 4 | run, ...bytes(raw)); x += run === 1 ? raw + 16 : run === 2 ? raw + 32 : raw + run || w; }
+    }
+    return out;
+  };
+  const hash = createHash('md5'), palette = Uint32Array.from({ length: 256 }, (_, i) => 0xff000000 + i * 0x10305);
+  for (let k = 0; k < 600; k++) {
+    const bpp = [8, 15, 16, 24, 32][k % 5], Bpp = (bpp + 7) >> 3, w = 1 + rnd(k % 7 ? 24 : 64), h = 1 + rnd(k % 7 ? 24 : 64), compressed = k % 3 > 0;
+    const data = compressed ? (bpp === 32 ? planar(w, h) : rle(Bpp)) : bytes(((w * Bpp + 3) & ~3) * h - rnd(2) * rnd(64));
+    const u = new Uint8Array(4 + 18 + data.length), dv = new DataView(u.buffer);
+    [1, 1, 0, 0, w - 1, h - 1, w, h, bpp, compressed ? 0x401 : 0, data.length].forEach((v, i) => dv.setUint16(i < 2 ? i * 2 : 4 + (i - 2) * 2, v, true));
+    u.set(data, 22);
+    try { bitmapUpdate(u, palette, (x, y, bw, bh, rgba) => hash.update(rgba), 1 << 20); } catch (e) { hash.update(e.message); }
+  }
+  const digest = hash.digest('hex');
+  check('bitmaps: RLE, planar and raw at every depth decoded as before', digest === 'b1fda02e73d67b4c18b34ae3d0a8fac7', digest);
+  // planar as the graphics pipeline asks for it: rows top-down, alpha kept, or opaque; reversed rows for bitmap updates
+  let same = true;
+  for (let k = 0; k < 50; k++) {
+    const w = 1 + rnd(40), h = 1 + rnd(40), src = Uint8Array.from(planar(w, h));
+    try {
+      const plain = planarDecode(src, w, h), opaque = planarDecode(src, w, h, true), up = planarDecode(src, w, h, true, true);
+      same &&= plain.every((v, i) => opaque[i] === (v | 0xff000000) >>> 0 && up[(h - 1 - Math.floor(i / w)) * w + i % w] === opaque[i]);
+    } catch (e) { same &&= e.message === 'Planar: truncated plane'; }
+  }
+  check('planar: opaque and bottom-up are the plain rows with alpha 255, reversed', same);
+}
+
+// an order whose length byte is past the end of the data draws nothing more: the rest of the bitmap is black, also right
+// after a white one (the pixel values are decoded into a buffer reused from one bitmap to the next)
+{
+  const rect = (data) => [0, 0, 7, 7, 8, 8, 16, 0x401, data.length].flatMap((v) => [v & 255, v >> 8]).concat(data);
+  const u = Uint8Array.from([1, 0, 4, 0, ...rect([0xf3, 64, 0, 0xff, 0xff]), ...rect([0x60]), ...rect([0xf3, 64, 0, 0xff, 0xff]), ...rect([0x00])]);
+  const got = [];
+  bitmapUpdate(u, new Uint32Array(256), (x, y, w, h, rgba) => got.push(rgba.every((v) => v === 0xffffffff) ? 'white' : rgba.every((v) => v === 0xff000000) ? 'black' : 'mixed'), 64);
+  check('RLE: length past the end of the data, the rest black after a white bitmap', got.join() === 'white,black,white,black', got.join());
+}
+
 // a palette update shorter than its header, or than the entries it announces: no error (it threw out of the stream
 // worker, and the session ended)
 {

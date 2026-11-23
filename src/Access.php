@@ -107,7 +107,7 @@ final class Access
      * metadata at 169.254.169.254 too), unspecified addresses and the other cloud metadata addresses (100.100.100.200,
      * fd00:ec2::254), also as IPv4 inside IPv6 (::ffff:a.b.c.d, ::a.b.c.d, NAT64 64:ff9b::/96).
      */
-    private static function unsafe(string $ip): bool
+    public static function unsafe(string $ip): bool
     {
         $b = (string)@inet_pton($ip);
         if (strlen($b) === 16 && (str_starts_with($b, "\0\0\0\0\0\0\0\0\0\0\xff\xff") || str_starts_with($b, "\0\x64\xff\x9b\0\0\0\0\0\0\0\0")
@@ -121,6 +121,13 @@ final class Access
             return $b[0] === "\0" || $b[0] === "\x7f" || str_starts_with($b, "\xa9\xfe") || $b === "\x64\x64\x64\xc8";
         }
         return ltrim($b, "\0") === '' || ltrim($b, "\0") === "\1" || ($b[0] === "\xfe" && (ord($b[1]) & 0xc0) === 0x80);   // ::, ::1, fe80::/10
+    }
+
+    /** The addresses of $host (itself when it is one), IPv4 and IPv6, with no allow-list applied (a computer the administrator set). */
+    public static function addresses(string $host): array
+    {
+        $host = strtolower(trim($host, " []"));
+        return @inet_pton($host) !== false ? [$host] : self::resolve($host);
     }
 
     private static function resolve(string $host): array

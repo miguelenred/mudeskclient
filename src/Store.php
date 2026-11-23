@@ -48,7 +48,11 @@ final class Store
             if ($raw === false || $raw === '') {
                 throw new \JsonException($raw === false ? 'unreadable' : 'empty file');
             }
-            return (array)json_decode($raw, true, 64, JSON_THROW_ON_ERROR);
+            $data = json_decode($raw, true, 64, JSON_THROW_ON_ERROR);
+            if (!is_array($data)) {               // "null" was taken for no data: no users, and the setup screen again
+                throw new \JsonException('no object or list');
+            }
+            return $data;
         } catch (\JsonException $e) {
             $name = ltrim(substr($file, strlen(Config::dir('')), -5), '/');
             if (in_array($name, self::REBUILT, true)) {
@@ -69,7 +73,7 @@ final class Store
     {
         do {
             $id = bin2hex(random_bytes(8));
-        } while (ctype_digit($id));
+        } while (preg_match('/^[0-9]+$/D', $id));
         return $id;
     }
 
@@ -100,12 +104,17 @@ final class Store
             // the stores written on every failed sign-in or refused request are kept compact (smaller, quicker under their
             // lock); the others indented, to be read by a person
             $pretty = in_array($name, self::COMPACT, true) ? 0 : JSON_PRETTY_PRINT;
-            if (file_put_contents($tmp, json_encode($data, $pretty | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)) === false
-                || !rename($tmp, $file)) {
+            try {
+                $json = json_encode($data, $pretty | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+            } catch (\JsonException $e) {               // (written, "false" was an empty file that replaced the store)
+                throw new RuntimeException('Cannot encode store ' . $name . ': ' . $e->getMessage(), 0, $e);
+            }
+            $ok = file_put_contents($tmp, $json) === strlen($json);   // (a full disk: a part written is no store)
+            @chmod($tmp, 0600);                       // before it takes the file's place: never readable by others, even for a moment
+            if (!$ok || !rename($tmp, $file)) {
                 @unlink($tmp);
                 throw new RuntimeException('Cannot write store');
             }
-            @chmod($file, 0600);
             return $result;
         } finally {
             flock($l, LOCK_UN);

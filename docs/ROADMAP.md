@@ -4,7 +4,7 @@
 
 ## 1. Validation with Windows
 
-Done with Windows 11 Pro (see [TESTING.md › Windows 11 Pro](TESTING.md#windows-11-pro-23h2-nla)): NLA, Display Control, compression, drawing orders, graphics pipeline with H.264, two monitors, clipboard, drive, audio and microphone, with five bugs fixed. Left: Windows Server with RDS licensing, MuDeskPDF and older versions.
+Done with Windows 11 Pro (see [TESTING.md › Windows 11 Pro](TESTING.md#windows-11-pro-23h2-nla)): NLA, Display Control, compression, drawing orders, graphics pipeline with H.264, two monitors, clipboard, drive, audio, microphone, camera and a folder of this computer, with five bugs fixed. Left: Windows Server with RDS licensing, MuDeskPDF and older versions: since 1.1 Windows XP and Server 2003 (Standard RDP Security) and Windows 7 and Server 2008 R2 (TLS 1.0, CredSSP 3) are supported, tested against servers that speak their protocols, not yet against those Windows.
 
 ## 2. Screen speed
 
@@ -18,8 +18,9 @@ What is already done:
 - LAN connection type: Windows sends 20 % more frames.
 - RemoteFX progressive decoding 5.6 times faster (79 → 14 ms per full-screen frame) and opaque graphics pipeline blocks painted without blending (2.6 times faster).
 - Measurements per codec and quality, PHP and browser apart: [PERFORMANCE](PERFORMANCE.md).
+- The speed review of 1.1: the gateway's decompression 1.2 to 2.5 times faster and its RC4 1.35 to 1.86 times, the browser's decoders 9 to 54 % less time, the bitmaps of an update delivered to the page together and an operation of several areas drawn once; on a computer held to a sixth of the CPU an animation goes from 9.7 to 12.3 frames per second ([PERFORMANCE](PERFORMANCE.md#fourth-review-11-decoders-delivery-to-the-page-and-slow-computers)). Left there: a burst of hundreds of full-screen scrolls from an old server queues on the page (holding the server back cost 12–25 % of throughput).
 
-- Automatic graphics mode (the default): the Windows version in the NTLM challenge decides; Windows 8.1 or later → graphics pipeline with H.264 when the browser supports it; xrdp, TLS only and older Windows → bitmaps. A RemoteApp connection always uses bitmaps and drawing orders (no graphics pipeline).
+- Automatic graphics mode (the default): the Windows version in the NTLM challenge decides (signed in with Kerberos, which gives none: a domain's Windows, the pipeline); Windows 8.1 or later → graphics pipeline with H.264 when the browser supports it; xrdp, TLS only and older Windows → bitmaps. A RemoteApp connection always uses bitmaps and drawing orders (no graphics pipeline).
 
 Next: AVC444 with full-resolution colour.
 
@@ -61,10 +62,14 @@ Left:
 
 ## 5. Next and other ideas
 
-- **Done: the microphone** in RDP sessions (audio input, the AUDIO_INPUT dynamic channel): one more box in the connection options, off by default; the remote Windows must allow audio recording redirection ([HOSTING](HOSTING.md#remote-computers)). Left: a compressed format (IMA ADPCM would send a quarter of the 176 KB/s of PCM), and the camera.
-- **Later: session recording**, played back in the browser with the same decoders (what the gateway sends: drawing, video and sound), opened from the audit. To be decided first: disk space, notice to the user, retention, encryption and who may watch it.
+- **Done: the microphone** in RDP sessions (audio input, the AUDIO_INPUT dynamic channel): one more box in the connection options, off by default; the remote Windows must allow audio recording redirection ([HOSTING](HOSTING.md#remote-computers)). Left: a compressed format (IMA ADPCM would send a quarter of the 176 KB/s of PCM).
+- **Done: the camera** (1.1), with the microphone in one box (MS-RDPECAM, Motion JPEG from the page's own camera, in Chrome, Edge and Firefox), and **a folder of this computer** as a drive of the session (read and write in Chrome and Edge, read only elsewhere; see [USAGE](USAGE.md#a-folder-of-this-computer)). Decided: the camera goes with the microphone (one decision about this computer's devices, off by default); the folder needs the connection's shared folder, so an administrator who turns that off turns both off. Left out: H.264 pictures of the camera (less bandwidth; Motion JPEG works in every browser) and the folder's changes told to Windows as they happen (the browser cannot watch a folder).
+- **Done: session recording** (1.1), played back in the browser with the same decoders, opened from the audit. Decided: off unless the administrator records a connection; the user is told before anything is shown and while the session lasts; only the picture (not the keyboard, clipboard or sound); encrypted with a key of the server; kept 30 days (a setting) and at most 2 GB each (`record_max_mb`); watched only by administrators and auditors, each viewing audited. Left: sound, and skipping still stretches.
+- **Done: sharing a session** (1.1) with a link, view only or with control (see [USAGE](USAGE.md#sharing-a-session)).
+- **Done: Remote Desktop Gateway and connection broker** (1.1): a connection through an RD Gateway (MS-TSGU over a WebSocket, over two HTTPS connections, or RPC over HTTP for Windows Server 2008 and 2008 R2; in plain PHP) and with a farm's load balance info, the broker's redirections followed (its password for the next computer given with RDSTLS); tested through an open-source gateway in front of Windows 11 (RPC over HTTP against a gateway written from the specifications), not yet against Windows Server's own gateway or a real broker.
+- **Done: older Windows** (1.1): Standard RDP Security for Windows XP and Server 2003 (only with the security *Automatic*), TLS 1.0 and CredSSP 3 for Windows 7 and Server 2008 R2, Kerberos with RC4 for Windows Server 2003 domains; their limits in [SECURITY](../SECURITY.md).
 
-Other ideas: smart cards, RD Gateway, connection broker redirection, Kerberos, persistent bitmap cache, copy of the audit to an external syslog server (stronger proof than the HMAC chain, whose key lives on the same server).
+Other ideas: persistent bitmap cache, copy of the audit to an external syslog server (stronger proof than the HMAC chain, whose key lives on the same server). Smart cards are not possible: a browser cannot let the gateway use the card's private key.
 
 ## Decisions taken (and why)
 
@@ -73,7 +78,8 @@ Other ideas: smart cards, RD Gateway, connection broker redirection, Kerberos, p
 | One long HTTP request per session | Shared hosting: no daemons, no WebSocket |
 | Bitmaps forwarded, decoded in JavaScript | Low CPU and memory on the hosting |
 | OpenSSL extension required | RDP requires TLS; TLS in plain PHP would be slow and unsafe. OpenSSL is bundled with PHP |
-| NTLM only | Kerberos needs a KDC and is not possible from a hosting |
+| Kerberos when a domain controller can be reached, else NTLM | From a hosting the domain controllers are usually out of reach: NTLM then, as Windows does without a KDC (not where the domain blocks it). Kerberos with AES and, for Windows Server 2003 domains and passwords older than their domain's AES keys, RC4 (offered last), only if the administrator allows it (off by default: someone in the middle could make it be used, and the password then breaks far faster); passwords only (no smart cards) |
+| Standard RDP Security only with the security *Automatic* | Windows XP and Server 2003 have nothing else, but it proves nothing of the server and its RC4 is weak: it is never used by a connection set to *NLA only* or *TLS only*, the server's key is pinned as a certificate (a TLS computer that falls back to it is a changed certificate), and a server that encrypts nothing is refused |
 | Remote passwords encrypted with the user's password | Not even the administrator can read them |
 | Trust on first use for server certificates | RDP servers use self-signed certificates |
 | Allow-lists for client IPs and targets | Requested: "IPs and domains, or everything allowed" |

@@ -58,12 +58,14 @@ final class Users
         return !str_contains("\n" . $list, "\n" . $lc . "\n");
     }
 
-    public static function create(string $name, string $password, string $role, bool $mustChange): ?array
+    public static function create(string $name, #[\SensitiveParameter] string $password, string $role, bool $mustChange, array $extra = []): ?array
     {
         $id = Store::newId();
-        $u  = [
-            'id' => $id, 'username' => $name, 'role' => $role === 'admin' ? 'admin' : 'user',
-            'pass' => self::hash($password), 'enabled' => true, 'must_change' => $mustChange,
+        // an external user (Windows, OpenID Connect): its data key wrapped with the Windows password, but no local password
+        // signs it in; all of it in one write (made in two, a request dying between them left a local account)
+        $u  = $extra + [
+            'id' => $id, 'username' => $name, 'role' => in_array($role, ['admin', 'auditor'], true) ? $role : 'user',
+            'pass' => self::hash(isset($extra['source']) ? bin2hex(random_bytes(24)) : $password), 'enabled' => true, 'must_change' => $mustChange,
             'lang' => '', 'max_sessions' => 0, 'created' => date('c'), 'last_login' => null,
             'dek' => Crypto::wrapKey($password, random_bytes(32), $id), 'totp' => null, 'sv' => 1, 'devices' => [],
         ];
@@ -108,6 +110,16 @@ final class Users
         });
     }
 
+    /**
+     * A user made by a sign-in from outside: 'ad' (a Windows account, checked each time against the domain: its data key
+     * is wrapped with that password) or 'oidc' (an OpenID Connect account: no password of its own, so no saved RDP
+     * passwords). Neither has a local password that signs in. Null when the name is taken meanwhile.
+     */
+    public static function createExternal(string $name, string $source, #[\SensitiveParameter] ?string $password = null, array $more = []): ?array
+    {
+        return self::validName($name) ? self::create($name, $password ?? bin2hex(random_bytes(24)), 'user', false, ['source' => $source] + $more) : null;
+    }
+
     /** Applies $fn to the stored record and returns the result. */
     public static function update(string $id, callable $fn): ?array
     {
@@ -134,6 +146,7 @@ final class Users
         });
         if ($done) {
             Store::delete('connections/' . $id);
+            Store::delete('hosts/' . $id);          // (the certificates of the computers reached with occasional connections)
             Files::removeAll($id);
         }
         return $done;
@@ -168,10 +181,67 @@ final class Users
     }
 
     /** Public view without secrets. */
+    /**
+     * The sign-in hours of a user as the administrator sent them: null (any time), the hours (days 1 = Monday to 7, from
+     * and to as HH:MM), or false when they are not valid (no day, a day out of range, a time that is not HH:MM).
+     */
+    public static function hours(mixed $in): array|null|false
+    {
+        if ($in === null || $in === false || $in === '') {
+            return null;
+        }
+        if (!is_array($in) || !is_array($in['days'] ?? null) || !is_string($in['from'] ?? null) || !is_string($in['to'] ?? null)) {
+            return false;
+        }
+        $days = [];
+        foreach ($in['days'] as $d) {
+            if (!is_int($d) && !(is_string($d) && preg_match('/^[0-9]+$/D', $d))) {
+                return false;
+            }
+            if ((int)$d < 1 || (int)$d > 7) {
+                return false;
+            }
+            $days[(int)$d] = (int)$d;
+        }
+        ksort($days);
+        $time = '/^([01]\d|2[0-3]):[0-5]\d$/D';
+        if ($days === [] || !preg_match($time, $in['from']) || !preg_match($time, $in['to'])) {
+            return false;
+        }
+        return ['days' => array_values($days), 'from' => $in['from'], 'to' => $in['to']];
+    }
+
+    /**
+     * Whether $u may sign in and open sessions at $now (a Unix time), in the time zone of the settings. Administrators
+     * always may (their own hours could shut everybody out). From later than to crosses midnight: 22:00–06:00 on Friday
+     * goes on until Saturday 06:00; the same from and to is the whole of each day.
+     */
+    public static function withinHours(array $u, ?int $now = null): bool
+    {
+        $h = $u['hours'] ?? null;
+        if (!is_array($h) || ($u['role'] ?? '') === 'admin') {
+            return true;
+        }
+        $t    = (new \DateTimeImmutable('@' . ($now ?? time())))->setTimezone(new \DateTimeZone(Settings::timeZone()));
+        $min  = (int)$t->format('G') * 60 + (int)$t->format('i');
+        $day  = (int)$t->format('N');
+        $from = (int)substr($h['from'], 0, 2) * 60 + (int)substr($h['from'], 3, 2);
+        $to   = (int)substr($h['to'], 0, 2) * 60 + (int)substr($h['to'], 3, 2);
+        $on   = static fn(int $d): bool => in_array($d, $h['days'], true);
+        if ($from === $to) {
+            return $on($day);
+        }
+        if ($from < $to) {
+            return $on($day) && $min >= $from && $min < $to;
+        }
+        return $min >= $from ? $on($day) : ($min < $to && $on($day === 1 ? 7 : $day - 1));
+    }
+
     public static function view(array $u): array
     {
         return [
-            'id' => $u['id'], 'username' => $u['username'], 'role' => $u['role'], 'enabled' => $u['enabled'],
+            'id' => $u['id'], 'username' => $u['username'], 'role' => $u['role'], 'enabled' => $u['enabled'], 'hours' => $u['hours'] ?? null,
+            'source' => $u['source'] ?? null,   // 'ad', 'oidc' or null (a local user)
             'must_change' => $u['must_change'], 'lang' => $u['lang'], 'max_sessions' => $u['max_sessions'],
             'created' => $u['created'], 'last_login' => $u['last_login'], 'totp' => !empty($u['totp']['enabled']),
             'passkeys' => array_map(static fn($p) => ['id' => $p['id'], 'name' => $p['name'], 'created' => $p['created'],

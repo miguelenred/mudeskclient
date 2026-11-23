@@ -5,31 +5,35 @@
 const WHITE = { 1: 0xff, 2: 0xffff, 3: 0xffffff };
 const DEPTHS = new Set([8, 15, 16, 24, 32]);             // colour depths of RDP bitmaps
 
-/** Interleaved RLE (MS-RDPBCGR 2.2.9.1.1.3.1.2.4). Returns pixel values, bottom-up, width*height. */
-export function rleDecode(src, width, height, bpp) {
-  const out = new Uint32Array(width * height);
+/** A pixel value of bpp bytes at src[s] (bytes past the end read as 0). */
+function pixel(src, s, bpp) {
+  let v = src[s];
+  if (bpp > 1) v |= src[s + 1] << 8;
+  if (bpp > 2) v |= src[s + 2] << 16;
+  return v;
+}
+
+/** bits pixels of a foreground/background mask from out[d] (on the first line, the row above is black). Returns the new d. */
+function fgbg(out, d, n, width, mask, bits, fg, firstLine) {
+  for (let i = 0; i < bits && d < n; i++, d++) {
+    if (firstLine) out[d] = (mask >> i) & 1 ? fg : 0;
+    else { const a = out[d - width]; out[d] = (mask >> i) & 1 ? a ^ fg : a; }
+  }
+  return d;
+}
+
+/**
+ * Interleaved RLE (MS-RDPBCGR 2.2.9.1.1.3.1.2.4). Returns pixel values, bottom-up, width*height: out when given (a buffer
+ * reused by the caller, at least that long), else a new array. Local variables only, no closures: it is a hot loop.
+ */
+export function rleDecode(src, width, height, bpp, out = null) {
+  const n = width * height;
+  out ??= new Uint32Array(n);
   const end = src.length;
   const white = WHITE[bpp];
   let s = 0, d = 0, fg = white, insertFg = false, firstLine = true;
 
-  const px = () => {
-    let v = src[s];
-    if (bpp > 1) v |= src[s + 1] << 8;
-    if (bpp > 2) v |= src[s + 2] << 16;
-    s += bpp;
-    return v;
-  };
-  const put = (v) => { if (d < out.length) out[d++] = v; };
-  const above = () => out[d - width];
-  const fgbg = (mask, bits) => {
-    for (let i = 0; i < bits; i++) {
-      const set = mask & (1 << i);
-      if (firstLine) put(set ? fg : 0);
-      else put(set ? above() ^ fg : above());
-    }
-  };
-
-  while (s < end && d < out.length) {
+  while (s < end && d < n) {
     if (firstLine && d >= width) { firstLine = false; insertFg = false; }
     const h = src[s];
     let code;
@@ -54,56 +58,62 @@ export function rleDecode(src, width, height, bpp) {
     } else {
       s += 1;                                           // single-byte special orders
     }
+    if (run !== run) break;                             // its length past the end of the data: nothing more is drawn
 
     if (code === 0x00 || code === 0xf0) {               // background run
-      if (insertFg && run > 0) { put(firstLine ? fg : above() ^ fg); run--; }
-      const end = Math.min(d + run, out.length);
-      if (firstLine) out.fill(0, d, end);
-      else if (end - d <= width) out.copyWithin(d, d - width, end - width);      // no overlap with what is being written
-      else for (let i = d; i < end; i++) out[i] = out[i - width];
-      d = end;
+      if (insertFg && run > 0) { if (d < n) { out[d] = firstLine ? fg : out[d - width] ^ fg; d++; } run--; }
+      const e = Math.min(d + run, n);
+      if (firstLine) out.fill(0, d, e);
+      else if (e - d <= width) out.copyWithin(d, d - width, e - width);      // no overlap with what is being written
+      else for (let i = d; i < e; i++) out[i] = out[i - width];
+      d = e;
       insertFg = true;
       continue;
     }
     insertFg = false;
 
     switch (code) {
-      case 0x01: case 0xf1: case 0x0c: case 0xf6:      // foreground runs
-        if (code === 0x0c || code === 0xf6) fg = px();
-        while (run-- > 0) put(firstLine ? fg : above() ^ fg);
+      case 0x01: case 0xf1: case 0x0c: case 0xf6: {    // foreground runs
+        if (code === 0x0c || code === 0xf6) { fg = pixel(src, s, bpp); s += bpp; }
+        const e = Math.min(d + run, n);
+        if (firstLine) for (; d < e; d++) out[d] = fg;
+        else for (; d < e; d++) out[d] = out[d - width] ^ fg;
         break;
+      }
       case 0x0e: case 0xf8: {                           // dithered run
-        const a = px(), b = px();
-        while (run-- > 0) { put(a); put(b); }
+        const a = pixel(src, s, bpp), b = pixel(src, s + bpp, bpp);
+        s += 2 * bpp;
+        for (let i = 0; i < run && d < n; i++) { out[d++] = a; if (d < n) out[d++] = b; }
         break;
       }
       case 0x03: case 0xf3: {                           // color run
-        const c = px();
-        const end = Math.min(d + run, out.length);
-        out.fill(c, d, end);
-        d = end;
+        const c = pixel(src, s, bpp);
+        s += bpp;
+        const e = Math.min(d + run, n);
+        out.fill(c, d, e);
+        d = e;
         break;
       }
       case 0x02: case 0xf2: case 0x0d: case 0xf7:      // FGBG images
-        if (code === 0x0d || code === 0xf7) fg = px();
-        while (run > 8) { fgbg(src[s++], 8); run -= 8; }
-        if (run > 0) fgbg(src[s++], run);
+        if (code === 0x0d || code === 0xf7) { fg = pixel(src, s, bpp); s += bpp; }
+        for (; run > 0; run -= 8) d = fgbg(out, d, n, width, src[s++], run > 8 ? 8 : run, fg, firstLine);
         break;
       case 0x04: case 0xf4: {                           // color image (hot path)
-        const end = Math.min(d + run, out.length), skip = (run - (end - d)) * bpp;
-        if (bpp === 2) for (; d < end; s += 2) out[d++] = src[s] | (src[s + 1] << 8);
-        else if (bpp === 3) for (; d < end; s += 3) out[d++] = src[s] | (src[s + 1] << 8) | (src[s + 2] << 16);
-        else while (d < end) out[d++] = src[s++];
+        const e = Math.min(d + run, n), skip = (run - (e - d)) * bpp;
+        if (bpp === 2) for (; d < e; s += 2) out[d++] = src[s] | (src[s + 1] << 8);
+        else if (bpp === 3) for (; d < e; s += 3) out[d++] = src[s] | (src[s + 1] << 8) | (src[s + 2] << 16);
+        else while (d < e) out[d++] = src[s++];
         s += skip;
         break;
       }
-      case 0xf9: fgbg(0x03, 8); break;                  // special FGBG 1
-      case 0xfa: fgbg(0x05, 8); break;                  // special FGBG 2
-      case 0xfd: put(white); break;
-      case 0xfe: put(0); break;
+      case 0xf9: d = fgbg(out, d, n, width, 0x03, 8, fg, firstLine); break;   // special FGBG 1
+      case 0xfa: d = fgbg(out, d, n, width, 0x05, 8, fg, firstLine); break;   // special FGBG 2
+      case 0xfd: if (d < n) out[d++] = white; break;
+      case 0xfe: if (d < n) out[d++] = 0; break;
       default: throw new Error('RLE: bad order 0x' + h.toString(16));
     }
   }
+  if (d < n) out.fill(0, d, n);                         // (a reused buffer: what the data did not reach is black)
   return out;
 }
 
@@ -118,10 +128,13 @@ function lut(bpp) {
   return LUT[bpp];
 }
 
+/** A 24-bit pixel value (blue in the low byte) as 0xAABBGGRR. */
+const rgb24 = (v) => 0xff000000 | ((v & 0xff) << 16) | (v & 0xff00) | ((v >> 16) & 0xff);
+
 /** Converts a pixel value of the given depth to 0xAABBGGRR (little-endian RGBA). */
 function toRgba(v, bpp, palette) {
   switch (bpp) {
-    case 32: case 24: return 0xff000000 | ((v & 0xff) << 16) | (v & 0xff00) | ((v >> 16) & 0xff);
+    case 32: case 24: return rgb24(v);
     case 16: {
       const r = (v >> 11) & 0x1f, g = (v >> 5) & 0x3f, b = v & 0x1f;
       return 0xff000000 | (((b << 3) | (b >> 2)) << 16) | (((g << 2) | (g >> 4)) << 8) | ((r << 3) | (r >> 2));
@@ -134,43 +147,77 @@ function toRgba(v, bpp, palette) {
   }
 }
 
-/** Planar codec (MS-RDPEGDI 2.2.2.5.1). Returns RGBA words, bottom-up. */
-export function planarDecode(src, width, height) {
+// Scratch buffers for one decode, kept for the next while small (a larger one is only for its call).
+const SCRATCH_MAX = 1 << 16;
+let pixScratch = new Uint32Array(4096), planeScratch = new Uint8Array(4 * 4096);
+function pixBuffer(n) {
+  if (n <= pixScratch.length) return pixScratch;
+  const b = new Uint32Array(n);
+  if (n <= SCRATCH_MAX) pixScratch = b;
+  return b;
+}
+function planeBuffer(n) {
+  if (n <= planeScratch.length) return planeScratch;
+  const b = new Uint8Array(n);
+  if (n <= 4 * SCRATCH_MAX) planeScratch = b;
+  return b;
+}
+
+/** One plane of planar data from src[s] into p[po..po + width * height) (raw or RLE rows). Returns where its data ends. */
+function planarPlane(src, s, p, po, width, height, rle) {
+  const n = width * height;
+  if (!rle) {
+    const part = src.subarray(s, s + n);
+    p.set(part, po);
+    if (part.length < n) p.fill(0, po + part.length, po + n);
+    return s + n;
+  }
+  for (let y = 0; y < height; y++) {
+    const row = po + y * width, end = row + width;
+    let x = row, last = 0;
+    while (x < end) {
+      if (s >= src.length) throw new Error('Planar: truncated plane');   // a control byte 0 does not move x
+      const ctl = src[s++];
+      let runLen = ctl & 0x0f, raw = ctl >> 4;
+      if (runLen === 1) { runLen = raw + 16; raw = 0; } else if (runLen === 2) { runLen = raw + 32; raw = 0; }
+      if (y === 0) {
+        for (; raw > 0 && x < end; raw--) { last = src[s++]; p[x++] = last; }
+        for (; runLen > 0 && x < end; runLen--) p[x++] = last;
+      } else {
+        for (; raw > 0 && x < end; raw--, x++) {
+          const b = src[s++];
+          last = b & 1 ? -((b >> 1) + 1) : b >> 1;
+          p[x] = p[x - width] + last;
+        }
+        for (; runLen > 0 && x < end; runLen--, x++) p[x] = p[x - width] + last;
+      }
+    }
+  }
+  return s;
+}
+
+/**
+ * Planar codec (MS-RDPEGDI 2.2.2.5.1). Returns RGBA words in the rows' own order, or reversed with bottomUp (a bitmap
+ * update's rows are bottom-up); opaque sets every alpha to 255.
+ */
+export function planarDecode(src, width, height, opaque = false, bottomUp = false) {
   const hdr = src[0];
   if (hdr & 0x07) throw new Error('Planar: color loss not supported');
   const rle = hdr & 0x10, noAlpha = hdr & 0x20;
-  const n = width * height;
+  const n = width * height, p = planeBuffer(4 * n);    // planes: alpha, red, green, blue
   let s = 1;
-  const plane = () => {
-    const p = new Uint8Array(n);
-    if (!rle) { p.set(src.subarray(s, s + n)); s += n; return p; }
-    for (let y = 0; y < height; y++) {
-      const row = y * width;
-      let x = 0, last = 0;
-      while (x < width) {
-        if (s >= src.length) throw new Error('Planar: truncated plane');   // a control byte 0 does not move x
-        const ctl = src[s++];
-        let runLen = ctl & 0x0f, raw = ctl >> 4;
-        if (runLen === 1) { runLen = raw + 16; raw = 0; } else if (runLen === 2) { runLen = raw + 32; raw = 0; }
-        if (y === 0) {
-          while (raw-- > 0 && x < width) { last = src[s++]; p[row + x++] = last; }
-          while (runLen-- > 0 && x < width) p[row + x++] = last;
-        } else {
-          while (raw-- > 0 && x < width) {
-            const b = src[s++];
-            last = b & 1 ? -((b >> 1) + 1) : b >> 1;
-            p[row + x] = p[row - width + x] + last; x++;
-          }
-          while (runLen-- > 0 && x < width) { p[row + x] = p[row - width + x] + last; x++; }
-        }
-      }
-    }
-    return p;
-  };
-  const a = noAlpha ? null : plane();
-  const r = plane(), g = plane(), b = plane();
-  const out = new Uint32Array(n);
-  for (let i = 0; i < n; i++) out[i] = ((a ? a[i] : 0xff) << 24 | b[i] << 16 | g[i] << 8 | r[i]) >>> 0;
+  if (!noAlpha) s = planarPlane(src, s, p, 0, width, height, rle);
+  s = planarPlane(src, s, p, n, width, height, rle);
+  s = planarPlane(src, s, p, 2 * n, width, height, rle);
+  planarPlane(src, s, p, 3 * n, width, height, rle);
+  const out = new Uint32Array(n), fixed = opaque || noAlpha;
+  const a = p.subarray(0, n), r = p.subarray(n, 2 * n), g = p.subarray(2 * n, 3 * n), b = p.subarray(3 * n, 4 * n);
+  for (let y = 0; y < height; y++) {
+    const i0 = y * width, i1 = i0 + width;
+    let o = (bottomUp ? height - 1 - y : y) * width;
+    if (fixed) for (let i = i0; i < i1; i++) out[o++] = 0xff000000 | b[i] << 16 | g[i] << 8 | r[i];
+    else for (let i = i0; i < i1; i++) out[o++] = a[i] << 24 | b[i] << 16 | g[i] << 8 | r[i];
+  }
   return out;
 }
 
@@ -181,32 +228,25 @@ export function planarDecode(src, width, height) {
 export function decodeBitmap(data, w, h, bpp, compressed, palette, max) {
   if (!DEPTHS.has(bpp) || w * h > max) throw new Error(`bad size or depth (${w} x ${h} at ${bpp} bpp)`);
   const Bpp = (bpp + 7) >> 3;
+  if (compressed && bpp === 32) return planarDecode(data, w, h, true, true);
   const rgba = new Uint32Array(w * h);
-  let pix, isRgba = false;
-  if (!compressed) {
-    const stride = ((w * Bpp + 3) & ~3);
-    pix = new Uint32Array(w * h);
-    for (let y = 0; y < h; y++) {
-      let o = y * stride;
-      for (let x = 0; x < w; x++, o += Bpp) {
-        let v = data[o];
-        if (Bpp > 1) v |= data[o + 1] << 8;
-        if (Bpp > 2) v |= data[o + 2] << 16;
-        pix[y * w + x] = v;
-      }
-    }
-  } else if (bpp === 32) {
-    pix = planarDecode(data, w, h);
-    isRgba = true;
-  } else {
-    pix = rleDecode(data, w, h, Bpp);
-  }
   const table = bpp === 16 || bpp === 15 ? lut(bpp) : null;
+  if (!compressed) {                            // one pass: values of each row (bottom-up) into their colours (top-down)
+    const stride = ((w * Bpp + 3) & ~3);
+    for (let y = 0; y < h; y++) {
+      let o = y * stride, d = (h - 1 - y) * w;
+      if (table) for (let x = 0; x < w; x++, o += 2) rgba[d++] = table[data[o] | (data[o + 1] << 8)];
+      else if (Bpp === 1) for (let x = 0; x < w; x++, o++) rgba[d++] = palette[data[o] & 0xff];
+      else for (let x = 0; x < w; x++, o += Bpp) rgba[d++] = rgb24(data[o] | (data[o + 1] << 8) | (data[o + 2] << 16));
+    }
+    return rgba;
+  }
+  const pix = rleDecode(data, w, h, Bpp, pixBuffer(w * h));
   for (let y = 0; y < h; y++) {                 // bottom-up -> top-down
     const srcRow = (h - 1 - y) * w, dstRow = y * w;
     if (table) for (let x = 0; x < w; x++) rgba[dstRow + x] = table[pix[srcRow + x]];
-    else if (isRgba) for (let x = 0; x < w; x++) rgba[dstRow + x] = pix[srcRow + x] | 0xff000000;
-    else for (let x = 0; x < w; x++) rgba[dstRow + x] = toRgba(pix[srcRow + x], bpp, palette);
+    else if (Bpp === 1) for (let x = 0; x < w; x++) rgba[dstRow + x] = palette[pix[srcRow + x] & 0xff];
+    else for (let x = 0; x < w; x++) rgba[dstRow + x] = rgb24(pix[srcRow + x]);
   }
   return rgba;
 }

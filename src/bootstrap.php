@@ -6,7 +6,7 @@ namespace MuDesk;
 
 ini_set('zend.exception_ignore_args', '1');   // no arguments (a password) in the stack traces of the error log
 
-const VERSION = '1.0.3';
+const VERSION = '1.1.0';
 
 spl_autoload_register(static function (string $class): void {
     if (strncmp($class, 'MuDesk\\', 7) === 0) {
@@ -20,7 +20,7 @@ spl_autoload_register(static function (string $class): void {
 // PHP keeps a request body over 16 KB in its temporary folder (upload_tmp_dir, else the system's) while it arrives; when it
 // cannot write there it drops the body, with a warning, before this script starts: an uploaded file was then saved empty
 // and answered as done. Checked first, before any other warning can take the place of that one.
-if (PHP_SAPI !== 'cli' && str_contains((string)(error_get_last()['message'] ?? ''), "POST data can't be buffered")) {
+if (PHP_SAPI !== 'cli' && strpos((string)(error_get_last()['message'] ?? ''), "POST data can't be buffered") !== false) {
     error_log('MuDeskClient: PHP cannot write to its temporary folder (' . (ini_get('upload_tmp_dir') ?: sys_get_temp_dir())
         . ') and dropped the body of this request: give the account that runs PHP write access to it');
     ErrorPage::send(500, 'tmp_dir');

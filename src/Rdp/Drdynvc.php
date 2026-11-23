@@ -6,7 +6,8 @@ namespace MuDesk\Rdp;
 
 /**
  * Dynamic virtual channels (MS-RDPEDYC): Display Control (MS-RDPEDISP) and, optionally, the graphics pipeline (MS-RDPEGFX),
- * whose messages are forwarded to the browser untouched (it decompresses and decodes them), and the microphone (see Audin).
+ * whose messages are forwarded to the browser untouched (it decompresses and decodes them), the microphone (see Audin) and
+ * the camera (see Rdpecam).
  */
 final class Drdynvc implements Channel
 {
@@ -17,17 +18,32 @@ final class Drdynvc implements Channel
     private ?int $gfxId = null;
     private ?int $micId = null;
     private ?Audin $mic = null;
+    private ?int $touchId = null;
+    private ?Rdpei $touch = null;
+    private ?int $camEnumId = null;
+    /** @var array<int, true> the camera's channels open (Windows 11 opens two) */
+    private array $camIds = [];
+    private ?Rdpecam $cam = null;
     private array $buf = [];
     private array $total = [];
 
     /**
      * $avc: the browser decodes H.264. The graphics pipeline itself is $c->gfx, decided when connecting.
-     * $mic: the browser's microphone is offered (the connection option, off by default).
+     * $mic: the browser's microphone is offered (the connection option "Microphone and camera", off by default).
+     * $touch: multitouch is taken (the connection option, off by default; see Rdpei).
+     * $camera: the browser's camera, by this name, offered (with the microphone, when the browser has one); null: none.
      */
-    public function __construct(private Client $c, private bool $avc = false, bool $mic = false)
+    public function __construct(private Client $c, private bool $avc = false, bool $mic = false, bool $touch = false, ?string $camera = null)
     {
         if ($mic) {
             $this->mic = new Audin($c, fn(string $m) => $this->micId === null ? null : $this->sendData($this->micId, $m));
+        }
+        if ($camera !== null) {
+            $this->cam = new Rdpecam($c, fn(string $m) => $this->camEnumId === null ? null : $this->sendData($this->camEnumId, $m),
+                fn(int $ch, string $m) => isset($this->camIds[$ch]) ? $this->sendData($ch, $m) : null, $camera);
+        }
+        if ($touch) {
+            $this->touch = new Rdpei($c, fn(string $m) => $this->touchId === null ? null : $this->sendData($this->touchId, $m));
         }
     }
 
@@ -90,8 +106,19 @@ final class Drdynvc implements Channel
         $id = self::readVar($r, $cb);
         switch ($cmd) {
             case 1: // create
+                unset($this->buf[$id], $this->total[$id]);   // (a message of an earlier channel of that id: not joined to this one)
                 $name = strstr($r->rest(), "\0", true);
-                $ok   = $name === self::DISP || ($this->c->gfx && $name === self::GFX) || ($this->mic && $name === Audin::NAME);
+                $ok   = $name === self::DISP || ($this->c->gfx && $name === self::GFX) || ($this->mic && $name === Audin::NAME)
+                     || ($this->touch && $name === Rdpei::NAME)
+                     || ($this->cam && ($name === Rdpecam::ENUMERATOR || ($name === Rdpecam::DEVICE && $this->camEnumId !== null))
+                         && !in_array('pnp', $this->c->denied, true));   // (a gateway's policy without Plug and Play devices: no camera, as Windows' client)
+                if ($ok && $name === Rdpecam::DEVICE) {
+                    $this->camIds[$id] = true;          // (another one may be open: Windows 11 opens two, each answered apart)
+                    $this->cam->opened($id);
+                }
+                if ($ok && $name === Rdpei::NAME) {
+                    $this->touchId = $id;
+                }
                 if ($name === self::DISP) {
                     $this->dispId = $id;
                 }
@@ -101,6 +128,10 @@ final class Drdynvc implements Channel
                 }
                 $this->c->trace?->log('dvc create', ['id' => $id, 'name' => $name, 'accepted' => $ok]);
                 $this->send(1, $id, pack('V', $ok ? 0 : 0xC0000001));
+                if ($ok && $name === Rdpecam::ENUMERATOR) {
+                    $this->camEnumId = $id;
+                    $this->cam->enumOpened();           // the client speaks first there: its version
+                }
                 if ($ok && $name === self::GFX) {
                     $this->gfxId = $id;
                     // CAPS_ADVERTISE: 8.1 (with AVC420 when the browser decodes H.264) and 8.0; with H.264 also 10.7 first:
@@ -113,7 +144,7 @@ final class Drdynvc implements Channel
                 break;
             case 2: // data first
                 $total = self::readVar($r, $sp);
-                if ($total > 67108864 || (!isset($this->total[$id]) && count($this->total) >= 8)) {
+                if ($total > 67108864 || $total > Client::memoryRoom() || (!isset($this->total[$id]) && count($this->total) >= 8)) {
                     throw new ProtocolException("Dynamic channel message of $total bytes", 'protocol');
                 }
                 $this->total[$id] = $total;
@@ -129,6 +160,7 @@ final class Drdynvc implements Channel
                 }
                 break;
             case 4: // close
+                unset($this->buf[$id], $this->total[$id]);   // what it was joining goes with it (it counted towards the 8)
                 $this->c->trace?->log('dvc close', ['id' => $id]);
                 if ($id === $this->dispId) {
                     $this->dispId = null;
@@ -139,6 +171,16 @@ final class Drdynvc implements Channel
                 if ($id === $this->micId) {
                     $this->micId = null;
                     $this->mic->stop();                 // no program records there any more: the browser lets go of the microphone
+                }
+                if ($id === $this->touchId) {
+                    $this->touchId = null;
+                    $this->touch->closed();
+                }
+                if (isset($this->camIds[$id])) {
+                    unset($this->camIds[$id]);
+                    $this->cam->closed($id);            // its stream ends: the browser lets go of its camera if no other runs
+                } elseif ($id === $this->camEnumId) {
+                    $this->camEnumId = null;
                 }
                 $this->send(4, $id, '');
                 break;
@@ -156,13 +198,26 @@ final class Drdynvc implements Channel
 
     private function dispatch(int $id, string $msg): void
     {
-        $this->c->trace?->count('dvc:' . ($id === $this->gfxId ? 'gfx' : ($id === $this->dispId ? 'displayControl' : ($id === $this->micId ? 'microphone' : $id))), strlen($msg));
+        $this->c->trace?->count('dvc:' . ($id === $this->gfxId ? 'gfx' : ($id === $this->dispId ? 'displayControl' : ($id === $this->micId ? 'microphone'
+            : ($id === $this->touchId ? 'touch' : (isset($this->camIds[$id]) || $id === $this->camEnumId ? 'camera' : $id))))), strlen($msg));
         if ($id === $this->gfxId) {
             $this->c->emit(Client::F_GFX, $msg);
             return;
         }
+        if ($id === $this->camEnumId) {
+            $this->cam->onEnum($msg);
+            return;
+        }
+        if (isset($this->camIds[$id])) {
+            $this->cam->onDevice($id, $msg);
+            return;
+        }
         if ($id === $this->micId) {
             $this->mic->onMessage($msg);
+            return;
+        }
+        if ($id === $this->touchId) {
+            $this->touch->onMessage($msg);
             return;
         }
         if ($id === $this->dispId && strlen($msg) >= 8 && unpack('V', $msg)[1] === 5) {
@@ -179,12 +234,38 @@ final class Drdynvc implements Channel
         }
     }
 
+    /** A multitouch frame from the browser (see Rdpei::fromBrowser). */
+    public function touchData(string $frame): void
+    {
+        if ($this->touchId !== null) {
+            $this->touch->fromBrowser($frame);
+        }
+    }
+
     /** Microphone audio from the browser (16-bit PCM in the format it was told). */
     public function micData(string $pcm): void
     {
         if ($this->micId !== null) {
             $this->mic->fromBrowser($pcm);
         }
+    }
+
+    /** From the browser's camera: u8 the start it belongs to (F_CAM), then a picture (JPEG), or nothing when it could not open its camera. */
+    public function camData(string $m): void
+    {
+        if ($this->camIds && $m !== '') {
+            strlen($m) === 1 ? $this->cam->browserFailed(ord($m[0])) : $this->cam->fromBrowser(ord($m[0]), substr($m, 1));
+        }
+    }
+
+    /**
+     * This connection given up (another one made in its place): the browser lets go of its microphone and its camera, which
+     * the new one asks for again if a program there still uses them (else the camera stayed on, its pictures dropped).
+     */
+    public function stopCapture(): void
+    {
+        $this->mic?->stop();
+        $this->cam?->stop();
     }
 
     /** Requests a new desktop size; returns false if the channel is not open. */

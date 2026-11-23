@@ -63,10 +63,16 @@ final class Cliprdr implements Channel
     {
     }
 
-    /** Clipboard audit: type and size, never the contents. */
+    private int $audited = 0;
+    private float $requestedAt = 0.0;
+
+    /** Clipboard audit: type and size, never the contents; at most 2,000 lines a session (a server copying in a loop). */
     private function audit(string $event, array $d): void
     {
-        Audit::log($event, ['sid' => $this->sid, 'conn' => $this->conn] + $d, null, true);
+        if (++$this->audited > 2000) {
+            return;
+        }
+        Audit::log($event, ['sid' => $this->sid, 'conn' => $this->conn] + $d + ($this->audited === 2000 ? ['note' => 'later clipboard events not logged'] : []), null, true);
     }
 
     public function name(): string
@@ -164,7 +170,7 @@ final class Cliprdr implements Channel
         $this->stale  = $this->requested !== null;      // its answer belongs to the previous list
         $this->remote = [];
         $d            = $r->data;
-        while ($r->left() >= 4) {
+        while ($r->left() >= 4 && count($this->remote) < 1000) {   // (11 million in a 64 MB list took 450 MB and 25 s)
             $id = $r->u32();
             if ($this->long) {
                 $end = $r->pos;
@@ -215,6 +221,7 @@ final class Cliprdr implements Channel
         if ($this->requested === null && ($this->queue || $this->toRead)) {
             $this->reqRead   = !$this->queue;               // what the browser shows goes first
             $this->requested = $this->reqRead ? array_shift($this->toRead) : array_shift($this->queue);
+            $this->requestedAt = microtime(true);
             $this->send(4, 0, pack('V', $this->requested));
         }
     }
@@ -267,7 +274,8 @@ final class Cliprdr implements Channel
             $name          = implode('\\', array_diff(preg_split('~[\\\\/:]+~', Text::fromUtf16($d->bytes(520)), -1, PREG_SPLIT_NO_EMPTY), ['.', '..']));
             $this->files[] = ['name' => $name, 'size' => $hi * 4294967296 + $lo, 'dir' => (bool)($attr & 0x10)];
         }
-        $this->audit('clip_from_remote', ['type' => 'files', 'files' => array_map(static fn($f) => $f['name'] . ($f['dir'] ? '/' : ' (' . $f['size'] . ')'), $this->files)]);
+        $this->audit('clip_from_remote', ['type' => 'files', 'count' => count($this->files),   // (the first 50 names, each cut)
+            'files' => array_map(static fn($f) => Text::cut($f['name'], 260) . ($f['dir'] ? '/' : ' (' . $f['size'] . ')'), array_slice($this->files, 0, 50))]);
         $this->toBrowser('F' . json_encode($this->files, JSON_UNESCAPED_UNICODE));
     }
 
@@ -392,8 +400,14 @@ final class Cliprdr implements Channel
         $stream = $r->u32();
         $index  = $r->i32();
         $flags  = $r->u32();
-        $pos    = $r->u32() | ($r->u32() << 32);
+        $lo     = $r->u32();
+        $hi     = $r->u32();
         $len    = min($r->u32(), 4 * 1048576);
+        if ($hi > 0x7FFFFFFF) {                          // an offset past what a file can have: refused (it read from 0)
+            $this->send(9, 2, pack('V', $stream));
+            return;
+        }
+        $pos    = $lo | ($hi << 32);
         $f      = $this->localFiles[$index] ?? null;
         if ($f === null) {
             $this->send(9, 2, pack('V', $stream));
@@ -406,13 +420,14 @@ final class Cliprdr implements Channel
         if ($pos === 0) {
             $this->audit('clip_file_to_remote', ['file' => $f['name'], 'size' => $f['size']]);
         }
-        $h    = fopen($f['path'], 'rb');
-        $data = '';
-        if ($h !== false) {
-            fseek($h, $pos);
-            $data = (string)fread($h, max(1, $len));
-            fclose($h);
+        $h = @fopen($f['path'], 'rb');
+        if ($h === false || fseek($h, $pos) !== 0) {     // gone, or no such place: no bytes from elsewhere
+            $h !== false && fclose($h);
+            $this->send(9, 2, pack('V', $stream));
+            return;
         }
+        $data = $len > 0 ? (string)fread($h, $len) : '';
+        fclose($h);
         $this->send(9, 1, pack('V', $stream) . $data);
     }
 
@@ -494,6 +509,10 @@ final class Cliprdr implements Channel
     /** Called on every loop of the session. */
     public function tick(): void
     {
+        if ($this->requested !== null && microtime(true) - $this->requestedAt > 30) {
+            [$this->requested, $this->stale] = [null, false];   // never answered (or left out, too large): the next copies are read again
+            $this->next();
+        }
         $t = $this->typing;
         if ($t !== null && $t['step'] === 'ready' && ($this->c->drawnSinceInput() || microtime(true) > $t['until'])) {
             // Ctrl+V once the application has drawn the last input sent (Notepad dropped a Ctrl+V right behind an Enter

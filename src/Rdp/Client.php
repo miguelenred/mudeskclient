@@ -25,6 +25,10 @@ final class Client
     public const F_ZSLOW   = 11; // bulk compression on: u8 flags, u8 pduType2 + compressed slow-path data PDU (updates and pointers are drawn from it)
     public const F_RAIL    = 12; // RemoteApp: JSON about the program's windows that does not come with the drawing orders (cloaked)
     public const F_MIC     = 13; // microphone: u8 1 + u32 rate + u8 channels (record 16-bit PCM like this), or u8 0 (stop)
+    public const F_RESET   = 14; // the connection made again (a guest joined a shared session): every decoder starts anew
+    public const F_POINTER = 15; // to the guests only: u16 x, u16 y, where the owner's mouse is
+    public const F_CAM     = 16; // camera: u8 1 + u16 width + u16 height + u8 pictures a second (send JPEG pictures so), or u8 0 (stop)
+    public const F_DRIVE   = 17; // this computer's folder: a Device I/O Request for it (from its DeviceId on), answered by the browser
 
     private const IO_SERVER = 0x03EA;
     /** Seconds from the Client Info to the Demand Active (licensing included) */
@@ -84,11 +88,30 @@ final class Client
     private const CHANNEL_MAX = 67108864;      // largest channel message (a 4K screenshot copied is 33 MB)
     /** @var array<int,int> their total size */
     private array $chanLen = [];
+    /** @var array<int,true> channels whose message is being left out (larger than the memory can hold) */
+    private array $chanSkip = [];
+    /** @var list<Channel> the channels added, before the server gives them their ids */
+    private array $added = [];
     /** @var list<array{0:string,1:int,2:int,3?:string}> input waiting behind typed text or a paste (see input(), pasteText()) */
     private array $inputQueue = [];
     private float $inputAt = 0.0;        // input waits until then: a typed character's pause, or INF while a paste is under way
     /** pastes text through the remote clipboard (Cliprdr::typeText), which then calls inputDone() */
     public ?\Closure $paster = null;
+    /** @var list<string> device redirections the gateway's policy forbids (Gateway::DEVICES): their channels not offered */
+    public array $denied = [];
+    /** @var bool the server refused the Kerberos ticket: NTLM only from then on (its next connections too) */
+    private bool $ntlmOnly = false;
+    /** Standard RDP Security (Windows XP, Server 2003, or a later Windows set to it), once its keys are made */
+    private ?RdpSecurity $sec = null;
+    /** @var bool the server refused TLS (SSL_NOT_ALLOWED_BY_SERVER): asked again without it */
+    private bool $legacyOnly = false;
+    private bool $licenseEncrypt = false;      // the server asked for the client's licensing PDUs encrypted (SEC_LICENSE_ENCRYPT_CS)
+    /** @var array{0:int,1:string,2:string}|null the server's encryption method, random and certificate (Server Security Data) */
+    private ?array $serverSec = null;
+    /** NLA made with Kerberos (else NTLM) */
+    public bool $kerberos = false;
+    /** @var string|null Standard RDP Security in use (no TLS: Windows XP, Server 2003): its encryption, for the audit */
+    public ?string $rdpSecurity = null;
     private int $drawn = 0;              // screen updates received (fast-path or graphics pipeline)
     private int $drawnAtInput = 0;       // ... when input was last sent (see drawnSinceInput())
     private ?int $drawnBefore = null;    // after a paste, input waits until the screen changes (see inputDone())
@@ -107,7 +130,18 @@ final class Client
 
     public function addChannel(Channel $ch): void
     {
-        $this->handlers[count($this->handlers)] = $ch;
+        $this->added[] = $ch;                    // (mapped to its id once the server gives it: ids below the count were handled before)
+    }
+
+    /**
+     * Bytes a message may take now: what the memory limit leaves, over 6 (a message is copied a few times on its way: its
+     * pieces, joined, read by its channel, sent on). A larger one ended the session with "Allowed memory size exhausted".
+     */
+    public static function memoryRoom(): int
+    {
+        $l = trim((string)ini_get('memory_limit'));
+        $n = (int)$l * (['k' => 1024, 'm' => 1048576, 'g' => 1073741824][strtolower(substr($l, -1))] ?? 1);
+        return $n <= 0 ? PHP_INT_MAX : intdiv(max(0, $n - memory_get_usage()), 6);
     }
 
     // ------------------------------------------------------------------ framing
@@ -131,8 +165,18 @@ final class Client
         return $n < 0x80 ? chr($n) : pack('n', 0x8000 | $n);
     }
 
-    private function mcsSend(int $channel, string $data): void
+    /**
+     * Sends $data on an MCS channel. $secFlags: the basic security header's flags it needs (SEC_INFO_PKT, SEC_LICENSE_PKT;
+     * TLS and NLA only carry it for them). With Standard RDP Security every PDU is encrypted, with its header and signature;
+     * licensing PDUs only when the server asked for it.
+     */
+    private function mcsSend(int $channel, string $data, int $secFlags = 0): void
     {
+        if ($this->sec !== null && !($secFlags & RdpSecurity::SEC_LICENSE_PKT && !$this->licenseEncrypt)) {
+            $data = $this->sec->seal($secFlags, $data);
+        } elseif ($secFlags !== 0 || $this->sec !== null) {
+            $data = pack('vv', $secFlags, 0) . $data;
+        }
         $this->t->send(self::tpkt("\x02\xf0\x80\x64" . pack('nn', $this->userId, $channel) . "\x70" . self::perLen(strlen($data)) . $data));
     }
 
@@ -145,63 +189,157 @@ final class Client
     // ------------------------------------------------------------------ connection sequence
 
     /** @param callable(string):void $verifyCert receives the SHA-256 certificate fingerprint; throw to abort */
+    /**
+     * RDP_PRECONNECTION_PDU_V2 (MS-RDPEPS 2.2.1.2): cbSize, Flags 0, Version 2, Id, cchPCB and the UTF-16 text with its
+     * terminating null, which cchPCB counts (as in the specification's examples). For Hyper-V the text is the virtual
+     * machine's id, with ";EnhancedMode=1" for an enhanced session.
+     */
+    public static function preconnection(string $pcb, int $id = 0): string
+    {
+        $w = $pcb === '' ? '' : Text::toUtf16($pcb) . "\0\0";
+        return pack('VVVVv', 18 + strlen($w), 0, 2, $id, intdiv(strlen($w), 2)) . $w;
+    }
+
     public function connect(callable $verifyCert): void
     {
         $o       = $this->o;
-        $this->t = new Transport($o['ip'], $o['port']);
-
-        // X.224 Connection Request with RDP negotiation (TLS, or TLS+NLA)
-        $want   = $o['security'] === 'tls' ? 1 : 3;
-        $cookie = 'Cookie: mstshash=' . preg_replace('/[^A-Za-z0-9._-]/', '', substr($o['user'], 0, 9)) . "\r\n";
-        $neg    = pack('CCvV', 1, 0, 8, $want);
-        $x      = "\xe0\x00\x00\x00\x00\x00" . $cookie . $neg;
-        $this->t->send(self::tpkt(chr(strlen($x)) . $x));
-        $r = new Reader($this->t->recvPdu());
-        $r->skip(5);
-        if ($r->u8() !== 0xD0) {
-            throw new ProtocolException('Unexpected X.224 response', 'protocol');
-        }
-        $r->skip(5);
-        if ($r->left() < 8) {
-            throw new ProtocolException('Server only supports legacy RDP security', 'rdp_security');
-        }
-        $type = $r->u8();
-        $r->skip(3);
-        $val = $r->u32();
-        if ($type === 3) {
-            throw new ProtocolException("Negotiation failure $val", [1 => 'tls_required', 2 => 'rdp_security', 5 => 'nla_required'][$val] ?? 'protocol');
-        }
-        if ($val === 0) {
-            throw new ProtocolException('Server only supports legacy RDP security', 'rdp_security');
-        }
-        if ($val & ~$want) {                     // not asked for (RDSTLS, HYBRID_EX...): never taken on
-            throw new ProtocolException("Server chose protocol $val, not offered", 'protocol');
-        }
-        $this->trace?->log('x224', ['requested' => $want, 'selected' => $val, 'meaning' => [1 => 'TLS', 2 => 'NLA (CredSSP)', 4 => 'RDSTLS', 8 => 'NLA extended (HYBRID_EX)'][$val] ?? '?']);
-        if ($o['security'] === 'nla' && $val !== 2) {
-            throw new ProtocolException('Server does not offer NLA', 'nla_unavailable');
+        // through a Remote Desktop Gateway ('gateway': it opens the tunnel to the computer), or straight to it
+        $this->t = isset($o['gateway']) ? Transport::through(($o['gateway'])($o['host'], (int)$o['port'])) : new Transport($o['ip'], $o['port']);
+        // the device redirections the gateway's policy forbids: their channels not offered (the clipboard; the drives and
+        // printers, whose channel goes when both are; Rdpdr leaves out the one forbidden), as Windows' own client does
+        $this->denied = $this->t->gw?->denied ?? [];
+        if ($this->denied !== []) {
+            $no = fn(string $d): bool => in_array($d, $this->denied, true);
+            $this->o['channels'] = array_values(array_filter($this->o['channels'], static fn(array $c): bool =>
+                !($c[0] === 'cliprdr' && $no('clipboard')) && !($c[0] === 'rdpdr' && $no('drive') && $no('printer'))));
+            $no('clipboard') && $this->paster = null;   // (typed character by character instead)
+            $this->trace?->log('gateway policy', ['denied' => $this->denied]);
         }
 
-        $cert                  = $this->t->startTls();
-        $this->certFingerprint = (string)openssl_x509_fingerprint($cert, 'sha256');
-        if ($this->trace) {
-            $x = openssl_x509_parse($cert) ?: [];
-            $this->trace->log('tls', $this->t->tlsInfo() + ['subject' => $x['subject']['CN'] ?? null, 'issuer' => $x['issuer']['CN'] ?? null,
-                'validTo' => date('c', $x['validTo_time_t'] ?? 0), 'fingerprint' => $this->certFingerprint]);
+        if (($o['vm'] ?? '') !== '') {
+            // the console of a Hyper-V virtual machine (what VMConnect does): the Preconnection PDU names the machine, then
+            // TLS and NLA with the Hyper-V host's account at once, without the X.224 negotiation (the host does not answer it)
+            $this->t->send(self::preconnection($o['vm']));
+            $val = 2;
+            $this->trace?->log('vmconnect', ['pcb' => $o['vm']]);
+        } else {
+            // X.224 Connection Request with RDP negotiation (TLS, or TLS+NLA; after a server refused TLS, Standard RDP Security:
+            // then without the negotiation request, as Windows XP's server does not know it)
+            $want   = isset($o['rdstls']) ? 4 | 1 : ($this->legacyOnly ? 0 : ($o['security'] === 'tls' ? 1 : 3));   // (RDSTLS, or TLS, as Windows)
+            // a connection broker's routing token (the load balance info of the connection, or the one the broker gave when
+            // it sent the client to this computer), else the user name as cookie
+            $lb     = (string)($o['lb'] ?? '');
+            $cookie = $lb !== '' ? (str_ends_with($lb, "\r\n") ? $lb : $lb . "\r\n") : 'Cookie: mstshash=' . preg_replace('/[^A-Za-z0-9._-]/', '', substr($o['user'], 0, 9)) . "\r\n";
+            $neg    = $want === 0 ? '' : pack('CCvV', 1, 0, 8, $want);
+            $x      = "\xe0\x00\x00\x00\x00\x00" . $cookie . $neg;
+            if (strlen($x) > 254) {                    // (its length is one byte: a longer token made a broken request)
+                throw new ProtocolException('Routing token too long', 'routing_token');
+            }
+            $this->t->send(self::tpkt(chr(strlen($x)) . $x));
+            $r = new Reader($this->t->recvPdu());
+            $r->skip(5);
+            if ($r->u8() !== 0xD0) {
+                throw new ProtocolException('Unexpected X.224 response', 'protocol');
+            }
+            $r->skip(5);
+            // no negotiation in the answer (Windows XP, Server 2003 before SP1), or PROTOCOL_RDP chosen: Standard RDP Security,
+            // only when the connection's security is automatic (as Windows' own client: its key pinned like a certificate)
+            [$type, $val] = [0, 0];
+            if ($r->left() >= 8) {
+                $type = $r->u8();
+                $r->skip(3);
+                $val = $r->u32();
+            }
+            if ($type === 3 && ($val === 2 || $val === 3) && $o['security'] === 'auto' && !$this->legacyOnly) {
+                $this->trace?->log('x224', ['requested' => $want, 'refused' => $val === 2 ? 'SSL_NOT_ALLOWED_BY_SERVER' : 'SSL_CERT_NOT_ON_SERVER',
+                    'then' => 'Standard RDP Security']);
+                // (SSL_NOT_ALLOWED_BY_SERVER, or SSL_CERT_NOT_ON_SERVER: a server without a certificate; before, that one ended
+                // the session): asked again without TLS, as Windows does
+                $this->t->close();
+                $this->legacyOnly = true;
+                $this->connect($verifyCert);
+                return;
+            }
+            if ($type === 3) {
+                throw new ProtocolException("Negotiation failure $val", [1 => 'tls_required', 2 => 'rdp_security', 5 => 'nla_required'][$val] ?? 'protocol');
+            }
+            if ($val === 0 && $o['security'] !== 'auto') {
+                throw new ProtocolException('Server only supports legacy RDP security', 'rdp_security');
+            }
+            if ($val & ~$want) {                     // not asked for (RDSTLS, HYBRID_EX...): never taken on
+                throw new ProtocolException("Server chose protocol $val, not offered", 'protocol');
+            }
+            $this->trace?->log('x224', ['requested' => $want, 'selected' => $val, 'meaning' => [0 => 'Standard RDP Security', 1 => 'TLS', 2 => 'NLA (CredSSP)', 4 => 'RDSTLS',
+                8 => 'NLA extended (HYBRID_EX)'][$val] ?? '?']);
+            // (RDSTLS too: the broker's password for that computer, after the broker's own NLA; before, refused as no NLA)
+            if ($o['security'] === 'nla' && $val !== 2 && !($val === 4 && isset($o['rdstls']))) {
+                throw new ProtocolException('Server does not offer NLA', 'nla_unavailable');
+            }
         }
-        $verifyCert($this->certFingerprint);
+
+        if ($val !== 0) {
+            try {
+                $cert = $this->t->startTls();
+            } catch (ProtocolException $e) {
+                if ($val !== 1 || $o['security'] !== 'auto' || $this->legacyOnly) {
+                    throw $e;
+                }
+                // no TLS this server and OpenSSL share (Windows Server 2003 offers RC4 and triple DES, which OpenSSL 3 leaves
+                // out): Standard RDP Security instead, as with a server that refuses TLS
+                $this->trace?->log('tls', ['failed' => $e->getMessage(), 'then' => 'Standard RDP Security']);
+                $this->t->close();
+                $this->legacyOnly = true;
+                $this->connect($verifyCert);
+                return;
+            }
+            $this->certFingerprint = (string)openssl_x509_fingerprint($cert, 'sha256');
+            if ($this->trace) {
+                $x = openssl_x509_parse($cert) ?: [];
+                $this->trace->log('tls', $this->t->tlsInfo() + ['subject' => $x['subject']['CN'] ?? null, 'issuer' => $x['issuer']['CN'] ?? null,
+                    'validTo' => date('c', $x['validTo_time_t'] ?? 0), 'fingerprint' => $this->certFingerprint]);
+            }
+            $verifyCert($this->certFingerprint);
+        }
+        if ($val === 4) {
+            $this->rdstls($o['rdstls'] ?? throw new ProtocolException('Server chose RDSTLS, not offered', 'protocol'));
+        }
         if ($val === 2) {
             try {
                 $this->trace?->log('nla', ['user_form' => str_contains($o['user'], '@') ? 'upn' : ($o['domain'] === '.' ? 'local' : ($o['domain'] !== '' ? 'domain' : 'plain'))]);
-                $this->serverVersion = CredSsp::authenticate($this->t, Der::subjectPublicKey($cert), $o['user'], $o['domain'], $o['password'], $o['host']);
-                $this->trace?->log('nla ok', ['server' => $this->serverVersion ? implode('.', $this->serverVersion) : null]);
+                $this->serverVersion = CredSsp::authenticate($this->t, Der::subjectPublicKey($cert), $o['user'], $o['domain'], $o['password'], $o['host'],
+                                                             true, !$this->ntlmOnly);
+                $this->kerberos      = CredSsp::$kerberos;
+                $this->trace?->log('nla ok', ['server' => $this->serverVersion ? implode('.', $this->serverVersion) : null, 'with' => $this->kerberos ? 'kerberos' : 'ntlm']);
             } catch (ProtocolException $e) {
+                if ($e->key === 'kerberos' && !$this->ntlmOnly) {
+                    // the server refused the Kerberos ticket: connected again, and signed in with NTLM (as Windows does)
+                    $this->trace?->log('nla kerberos refused', ['error' => $e->getMessage()]);
+                    $this->t->close();
+                    $this->ntlmOnly = true;
+                    $this->connect($verifyCert);
+                    return;
+                }
                 throw self::nlaFailure($e);
             }
         }
 
         $this->graphics();
         $this->mcsConnect($val);
+        if ($val === 0 && $this->serverSec === null) {
+            // Standard RDP Security that encrypts nothing (no security data, or encryption method 0): the password would go in
+            // the clear, and no key would be checked (a man in the middle posing as an old server, or a server set to none)
+            throw new ProtocolException('Standard RDP Security without encryption', 'rdp_unencrypted');
+        }
+        if ($val === 0) {
+            // Standard RDP Security: the server's key pinned as a certificate is (the SHA-256 of its modulus and exponent, each
+            // with its length: before, "n \0 e" let another modulus and exponent give the same string, and so the same pin)
+            $key = RdpSecurity::publicKey($this->serverSec[2]);
+            $this->certFingerprint = RdpSecurity::pin(...$key);
+            $this->rdpSecurity     = [1 => '40-bit', 2 => '128-bit', 8 => '56-bit', 0x10 => 'FIPS'][$this->serverSec[0]] ?? 'unknown';
+            $this->trace?->log('rdp security', ['method' => $this->rdpSecurity,
+                'level' => $this->serverSec[3], 'key_bits' => strlen($key[0]) * 8, 'fingerprint' => $this->certFingerprint]);
+            $verifyCert($this->certFingerprint);
+        }
         $this->t->send(self::tpkt("\x02\xf0\x80\x04\x01\x00\x01\x00"));       // Erect Domain
         $this->t->send(self::tpkt("\x02\xf0\x80\x28"));                       // Attach User
         $r = new Reader($this->t->recvPdu());
@@ -219,11 +357,46 @@ final class Client
                 throw new ProtocolException("MCS channel join $ch failed", 'protocol');
             }
         }
+        if ($this->serverSec !== null) {
+            // Security Exchange PDU: the client random encrypted with the server's key (little-endian, 8 bytes of padding)
+            [$method, $serverRandom, $serverCert] = $this->serverSec;
+            [$n, $e] = RdpSecurity::publicKey($serverCert);
+            $random  = random_bytes(32);
+            $enc     = RdpSecurity::rsa($random, $n, $e) . str_repeat("\0", 8);
+            $this->mcsSend($this->ioChannel, pack('V', strlen($enc)) . $enc, RdpSecurity::SEC_EXCHANGE_PKT);
+            $this->sec = new RdpSecurity($method, $random, $serverRandom);
+            $this->sec->level = $this->serverSec[3];
+        }
         $this->sendClientInfo();
         $this->trace?->log('client info sent', ['perf' => sprintf('0x%x', $o['perf']), 'compression' => array_search($o['compression'] ?? 0, Bulk::LEVELS, true) ?: 'none',
             'audio' => $o['audio'], 'mic' => !empty($o['mic']), 'tzBias' => $o['tzBias']]);
 
         $this->activate(self::ACTIVATION_TIMEOUT);
+    }
+
+    /**
+     * RDSTLS (MS-RDPBCGR 2.2.17), after a broker's redirection whose password is encrypted for the target: the server's
+     * capabilities (version 1 offered), then the password credentials (the redirection's GUID and password as they came, the
+     * user and domain as null-terminated UTF-16; lengths of 16 bits, little-endian), and its result.
+     */
+    private function rdstls(array $cred): void
+    {
+        [$version, $type, $data, $versions] = array_values(unpack('v4', $this->t->recv(8)));
+        if ($version !== 1 || $type !== 1 || $data !== 1 || !($versions & 1)) {
+            throw new ProtocolException(sprintf('RDSTLS: capabilities %d/%d/%d/%d', $version, $type, $data, $versions), 'protocol');
+        }
+        $str = static fn(string $s): string => pack('v', strlen($w = Text::toUtf16($s) . "\0\0")) . $w;
+        $this->t->send(pack('vvv', 1, 2, 1) . pack('v', strlen($cred['guid'])) . $cred['guid'] . $str($this->o['user']) . $str($this->o['domain'])
+            . pack('v', strlen($cred['password'])) . $cred['password']);
+        ['v' => $version, 't' => $type, 'd' => $data, 'r' => $result] = unpack('vv/vt/vd/Vr', $this->t->recv(10));
+        $this->trace?->log('rdstls', ['result' => sprintf('0x%08x', $result)]);
+        if ($version !== 1 || $type !== 4 || $data !== 1) {
+            throw new ProtocolException('RDSTLS: no authentication response', 'protocol');
+        }
+        if ($result !== 0) {
+            throw new ProtocolException(sprintf('RDSTLS: result 0x%x', $result), [0x52E => 'auth_failed', 0x530 => 'account_restricted',
+                0x532 => 'password_expired', 0x533 => 'account_disabled', 0x773 => 'password_expired', 0x775 => 'account_locked'][$result] ?? 'redirect_auth');
+        }
     }
 
     /** Waits for the Demand Active (licensing comes first), with a limit for the whole wait: other PDUs do not extend it. */
@@ -247,7 +420,9 @@ final class Client
     {
         $mode      = $this->o['gfx'] ?? false;
         $v         = $this->serverVersion;
-        $this->gfx = $mode === 'auto' ? $v !== null && $v[0] * 100 + $v[1] >= 603 : $mode === true || $mode === 'on';
+        // (signed in with Kerberos, which says no version: a Windows of a domain, with the AES that Windows Server 2008 R2 and
+        // later give; the graphics pipeline taken as with 6.3)
+        $this->gfx = $mode === 'auto' ? ($v !== null ? $v[0] * 100 + $v[1] >= 603 : $this->kerberos) : $mode === true || $mode === 'on';
         if ($this->gfx) {
             $this->o['bpp'] = 32;                    // the graphics pipeline requires 32 bpp
         }
@@ -273,8 +448,11 @@ final class Client
         foreach ($o['channels'] as $i => [$chName, $opt]) {
             $net .= str_pad($chName, 8, "\0") . pack('V', $opt);
         }
+        // TS_UD_CS_SEC: with Standard RDP Security, the encryption methods taken (40, 128, 56-bit, FIPS)
         $blocks = pack('vv', 0xC001, strlen($core) + 4) . $core
-                . pack('vvVV', 0xC002, 12, 0, 0)
+                . pack('vvVV', 0xC002, 12, $protocol === 0 ? 0x1B : 0, 0)
+                // TS_UD_CS_CLUSTER: redirection supported (version 5); after a broker's redirection, the session to join
+                . pack('vvVV', 0xC004, 12, 0x01 | (0x04 << 2) | (!empty($o['redirectSession']) ? 0x02 : 0), (int)($o['redirectSession'] ?? 0))
                 . pack('vv', 0xC003, strlen($net) + 4) . $net;
         if (count($o['monitors']) > 1) { // TS_UD_CS_MONITOR: each monitor is a separate screen in the session
             $mon = pack('VV', 0, count($o['monitors']));
@@ -308,8 +486,16 @@ final class Client
             $b    = new Reader($r->bytes($r->u16() - 4));
             $this->trace?->log('server data', ['block' => [0x0C01 => 'core', 0x0C02 => 'security', 0x0C03 => 'network', 0x0C04 => 'messageChannel',
                 0x0C08 => 'multitransport'][$type] ?? sprintf('0x%04x', $type), 'data' => Trace::hex($b->data)]);
-            if ($type === 0x0C02 && $b->u32() !== 0) {
-                throw new ProtocolException('Server requires legacy RDP encryption', 'rdp_security');
+            if ($type === 0x0C02 && ($method = $b->u32()) !== 0) {
+                if ($protocol !== 0) {              // (TLS and NLA carry no encryption of their own)
+                    throw new ProtocolException('Server requires legacy RDP encryption', 'rdp_security');
+                }
+                $level = $b->u32();
+                [$randomLen, $certLen] = [$b->u32(), $b->u32()];
+                if ($randomLen !== 32 || $certLen < 16 || $certLen > 16384) {
+                    throw new ProtocolException('Standard RDP Security: bad server security data', 'protocol');
+                }
+                $this->serverSec = [$method, $b->bytes(32), $b->bytes($certLen), $level];
             }
             if ($type === 0x0C03) {
                 $this->ioChannel = $b->u16();
@@ -319,7 +505,7 @@ final class Client
                         $id                       = $b->u16();
                         $this->channelIds[$chName] = $id;
                         $this->channelOpts[$chName] = $o['channels'][$i][1];
-                        foreach ($this->handlers as $h) {
+                        foreach ($this->added as $h) {
                             if ($h->name() === $chName) {
                                 $this->handlers[$id] = $h;
                             }
@@ -338,16 +524,23 @@ final class Client
                | (empty($o['mic']) ? 0 : 0x00200000)                                   // INFO_AUDIOCAPTURE: the microphone is offered
                | (empty($o['compression']) ? 0 : 0x80 | ($o['compression'] << 9));   // INFO_COMPRESSION + highest type accepted
         $this->bulk = empty($o['compression']) ? null : new Bulk();
-        $dom   = $u16z($o['domain']);
-        $usr   = $u16z($o['user']);
-        $pwd   = $u16z($o['password']);
+        // the console of a Hyper-V machine: the host's account signed in with NLA; the session (enhanced, the guest's own)
+        // is not given it, nor logged on with it automatically
+        $vm    = ($o['vm'] ?? '') !== '';
+        $flags = $vm ? $flags & ~0x8 : $flags;
+        $dom   = $u16z($vm ? '' : $o['domain']);
+        $usr   = $u16z($vm ? '' : $o['user']);
+        $pwd   = $u16z($vm ? '' : $o['password']);
+        if (isset($o['redirectCookie']) && strlen($o['redirectCookie']) >= 2) {   // after a broker's redirection: its cookie, as it gave it
+            $pwd = substr($o['redirectCookie'], -2) === "\0\0" ? $o['redirectCookie'] : $o['redirectCookie'] . "\0\0";
+        }
         $info  = pack('VVvvvvv', 0, $flags, strlen($dom) - 2, strlen($usr) - 2, strlen($pwd) - 2, 0, 0)
                . $dom . $usr . $pwd . "\0\0\0\0";
         $addr  = $u16z('0.0.0.0');
         $dir   = $u16z('C:\\Windows\\System32\\mstscax.dll');
         $tz    = pack('l', $o['tzBias']) . str_repeat("\0", 64 + 16 + 4 + 64 + 16 + 4);
         $info .= pack('vv', 2, strlen($addr)) . $addr . pack('v', strlen($dir)) . $dir . $tz . pack('VVv', 0, $o['perf'], 0);
-        $this->mcsSend($this->ioChannel, pack('vv', 0x0040, 0) . $info);
+        $this->mcsSend($this->ioChannel, $info, RdpSecurity::SEC_INFO_PKT);
     }
 
     /** TS_ORDER_CAPABILITYSET orderSupport: DstBlt, PatBlt (and OpaqueRect), ScrBlt, MemBlt, FastIndex, FastGlyph, GlyphIndex. */
@@ -441,6 +634,19 @@ final class Client
         $channel = $r->u16be();
         $r->skip(1);
         $data = $r->bytes($r->perLength());
+        if ($this->sec !== null) {
+            // Standard RDP Security: every PDU with its security header, decrypted (in order: RC4 is one stream) when encrypted
+            [$flags, $data] = $this->sec->open($data);
+            if ($channel === $this->ioChannel && $flags & RdpSecurity::SEC_LICENSE_PKT) {
+                $this->licenseEncrypt = $this->licenseEncrypt || (bool)($flags & RdpSecurity::SEC_LICENSE_ENCRYPT);
+                $this->license(new Reader($data));
+                return;
+            }
+            if ($channel === $this->ioChannel && $flags & RdpSecurity::SEC_REDIRECTION_PKT) {
+                $this->redirect(new Reader("\0\0" . $data));   // (Standard Security's: no padding before the packet)
+                return;
+            }
+        }
         if ($channel === $this->ioChannel) {
             $this->ioPdu($data);
         } elseif (isset($this->handlers[$channel])) {
@@ -451,7 +657,9 @@ final class Client
     private function ioPdu(string $data): void
     {
         $r = new Reader($data);
-        if (!$this->licensed && ($r->u16() & 0x0080)) {
+        // a licensing PDU (SEC_LICENSE_PKT, then a known message type and its size), not a share-control PDU of 128 bytes
+        if ($this->sec === null && !$this->licensed && ($r->u16() & 0x0080) && strlen($data) >= 8 && in_array(ord($data[4]), [1, 2, 3, 4, 0xFF], true)
+            && unpack('v', $data, 6)[1] === strlen($data) - 4) {
             $r->skip(2);
             $this->license($r);
             return;
@@ -474,22 +682,176 @@ final class Client
                 1       => $this->demandActive($body),
                 6       => $this->active = false,
                 7       => $this->dataPdu($body),
-                0xA     => throw new ProtocolException('Server redirection not supported', 'redirect'),
+                0xA     => $this->redirect($body),
                 default => null,
             };
         }
+    }
+
+    /** The Server Redirection PDU (enhanced security): the session is made again elsewhere, unless it only informs. */
+    private function redirect(Reader $body): void
+    {
+        $info = self::redirection(substr($body->data, $body->pos));
+        $this->trace?->log('server redirection', ['flags' => sprintf('0x%x', $info['flags']), 'session' => $info['session'],
+            'to' => implode(' ', self::redirectTargets($info, false)) ?: '(the same computer)',
+            'routing_token' => $info['lb'] !== null, 'user' => $info['user'] !== null, 'cookie' => $info['cookie'] !== null]);
+        if (!($info['flags'] & 0x80)) {                   // (LB_NOREDIRECT: said to the client, not a redirection)
+            throw new Redirection($info);
+        }
+    }
+
+    /**
+     * RDP_SERVER_REDIRECTION_PACKET after the 2 bytes of padding (MS-RDPBCGR 2.2.13.1): the session id, the flags, and each
+     * field its flag announces, in this order, as [u32 length][bytes]: target address, load balance info (the routing token
+     * to send), user, domain, password (a cookie for the target), target FQDN, NetBIOS name, TSV URL, redirection GUID,
+     * target certificate, target addresses.
+     */
+    public static function redirection(string $data): array
+    {
+        $r = new Reader($data);
+        $r->skip(2);                                      // pad2Octets
+        if ($r->u16() !== 0x0400) {                       // SEC_REDIRECTION_PKT
+            throw new ProtocolException('Invalid redirection packet', 'protocol');
+        }
+        $r->skip(2);                                      // its length
+        $info  = ['session' => $r->u32(), 'flags' => $flags = $r->u32(), 'address' => null, 'addresses' => [], 'fqdn' => null, 'netbios' => null,
+                  'lb' => null, 'user' => null, 'domain' => null, 'cookie' => null, 'cert' => null, 'guid' => null, 'pk' => null];
+        $field = static fn() => $r->bytes(min($r->u32(), 65536));
+        // (UTF-16 up to its first null; before, a pattern cut the trailing ones first: on a long run of zeros it gave up, and
+        // the session ended with an internal error, or took minutes of CPU without the PCRE JIT)
+        $text  = static fn(string $b): string => Text::fromUtf16(strlen($b) % 2 ? substr($b, 0, -1) : $b);
+        foreach ([0x1 => 'address', 0x2 => 'lb', 0x4 => 'user', 0x8 => 'domain', 0x10 => 'cookie', 0x100 => 'fqdn', 0x200 => 'netbios',
+                  0x1000 => null, 0x8000 => 'guid', 0x10000 => 'cert', 0x800 => 'addresses'] as $bit => $k) {
+            if (!($flags & $bit)) {
+                continue;
+            }
+            $v = $field();
+            if ($k === 'lb' || $k === 'cookie' || $k === 'guid') {
+                $info[$k] = $v;                           // (bytes: the routing token, the password cookie, the redirection GUID)
+            } elseif ($k === 'cert') {
+                $info['cert'] = self::targetCertificate($text($v));
+            } elseif ($k === 'addresses') {
+                $a = new Reader($v);
+                for ($n = $a->u32(), $i = 0; $i < $n && $i < 32 && $a->left() >= 4; $i++) {
+                    $info['addresses'][] = $text($a->bytes(min($a->u32(), $a->left())));
+                }
+            } elseif ($k !== null) {
+                $info[$k] = $text($v);
+            }
+        }
+        if ($flags & 0x4000) {                            // LB_PASSWORD_IS_PK_ENCRYPTED: for the target only, through RDSTLS
+            [$info['pk'], $info['cookie']] = [$info['cookie'], null];
+        }
+        if (strlen((string)$info['user']) > 512 || strlen((string)$info['domain']) > 512) {   // (more than the Client Info can carry)
+            throw new ProtocolException('Invalid redirection packet', 'protocol');
+        }
+        return $info;
+    }
+
+    /**
+     * The SHA-256 fingerprint of the target's certificate the broker vouches for (TargetCertificate: a Target Certificate
+     * Container in base64, MS-RDPBCGR 2.2.13.1.2: elements of [type, encoding, size, data], the certificate being the one of
+     * type ELEMENT_TYPE_CERTIFICATE (32) in DER (1)); null when there is none.
+     */
+    public static function targetCertificate(string $base64): ?string
+    {
+        $c = base64_decode((string)preg_replace('~\s+~', '', $base64), true);
+        for ($o = 0; is_string($c) && strlen($c) - $o >= 12;) {
+            ['t' => $t, 'e' => $e, 'n' => $n] = unpack('Vt/Ve/Vn', $c, $o);
+            if ($n > strlen($c) - $o - 12) {
+                return null;
+            }
+            if ($t === 32 && $e === 1 && $n > 0) {
+                return hash('sha256', substr($c, $o + 12, $n));   // (as openssl_x509_fingerprint gives it: of the DER)
+            }
+            $o += 12 + $n;
+        }
+        return null;
+    }
+
+    /**
+     * The password a broker gives in its redirection, when it is a password and not an opaque cookie (MS-RDPBCGR 2.2.13.1: not
+     * encrypted, Unicode text with its terminating null): printable text only, or null.
+     */
+    public static function cookiePassword(?string $cookie): ?string
+    {
+        if ($cookie === null || strlen($cookie) < 4 || strlen($cookie) % 2 || substr($cookie, -2) !== "\0\0") {
+            return null;
+        }
+        $u = array_values(unpack('v*', substr($cookie, 0, -2)));
+        foreach ($u as $i => $c) {
+            $hi = $c >= 0xD800 && $c <= 0xDBFF;
+            if ($c < 0x20 || ($c >= 0x7F && $c < 0xA0) || ($c >= 0xDC00 && $c <= 0xDFFF && !(($u[$i - 1] ?? 0) >= 0xD800 && ($u[$i - 1] ?? 0) <= 0xDBFF))
+                || ($hi && !(($u[$i + 1] ?? 0) >= 0xDC00 && ($u[$i + 1] ?? 0) <= 0xDFFF)) || $c === 0xFFFE || $c === 0xFFFF) {
+                return null;                              // (a control character, a broken surrogate: binary, not text)
+            }
+        }
+        return Text::fromUtf16(substr($cookie, 0, -2));
+    }
+
+    /**
+     * The computers a redirection sends the client to, best first; [] for the same one (a routing token without a target
+     * address: MS-RDPBCGR 1.3.8, the token goes back to the server that sent it). By address first, as Windows' own client
+     * does; by name first ($byName) through a gateway, whose policies name the computers.
+     */
+    public static function redirectTargets(array $info, bool $byName): array
+    {
+        if (($info['lb'] ?? null) !== null && !($info['flags'] & 0x1)) {
+            return [];
+        }
+        $names = [$info['fqdn'] ?? null, $info['netbios'] ?? null];
+        $addrs = [$info['address'] ?? null, ...($info['addresses'] ?? [])];
+        $out   = [];
+        foreach ($byName ? [...$names, ...$addrs] : [...$addrs, ...$names] as $t) {
+            if (is_string($t) && ($t = trim($t)) !== '' && strlen($t) <= 253 && !preg_match('~[\x00-\x20\x7f]~', $t)
+                && !in_array(strtolower($t), array_map('strtolower', $out), true)) {
+                $out[] = $t;
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * The options of the connection made again after $info's redirection (to $host at $ip): the routing token only back to
+     * the server that sent it (no target address), the session only when one was given, its user and domain when not empty
+     * (an empty domain too with a user of the form user@domain, which carries its own). Its password, when it gives one as
+     * text and the user's own is not known (signed in on the broker's logon screen, without NLA), signs in with NLA there.
+     */
+    public static function redirected(array $o, array $info, string $host, string $ip): array
+    {
+        $o['host'] = $host;
+        $o['ip']   = $ip;
+        $o['lb']   = $info['flags'] & 0x1 ? '' : (string)($info['lb'] ?? '');
+        unset($o['redirectSession']);
+        if ($info['session'] !== 0) {
+            $o['redirectSession'] = $info['session'];
+        }
+        $upn         = str_contains((string)($info['user'] ?? ''), '@') && ($info['domain'] ?? null) !== null;
+        $o['user']   = ($info['user'] ?? '') !== '' ? $info['user'] : $o['user'];
+        $o['domain'] = ($info['domain'] ?? '') !== '' || $upn ? $info['domain'] : $o['domain'];
+        $o['redirectCookie'] = $info['cookie'] ?? null;
+        if (($o['password'] ?? '') === '' && ($p = self::cookiePassword($info['cookie'] ?? null)) !== null) {
+            $o['password'] = $p;
+        }
+        // a password encrypted with the target's key (LB_PASSWORD_IS_PK_ENCRYPTED): given to it with RDSTLS, as it came,
+        // with the redirection's GUID (MS-RDPBCGR 2.2.17)
+        unset($o['rdstls']);
+        if (($info['pk'] ?? null) !== null) {
+            $o['rdstls'] = ['guid' => (string)($info['guid'] ?? ''), 'password' => $info['pk']];
+        }
+        return $o;
     }
 
     private function license(Reader $r): void
     {
         $type = $r->u8();
         $r->skip(3);
-        $this->lic ??= new Licensing($this->o['user'], $this->o['clientName']);
+        $this->lic ??= new Licensing($this->o['user'], $this->o['clientName'], $this->serverSec[2] ?? '');
         $this->trace?->log('license', ['msg' => [0x01 => 'licenseRequest', 0x02 => 'platformChallenge', 0x03 => 'newLicense', 0x04 => 'upgradeLicense',
             0xFF => 'errorAlert'][$type] ?? sprintf('0x%02x', $type), 'error' => $type === 0xFF ? Trace::hex(substr($r->data, $r->pos, 8)) : null]);
         [$reply, $done] = $this->lic->handle($type, $r);
         if ($reply !== null) {
-            $this->mcsSend($this->ioChannel, pack('vv', 0x0080, 0) . $reply);
+            $this->mcsSend($this->ioChannel, $reply, RdpSecurity::SEC_LICENSE_PKT);
         }
         $this->licensed = $done;
     }
@@ -605,9 +967,21 @@ final class Client
 
     private function fastPath(string $pdu): void
     {
+        $head = ord($pdu[1]) & 0x80 ? 3 : 2;
+        if (ord($pdu[0]) & 0x80) {                    // FASTPATH_OUTPUT_ENCRYPTED: decrypted even when not drawn (RC4 is one stream)
+            if ($this->sec === null) {
+                throw new ProtocolException('Encrypted fast-path update without Standard RDP Security', 'protocol');
+            }
+            $pdu  = str_repeat("\0", $head) . $this->sec->fastOpen(substr($pdu, $head), (bool)(ord($pdu[0]) & 0x40));
+        } elseif ($this->sec !== null && $this->sec->level >= 2) {
+            throw new ProtocolException('Standard RDP Security: a fast-path update in the clear', 'protocol');   // (see RdpSecurity::$level)
+        }
+        if (!$this->active) {
+            return;                                   // before the activation (or between two): not a picture to draw, never piled up
+        }
         $this->drawn++;
         $r = new Reader($pdu);
-        $r->skip(ord($pdu[1]) & 0x80 ? 3 : 2);
+        $r->skip($head);
         while ($r->left() >= 3) {
             $h    = $r->u8();
             $code = $h & 0x0f;
@@ -663,6 +1037,21 @@ final class Client
                 if ($total > self::CHANNEL_MAX) {
                     throw new ProtocolException("Channel message of $total bytes", 'protocol');
                 }
+                unset($this->chanSkip[$id]);
+                if ($total > self::memoryRoom()) {    // left out, the session goes on (a clipboard copy that does not fit is not pasted)
+                    $this->chanSkip[$id] = true;
+                    unset($this->chanBuf[$id], $this->chanLen[$id], $this->chanTotal[$id]);
+                    $this->trace?->log('channel message left out', ['channel' => $this->handlers[$id]->name(), 'bytes' => $total, 'memory_limit' => ini_get('memory_limit')]);
+                    error_log("MuDeskClient: a message of $total bytes of channel " . $this->handlers[$id]->name() . ' was left out: more than the memory limit leaves (memory_limit ' . ini_get('memory_limit') . ')');
+                }
+            }
+            if (isset($this->chanSkip[$id])) {
+                if ($flags & 2) {
+                    unset($this->chanSkip[$id]);
+                }
+                return;
+            }
+            if ($flags & 1) {
                 $this->chanBuf[$id] = [];
                 $this->chanLen[$id] = 0;
                 $this->chanTotal[$id] = $total;
@@ -715,7 +1104,9 @@ final class Client
             $this->sendInput();
             return;
         }
-        if ($count >= 1 && $count <= 255) {
+        if ($this->sec !== null && $count >= 1) {
+            $this->sealedInput($events, $count);
+        } elseif ($count >= 1 && $count <= 255) {
             $hdr = $count < 16 ? chr($count << 2) : "\x00";
             $ext = $count < 16 ? '' : chr($count);
             $len = 2 + strlen($ext) + strlen($events);
@@ -727,6 +1118,28 @@ final class Client
         if ($gapMs > 0) {
             $this->inputAt = microtime(true) + $gapMs / 1000;
         }
+    }
+
+    /**
+     * Fast-path input with Standard RDP Security: FASTPATH_INPUT_ENCRYPTED, the signature (FIPS: its information first) and
+     * the events encrypted, at most 15 a PDU so that their count stays in the header (each event's size from its code).
+     */
+    private function sealedInput(string $events, int $count): void
+    {
+        $sizes = [0 => 2, 1 => 7, 2 => 7, 3 => 1, 4 => 3, 5 => 7, 6 => 5];   // (scancode, mouse, mouse X, sync, unicode, relative mouse, QoE)
+        $all   = [];
+        for ($p = 0, $n = strlen($events); $p < $n && count($all) < $count;) {
+            $size  = $sizes[ord($events[$p]) >> 5] ?? throw new ProtocolException('Unknown input event', 'protocol');
+            $all[] = substr($events, $p, $size);
+            $p    += $size;
+        }
+        foreach (array_chunk($all, 15) as $chunk) {
+            [$sig, $c] = $this->sec->fastSeal(implode('', $chunk));
+            $len = 2 + strlen($sig) + strlen($c);
+            $len = $len < 0x80 ? chr($len) : pack('n', 0x8000 | ($len + 1));
+            $this->t->send(chr((count($chunk) << 2) | 0x80) . $len . $sig . $c);
+        }
+        $this->drawnAtInput = $this->drawn;
     }
 
     /** Sends the input that is due; returns the seconds until the rest is due, or null when nothing waits. */
@@ -786,6 +1199,22 @@ final class Client
         $this->inputAt     = $pasted ? microtime(true) + 2 : 0.0;
         $this->drawnBefore = $pasted ? $this->drawn : null;
         $this->sendInput();
+    }
+
+    /** How many inputs wait (typed text with its pauses, pastes): a guest's typing is not taken past a few. */
+    public function queued(): int
+    {
+        return count($this->inputQueue);
+    }
+
+    /** Releases Ctrl, Shift, Alt and Win (both sides): a guest given control left with one of them held. */
+    public function releaseModifiers(): void
+    {
+        $ev = '';
+        foreach ([[0x1D, 0], [0x1D, 2], [0x2A, 0], [0x36, 0], [0x38, 0], [0x38, 2], [0x5B, 2], [0x5C, 2]] as [$sc, $ext]) {
+            $ev .= chr($ext | 1) . chr($sc);           // fast-path key event, released
+        }
+        $this->input($ev, 8);
     }
 
     /** 1: more text to paste is next in the queue, 2: it waits behind other input, 0: none. */
@@ -855,6 +1284,24 @@ final class Client
             $this->width  = max(200, min(32766, $w & ~1));
             $this->height = max(200, min(32766, $h));
         }
+    }
+
+    /** Where the last mouse event of fast-path input events leaves the pointer (u16 x, u16 y), or null with none. */
+    public static function mouseAt(string $events): ?string
+    {
+        $at = null;
+        for ($o = 0, $n = strlen($events); $o < $n;) {
+            $code = ord($events[$o]) >> 5;            // key 2 bytes, mouse and extended mouse 7, synchronize 1, Unicode 3
+            $len  = [2, 7, 7, 1, 3][$code] ?? 0;
+            if ($len === 0 || $o + $len > $n) {
+                break;
+            }
+            if ($code === 1 || $code === 2) {
+                $at = substr($events, $o + 3, 4);
+            }
+            $o += $len;
+        }
+        return $at;
     }
 
     public function disconnect(): void

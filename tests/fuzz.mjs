@@ -408,6 +408,54 @@ const TARGETS = {
       for (const u of inputs) p.onData(u);
     },
   },
+  localdrive: {                                        // a folder of this computer: the server's requests (as the gateway passes them)
+    cases: 300,
+    gen() {
+      const u16 = (s) => { const b = []; for (const ch of s + '\0') b.push(ch.charCodeAt(0) & 0xff, ch.charCodeAt(0) >> 8); return b; };
+      const path = () => u16(pick(['\\a.txt', '\\d', '\\d\\b.bin', '\\new.txt', '\\', '\\d\\*', '\\*', '\\..\\x', '\\d\\new', String.fromCharCode(...bytes(rnd(12)))]));
+      const le = (n, x) => Array.from({ length: n }, (_, i) => (n === 8 && i >= 4 ? 0 : (x >>> (8 * i)) & 0xff));
+      const inputs = Array.from({ length: 1 + rnd(20) }, (_, cid) => {
+        const major = pick([0x00, 0x00, 0x02, 0x03, 0x04, 0x05, 0x06, 0x0A, 0x0C, 0x0E, 0x11, rnd(32)]), file = rnd(5);
+        const p = path();
+        const body = {
+          0x00: () => [...le(4, pick([0x1, 0x2, 0x40000000, 0x10000, rnd(0x7fffffff)])), ...le(8, 0), ...le(4, pick([0, 0x10, 0x80])), ...le(4, 7), ...le(4, rnd(7)),
+            ...le(4, pick([0, 0x1, 0x40, 0x1000, rnd(0x7fffffff)])), ...le(4, chance(90) ? p.length : rnd(300)), ...p],
+          0x03: () => [...le(4, pick([0, 10, 1 << 20, 0xffffffff])), ...le(8, pick([0, 5, 1 << 30])), ...new Array(20).fill(0)],
+          0x04: () => { const d = bytes(rnd(50)); return [...le(4, d.length + pick([0, 0, 9])), ...le(8, pick([0, 3, 1 << 30])), ...new Array(20).fill(0), ...d]; },
+          0x06: () => { const cls = pick([10, 13, 19, 20, rnd(60)]), b = cls === 10 ? [rnd(2), 0, ...le(4, p.length), ...p] : bytes(rnd(10)); return [...le(4, cls), ...le(4, b.length), ...new Array(24).fill(0), ...b]; },
+          0x0C: () => [...le(4, pick([1, 2, 3, 12, rnd(20)])), rnd(2), ...le(4, p.length), ...new Array(23).fill(0), ...p],
+        }[major]?.() ?? [...le(4, pick([1, 3, 4, 5, 7, 35, rnd(60)])), ...le(4, 0), ...new Array(24).fill(0)];
+        const d = Uint8Array.from([...le(4, 100 + cid), ...le(4, 3), ...le(4, file), ...le(4, cid), ...le(4, major), ...le(4, major === 0x0C ? pick([1, 1, 2]) : 0), ...body]);
+        return chance(10) ? d.subarray(0, rnd(d.length)) : d;
+      });
+      return { opts: { readonly: chance(30) }, inputs };
+    },
+    async run({ opts, inputs }, M, fail) {
+      // a folder in memory as File System Access gives one (a file, a folder with a file in it), or as an upload of a folder
+      const err = (name) => Object.assign(new Error(name), { name });
+      const file = (name, data) => ({ kind: 'file', name, data, async getFile() { return new Blob([this.data]); },
+        async createWritable(o) { let b = o?.keepExistingData ? this.data.slice() : new Uint8Array(0); const f = this; return { async abort() {}, async write(a) { const d = a instanceof Blob ? new Uint8Array(await a.arrayBuffer()) : new Uint8Array(a.data); const at = a.position ?? b.length; if (at > 1 << 20) throw err('QuotaExceededError'); const n = new Uint8Array(Math.max(b.length, at + d.length)); n.set(b); n.set(d, at); b = n; }, async truncate(n) { b = b.slice(0, n); }, async close() { f.data = b; } }; } });
+      const dir = (name, kids) => ({ kind: 'directory', name, kids: new Map(kids.map((k) => [k.name, k])),
+        async getDirectoryHandle(n, o) { const k = this.kids.get(n); if (k?.kind === 'directory') return k; if (k) throw err('TypeMismatchError'); if (!o?.create) throw err('NotFoundError'); const d = dir(n, []); this.kids.set(n, d); return d; },
+        async getFileHandle(n, o) { if (/[\\/]/.test(n) || n === '' || n === '.' || n === '..') throw new TypeError('name'); const k = this.kids.get(n); if (k?.kind === 'file') return k; if (k) throw err('TypeMismatchError'); if (!o?.create) throw err('NotFoundError'); const f = file(n, new Uint8Array(0)); this.kids.set(n, f); return f; },
+        async removeEntry(n) { const k = this.kids.get(n); if (!k) throw err('NotFoundError'); if (k.kind === 'directory' && k.kids.size) throw err('InvalidModificationError'); this.kids.delete(n); },
+        async *entries() { yield* this.kids; } });
+      const fs = opts.readonly ? new M.ListFs([Object.assign(new Blob(['hola']), { name: 'a.txt', lastModified: 1, webkitRelativePath: 'F/a.txt' }),
+        Object.assign(new Blob([new Uint8Array(100)]), { name: 'b.bin', lastModified: 1, webkitRelativePath: 'F/d/b.bin' })])
+        : new M.HandleFs(dir('F', [file('a.txt', new Uint8Array([104, 105])), dir('d', [file('b.bin', new Uint8Array(100))])]));
+      const replies = [];
+      const f = new M.LocalFolder({ send: (no, b) => replies.push([no, b]), list: (no, a) => replies.push([no, a]) });
+      f.use(fs);
+      for (const d of inputs) f.onRequest(d);
+      await f.queue;
+      // each whole request answered once, with its number, of this device and that request (none for a change notification,
+      // nor a cut one)
+      const u32 = (b, o) => new DataView(b.buffer, b.byteOffset).getUint32(o, true);
+      const want = inputs.filter((d) => d.length >= 24 && !(u32(d, 16) === 0x0C && d[20] !== 1));
+      if (replies.length !== want.length) fail(`${replies.length} answers to ${want.length} requests`, 'answers');
+      else if (replies.some(([no, r], i) => no !== u32(want[i], 0) || u32(r, 0) !== 3 || u32(r, 4) !== u32(want[i], 12))) fail('an answer of another device or request', 'answer id');
+    },
+  },
   bulk: {                                              // MPPC, NCRUSH, XCRUSH through frames 10 and 11 of the gateway, or alone
     cases: 300,
     gen() {
@@ -470,7 +518,7 @@ async function work({ target, seed, from, count, progress }) {
   };
   globalThis.EncodedVideoChunk = class { constructor(o) { Object.assign(this, o); } };
   const M = {};
-  for (const m of ['gfx', 'orders', 'rfx', 'rdpgfx', 'bulk']) Object.assign(M, await import(new URL(`../public/assets/${m}.js`, import.meta.url)));
+  for (const m of ['gfx', 'orders', 'rfx', 'rdpgfx', 'bulk', 'localdrive']) Object.assign(M, await import(new URL(`../public/assets/${m}.js`, import.meta.url)));
   const at = new Int32Array(progress), T = TARGETS[target];
   let inputs = 0;
   for (let n = from; n < from + count; n++) {
@@ -480,7 +528,7 @@ async function work({ target, seed, from, count, progress }) {
     problems.length = 0;
     const t0 = performance.now();
     try {
-      T.run(c, M, fail);
+      await T.run(c, M, fail);                         // (a promise for the targets that answer asynchronously)
     } catch (e) {
       if (!e?.fuzz && !expected(e)) fail(`${e?.name ?? typeof e}: ${e?.message ?? e} (${where(e)})`, `${e?.name} ${where(e)}`);
     }

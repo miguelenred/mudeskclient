@@ -46,7 +46,9 @@ final class Xcrush
             $this->old = $this->cur . (string)substr($this->old, strlen($this->cur));
             $this->cur = '';
         }
-        $start = strlen($this->cur);
+        $cur       = $this->cur;
+        $this->cur = '';                                      // ($cur alone holds it: appended in place, not copied)
+        $start = strlen($cur);
         $n     = strlen($data);
         $lit   = 0;                                           // next literal byte
         if (!($l1 & self::L1_NO_COMPRESSION)) {
@@ -58,39 +60,37 @@ final class Xcrush
             if ($lit > $n) {
                 throw new ProtocolException('XCRUSH: bad match count', 'protocol');
             }
+            $m   = $count > 0 ? unpack('v' . 4 * $count, $data, 2) : [];   // the matches: length, output offset, history offset (32 bits)
             $out = 0;                                         // output offset within this block
-            for ($i = 0; $i < $count; $i++) {
-                ['len' => $len, 'at' => $at, 'from' => $from] = unpack('vlen/vat/Vfrom', $data, 2 + 8 * $i);
+            for ($i = 1, $end = 4 * $count; $i < $end; $i += 4) {
+                $len  = $m[$i];
+                $at   = $m[$i + 1];
+                $from = $m[$i + 2] | $m[$i + 3] << 16;
                 if ($at < $out || $at - $out > $n - $lit) {
                     throw new ProtocolException('XCRUSH: bad match', 'protocol');
                 }
-                $this->cur .= substr($data, $lit, $at - $out);   // literals before the match
-                $lit       += $at - $out;
-                $pos        = strlen($this->cur);
+                $cur .= substr($data, $lit, $at - $out);       // literals before the match
+                $lit += $at - $out;
+                $pos  = strlen($cur);
                 if ($pos + $len >= self::SIZE || $from + $len >= self::SIZE) {
                     throw new ProtocolException('XCRUSH: history overflow', 'protocol');
                 }
-                $this->cur .= $this->read($from, $len, $pos);
-                $out        = $at + $len;
+                if ($from + $len <= $pos) {
+                    $cur .= substr($cur, $from, $len);
+                } elseif ($from < $pos) {                     // overlaps what is being written: the bytes between repeat
+                    $cur .= substr(str_repeat(substr($cur, $from, $pos - $from), intdiv($len, $pos - $from) + 1), 0, $len);
+                } else {                                      // past the write position: from before the wrap (zeros if never written)
+                    $old  = (string)substr($this->old, $from, $len);
+                    $cur .= $old . str_repeat("\0", $len - strlen($old));
+                }
+                $out = $at + $len;
             }
         }
-        if (strlen($this->cur) + $n - $lit >= self::SIZE) {
+        if (strlen($cur) + $n - $lit >= self::SIZE) {
             throw new ProtocolException('XCRUSH: history overflow', 'protocol');
         }
-        $this->cur .= substr($data, $lit);
-        return substr($this->cur, $start);
-    }
-
-    /** $len bytes from history offset $from, copied forward as if byte by byte to position $pos. */
-    private function read(int $from, int $len, int $pos): string
-    {
-        if ($from < $pos && $from + $len > $pos) {          // overlaps what is being written: the bytes between repeat
-            return substr(str_repeat(substr($this->cur, $from, $pos - $from), intdiv($len, $pos - $from) + 1), 0, $len);
-        }
-        if ($from + $len <= $pos) {
-            return substr($this->cur, $from, $len);
-        }
-        $old = substr($this->old, $from, $len);              // past the write position: from before the wrap (zeros if never written)
-        return $old . str_repeat("\0", $len - strlen($old));
+        $cur      .= substr($data, $lit);
+        $this->cur = $cur;
+        return substr($cur, $start);
     }
 }

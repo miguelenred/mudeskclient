@@ -31,6 +31,9 @@ final class Files
      */
     public static function clean(string $rel): ?string
     {
+        if (!preg_match('//u', $rel)) {
+            return null;                       // not UTF-8: the checks below (which need it) would be skipped
+        }
         $parts = [];
         foreach (preg_split('~[/\\\\]+~', $rel) as $p) {
             if ($p === '' || $p === '.') {
@@ -127,7 +130,7 @@ final class Files
             if ($path === null || !is_dir($path)) {
                 continue;
             }
-            $names = array_values(array_filter(scandir($path) ?: [], static fn(string $n): bool =>
+            $names = array_values(array_filter(@scandir($path) ?: [], static fn(string $n): bool =>
                 $n !== '.' && $n !== '..' && is_dir("$path/$n") && !self::isLink("$path/$n")));
             usort($names, 'strnatcasecmp');
             $out[] = [$rel, array_slice($names, 0, $max), count($names) > $max];
@@ -220,11 +223,11 @@ final class Files
                 return;
             }
             if (!is_dir($path)) {
-                $out[] = [$name, $path, (int)filesize($path)];
+                $out[] = [$name, $path, (int)@filesize($path)];   // (gone meanwhile: 0, not a warning)
                 return;
             }
             $out[] = [$name . '/', null, 0];
-            $names = array_values(array_diff(scandir($path) ?: [], ['.', '..']));
+            $names = array_values(array_diff(@scandir($path) ?: [], ['.', '..']));
             usort($names, 'strnatcasecmp');
             foreach ($names as $n) {
                 $walk("$path/$n", "$name/$n", $depth + 1);
@@ -247,7 +250,7 @@ final class Files
             return 0;
         }
         if (!is_dir($path)) {
-            return is_file($path) ? (int)filesize($path) : 0;
+            return is_file($path) ? (int)@filesize($path) : 0;
         }
         $total = 0;
         $dirs  = new \RecursiveCallbackFilterIterator(new \RecursiveDirectoryIterator($path, \FilesystemIterator::SKIP_DOTS),
@@ -267,10 +270,13 @@ final class Files
     {
         // the folder is walked outside the counter's lock: walked under it (seconds with many files), a session's writes
         // waited for it
-        $size = self::size(self::root($uid));
-        if ($recount && self::limit($uid) !== 0 && !Sessions::active($uid)) {
-            self::counter($uid, static function (int &$used) use ($size): void {
-                $used = $size;
+        $limit  = self::limit($uid);
+        $before = $recount && $limit !== 0 ? self::counter($uid, static fn(int &$used): int => $used) : 0;
+        $size   = self::size(self::root($uid));
+        if ($recount && $limit !== 0 && !Sessions::active($uid)) {
+            // what was charged while the folder was walked (an upload of another request) is kept: set to the walk alone, it was lost
+            self::counter($uid, static function (int &$used) use ($size, $before): void {
+                $used = max(0, $size + $used - $before);
             });
         }
         return $size;
@@ -333,8 +339,10 @@ final class Files
     private static function limit(string $uid): int
     {
         $limit = self::quota();
-        if ($limit === 0) {
-            self::remove(self::counterFile($uid));
+        if ($limit === 0 && is_file(self::counterFile($uid))) {
+            // emptied, not deleted: a session holding it open kept writing to a deleted file (Linux), or every new open of it
+            // failed while it was "delete pending" (Windows); an empty one is counted again from the folder when needed
+            @file_put_contents(self::counterFile($uid), '');
         }
         return $limit;
     }

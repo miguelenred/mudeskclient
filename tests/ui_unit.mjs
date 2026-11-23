@@ -13,6 +13,7 @@ class Ev {
   constructor(type, o = {}) { Object.assign(this, o); this.type = type; }
   preventDefault() { this.defaultPrevented = true; }
   stopPropagation() { this.stopped = true; }
+  stopImmediatePropagation() { this.stopped = this.immediate = true; }
   getModifierState() { return false; }
 }
 const simple = (el, s) => {
@@ -53,7 +54,11 @@ class El extends Node0 {
   contains(n) { for (; n; n = n.parentNode) if (n === this) return true; return false; }
   addEventListener(t, f) { (this.l[t] ||= []).push(f); }
   removeEventListener(t, f) { this.l[t] = (this.l[t] || []).filter((x) => x !== f); }
-  dispatchEvent(e) { e.target ??= this; for (let n = this; n && !e.stopped; n = n.parentNode) (n.l?.[e.type] || []).forEach((f) => f(e)); return !e.defaultPrevented; }
+  dispatchEvent(e) {
+    e.target ??= this;
+    for (let n = this; n && !e.stopped; n = n.parentNode) for (const f of n.l?.[e.type] || []) { f(e); if (e.immediate) break; }
+    return !e.defaultPrevented;
+  }
   click() { this.dispatchEvent(new Ev('click')); }
   focus() { document.activeElement = this; }
   blur() { if (document.activeElement === this) { document.activeElement = document.body; this.dispatchEvent(new Ev('blur')); } }
@@ -76,20 +81,28 @@ const html = new El('html'), body = new El('body'), appEl = new El('div');
 html.append(body);
 body.append(appEl);
 const timers = [];                                       // fake timers: [{f, ms, every}]
-const winL = {};
+const winL = {}, docL0 = {};
+let docFocus = true;                                     // document.hasFocus(): this window is the one in front
+const listen = (map) => (t, f, o) => {                   // addEventListener with its once and signal options
+  const g = o?.once ? (...a) => { map[t] = (map[t] || []).filter((x) => x !== g); f(...a); } : f;
+  (map[t] ||= []).push(g);
+  o?.signal?.addEventListener?.('abort', () => { map[t] = (map[t] || []).filter((x) => x !== g); });
+};
+const fire = (map, type) => (map[type] || []).slice().forEach((f) => f(new Ev(type)));
 let clock = 1000;
 Object.defineProperty(globalThis, 'performance', { value: { now: () => clock }, configurable: true, writable: true });
 Object.assign(globalThis, {
   Node: Node0,
   document: { documentElement: html, body, activeElement: body, hidden: false, createElement: (t) => new El(t), createElementNS: (_, t) => new El(t),
-    getElementById: (id) => (id === 'app' ? appEl : html.querySelector(`[id=${id}]`)), querySelector: (s) => html.querySelector(s), addEventListener() {} },
-  location: { hash: '#/profile', href: 'https://gateway.test/' },
-  addEventListener: (t, f) => (winL[t] ||= []).push(f),
+    getElementById: (id) => (id === 'app' ? appEl : html.querySelector(`[id=${id}]`)), querySelector: (s) => html.querySelector(s), addEventListener: listen(docL0),
+    hasFocus: () => docFocus },
+  location: { hash: '#/profile', href: 'https://gateway.test/', origin: 'https://gateway.test' },
+  addEventListener: listen(winL),
   removeEventListener: (t, f) => { winL[t] = (winL[t] || []).filter((x) => x !== f); },
   sessionStorage: { getItem: (k) => (k === 'mudesk-data-check' ? '0' : null), setItem() {} },
   matchMedia: () => ({ matches: false }),
   PublicKeyCredential: class {},
-  ResizeObserver: class { observe() {} },
+  ResizeObserver: class { observe() {} disconnect() {} },
   ImageData: class {},
   requestAnimationFrame: () => 0,
   Worker: class { constructor() { workers.push(this); this.sent = []; } postMessage(m) { this.sent.push(m); } terminate() {} },
@@ -98,7 +111,7 @@ Object.assign(globalThis, {
   setInterval: (f, ms) => timers.push({ f, ms, every: true }), clearInterval: (i) => { if (timers[i - 1]) timers[i - 1].f = () => {}; },
   FormData: class {
     constructor(form) {
-      this.e = form.querySelectorAll('input,select,textarea').filter((el) => el.getAttribute('name') && (!/^(checkbox|radio)$/.test(el.getAttribute('type')) || el.checked))
+      this.e = form.querySelectorAll('input,select,textarea').filter((el) => el.getAttribute('name') && !el.disabled && (!/^(checkbox|radio)$/.test(el.getAttribute('type')) || el.checked))
         .map((el) => [el.getAttribute('name'), el.tagName === 'SELECT' ? (el.children.find((o) => o.selected) || el.children[0])?.value
           : /^(checkbox|radio)$/.test(el.getAttribute('type')) ? el.value || 'on' : el.value]);
     }
@@ -289,6 +302,78 @@ await settle();
   clock += 61000;
   runTimers(1000);
   check('session: the web session is kept alive only while the remote session is in use', idle === 0 && pings() - before === 1, `${idle} / ${pings() - before}`);
+}
+
+{
+  // the gateway's messages: one window at a time (before, one each, stacked without end), the same text not shown twice, at
+  // most three waiting; the open one closed, as declined, when the session ends
+  const status = (wk, j) => wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify(j)) } });
+  await go('#/s/c1');
+  for (let i = 0; i < 2; i++) {                          // (the session's options asked, then its password if not saved)
+    const form = appEl.querySelector('.overlay')?.querySelector('form');
+    if (!form) break;
+    const pw = form.querySelector('[name=password]');
+    if (pw) pw.value = 'right';
+    submit(form);
+    await settle();
+  }
+  const wk = workers.at(-1);
+  status(wk, { token: 't3' });
+  status(wk, { connected: true });
+  for (const m of ['Aviso 1', 'Aviso 1', 'Aviso 2', 'Aviso 3', 'Aviso 4', 'Aviso 5']) status(wk, { gateway_message: m });
+  await settle();
+  const open = () => document.body.querySelectorAll('.modal').map((d) => d.querySelector('p')?.textContent);
+  const first = open();
+  byText(t('accept'), document.body)?.click();
+  await settle();
+  const second = open();
+  byText(t('accept'), document.body)?.click();
+  await settle();
+  byText(t('accept'), document.body)?.click();
+  await settle();
+  const rest = open();
+  status(wk, { gateway_message: 'Aviso 6' });
+  await settle();
+  status(wk, { end: 'closed' });
+  wk.onmessage({ data: { t: 'end' } });
+  await settle();
+  check('session: the gateway\'s messages one window at a time, the same text once, three waiting at most; closed when the session ends',
+    JSON.stringify([first, second, rest, open()]) === JSON.stringify([['Aviso 1'], ['Aviso 2'], [], []]), JSON.stringify([first, second, rest, open()]));
+}
+
+{
+  // the gateway refused the password typed: asked again, as when the computer refuses it (before, "Reconnect" sent the same
+  // wrong one, each time a failed sign-in at the gateway); a changed certificate that is not the computer's says whose it is
+  const status = (wk, j) => wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify(j)) } });
+  const list0 = answers['conns.list'];
+  answers['conns.list'] = () => ({ conns: [{ ...CONN, has_pass: false, gw: 'rdg.empresa.com' }], keyboards: [0x040A] });
+  await go('#/profile');
+  await go('#/s/c1');
+  let form = appEl.querySelector('form');
+  form.querySelector('[name=password]').value = 'wrong';
+  submit(form);
+  await settle();
+  let wk = workers.at(-1);
+  status(wk, { token: 't' });
+  status(wk, { end: 'gateway_auth' });
+  wk.onmessage({ data: { t: 'end' } });
+  await settle();
+  form = appEl.querySelector('.overlay')?.querySelector('form');
+  const askedAgain = !!form?.querySelector('[name=password]');
+  if (form) {
+    form.querySelector('[name=password]').value = 'right';
+    submit(form);
+    await settle();
+  }
+  wk = workers.at(-1);
+  status(wk, { token: 't2' });
+  status(wk, { end: 'cert_changed', detail: 'AB:CD', host: 'rdg.empresa.com' });
+  wk.onmessage({ data: { t: 'end' } });
+  await settle();
+  const certSaid = appEl.querySelector('.overlay')?.textContent || '';
+  answers['conns.list'] = list0;
+  check('session: a password the gateway refused asked again; a changed certificate says whose it is', askedAgain && certSaid.startsWith(t('r_cert_changed_host', 'rdg.empresa.com') + t('cert_changed')),
+    JSON.stringify({ askedAgain, certSaid }));
 }
 
 // ------------------------------------------------------------ session toolbar: on-screen keyboard and clipboard history
@@ -734,6 +819,7 @@ await settle();
   const form = appEl.querySelector('.overlay').querySelector('form');
   const pw = form.querySelector('[name=password]');
   if (pw) pw.value = 'pw';
+  form.querySelector('[name=multi]').checked = false;     // (ticked by default: unticked, this screen alone, and then the offer)
   submit(form);
   await settle();
   let wk = workers.at(-1);
@@ -760,13 +846,17 @@ await settle();
   wk.onmessage({ data: { t: 'frame', type: 5, d: new Uint8Array(0) } });   // Display Control is there
   await settle();
   const decode = (p) => (p[0] === 13 ? JSON.parse(new TextDecoder().decode(new Uint8Array(p.slice(1)))) : p[0] === 2 ? ['resize', p[1] | (p[2] << 8), p[3] | (p[4] << 8)] : null);
-  // its bar: full screen, then (in full screen) out of it; Close this screen closes its window
+  // its bar: full screen, then (in full screen) out of it; Close this screen closes its window. Icon buttons, as the
+  // session's toolbar: its full screen icon, and the X (before, white buttons with their names written)
   const sbar = doc.body.querySelector('.screen-bar'), fsb = () => sbar?.querySelector('.fs');
-  const labels = [fsb()?.textContent];
+  const path = (b) => b?.querySelector('path')?.getAttribute('d');
+  const mainFullBtn = appEl.querySelector('.bar').querySelectorAll('button').find((b) => b.getAttribute('title') === t('fullscreen'));
+  const icons = [path(fsb()) === path(mainFullBtn), path(sbar?.querySelector('.close'))?.startsWith('M6 6l12 12'), fsb()?.textContent, sbar?.querySelector('.close')?.getAttribute('aria-label')];
+  const labels = [fsb()?.getAttribute('title')];
   fsb()?.click();
   doc.fullscreenElement = doc.documentElement;
   (docL.fullscreenchange || []).forEach((f) => f());
-  labels.push(fsb()?.textContent);
+  labels.push(fsb()?.getAttribute('title'));
   fsb()?.click();
   const sentNow = rdpSent.length;
   sbar?.querySelector('.close')?.click();                // the other screen's window closed: its monitor leaves
@@ -785,8 +875,10 @@ await settle();
     && JSON.stringify(left) === '[["resize",1920,1080]]' && JSON.stringify(asked) === '["screen 0"]' && JSON.stringify(joined) === '[[[0,0,1920,1080,1],[1920,0,1280,1024,0]]]',
     JSON.stringify({ offered, mons: body.mons, opened, left, asked, joined }));
   check('several screens: the other screen\'s window has a bar with full screen, a way out of it, and Close this screen (its monitor leaves)',
-    JSON.stringify(labels) === JSON.stringify([t('fullscreen'), t('exit_fullscreen')]) && JSON.stringify(fsCalls) === '["enter","exit"]'
-    && sbar?.querySelector('.close')?.textContent === t('close_this_screen') && JSON.stringify(left) === '[["resize",1920,1080]]', JSON.stringify({ labels, fsCalls }));
+    // (full screen was asked for: the other screen's window asks for it too as it opens, both times)
+    JSON.stringify(labels) === JSON.stringify([t('fullscreen'), t('exit_fullscreen')]) && JSON.stringify(fsCalls) === '["enter","enter","exit","enter"]'
+    && sbar?.querySelector('.close')?.getAttribute('title') === t('close_this_screen') && JSON.stringify(left) === '[["resize",1920,1080]]'
+    && JSON.stringify(icons) === JSON.stringify([true, true, '', t('close_this_screen')]), JSON.stringify({ labels, fsCalls, icons }));
   globalThis.matchMedia = media;
   window.open = open0;
   delete screen.isExtended;
@@ -813,6 +905,7 @@ await settle();
   const form = appEl.querySelector('.overlay').querySelector('form');
   const pw = form.querySelector('[name=password]');
   if (pw) pw.value = 'pw';
+  form.querySelector('[name=multi]').checked = false;     // (ticked by default: unticked, this screen alone, and then the offer)
   submit(form);
   await settle();
   let wk = workers.at(-1);
@@ -873,6 +966,309 @@ await settle();
   }
   check('several screens: the watcher closes the other screen\'s window once the session\'s window is gone, once a second',
     JSON.stringify(out) === JSON.stringify({ session: [0, 1000], closed: [1, 1000], otherPage: [1, 1000], otherSite: [1, 1000], none: [1, 1000] }), JSON.stringify(out));
+}
+
+// ------------------------------------------------------------ start in full screen (connect dialog)
+
+{
+  // "Start in full screen": on by default (off only if the user unticks it, then remembered with the options); this window in
+  // full screen with the click on Connect, also without "Use all my screens" (before, only that option went to full screen,
+  // and always). A window the browser keeps out of full screen (allowed only from a click in that window, unless a policy
+  // allows it) goes to it with its first press on the remote screen, which reaches no further (a click on the remote
+  // computer the user did not mean); once pressed in full screen, the presses are the session's. A connection opened
+  // without the dialog asks for it at once (a policy may allow it) and on its first press
+  const asked = [], rf0 = El.prototype.requestFullscreen;
+  let refuse = false, onAsk = null, held = null;          // held: the requests left pending, answered by the test
+  El.prototype.requestFullscreen = function (o) {
+    asked.push(this.className.split(' ')[0] + (o?.screen ? ' ' + o.screen.left : ''));
+    onAsk?.();
+    if (held) return new Promise((ok, no) => held.push([ok, no]));
+    return refuse ? Promise.reject(new TypeError('Fullscreen request denied')) : rf0.call(this);
+  };
+  const press = async (el, id) => {
+    const n = rdpSent.length, down = new Ev('pointerdown', { button: 0, buttons: 1, pointerId: id, pointerType: 'mouse', clientX: 30, clientY: 30 });
+    el.dispatchEvent(down);
+    el.dispatchEvent(new Ev('pointerup', { button: 0, buttons: 0, pointerId: id, pointerType: 'mouse', clientX: 30, clientY: 30 }));
+    await settle();
+    return [rdpSent.length - n > 0, !!down.immediate];   // [reached the remote computer, stopped]
+  };
+  const open = async (setup) => {
+    Object.assign(CONN, { clipboard: false, ask: true, has_pass: false, kbd: 0x040A, full: true }, setup);
+    await go('#/conns');
+    await go('#/s/c1');
+    return appEl.querySelector('.overlay')?.querySelector('form');
+  };
+  const connected = async (token) => {
+    const wk = workers.at(-1);
+    for (const j of [{ token }, { connected: true }]) wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify(j)) } });
+    await settle();
+  };
+  // the dialog: ticked (also when the connection says nothing of it), among the options (two columns where they fit);
+  // unticked and remembered
+  let form = await open({ full: undefined });
+  const shown = [!!form.querySelector('.conn-opts')?.querySelector('[name=full]'), form.querySelector('[name=full]')?.checked];
+  form.querySelector('[name=password]').value = 'pw';
+  form.querySelector('[name=full]').checked = false;
+  form.querySelector('[name=remember]').checked = true;
+  asked.length = 0;
+  submit(form);
+  await settle();
+  const remembered = calls.filter((c) => c.action === 'conns.options').at(-1)?.opts?.full;
+  const offAsked = asked.length;
+  await connected('t30');
+  const offPress = await press(appEl.querySelector('canvas'), 1);
+  // remembered off: unticked; ticked again: full screen with Connect, then the first press (kept out of it) goes there
+  form = await open({ full: false });
+  const offShown = form.querySelector('[name=full]')?.checked;
+  form.querySelector('[name=full]').checked = true;
+  form.querySelector('[name=password]').value = 'pw';
+  asked.length = 0;
+  submit(form);
+  await settle();
+  const onAsked = asked.splice(0);
+  await connected('t31');
+  const canvas = appEl.querySelector('canvas');
+  const first = [...await press(canvas, 2), asked.splice(0)];
+  document.fullscreenElement = appEl.querySelector('.session');
+  const inFull = await press(canvas, 3);                  // pressed in full screen: settled
+  delete document.fullscreenElement;
+  const later = [...await press(canvas, 4), asked.splice(0)];
+  // without the dialog (a saved password, "do not ask"): asked for at once, then at the first press
+  await open({ ask: false, has_pass: true });
+  const direct = asked.splice(0);
+  await connected('t32');
+  const directPress = [...await press(appEl.querySelector('canvas'), 5), asked.splice(0)];
+  // a first press whose release went elsewhere (off the canvas): the next press's release still reaches the session (it was
+  // taken for the first one's, and the remote button stayed down)
+  await open({ ask: false, has_pass: true });
+  await connected('t35');
+  const c6 = appEl.querySelector('canvas'), pev = (type, buttons) => new Ev(type, { button: 0, buttons, pointerId: 1, pointerType: 'mouse', clientX: 30, clientY: 30 });
+  c6.dispatchEvent(pev('pointerdown', 1));
+  document.fullscreenElement = appEl.querySelector('.session');
+  const relDown = pev('pointerdown', 1), relUp = pev('pointerup', 0);
+  c6.dispatchEvent(relDown);
+  c6.dispatchEvent(relUp);
+  await settle();
+  delete document.fullscreenElement;
+  const lostRelease = [!!relDown.immediate, !!relUp.immediate];
+  asked.length = 0;
+  await open({ ask: false, has_pass: true, full: false });
+  const directOff = asked.splice(0);
+  // a finger's (or a pen's) press: browsers let a page go to full screen only when it is lifted (a mouse's, when pressed);
+  // the whole press kept from the session, its moves too (one that moved stayed there as a second finger for good)
+  await open({ ask: false, has_pass: true });
+  await connected('t39');
+  asked.length = 0;
+  const cv = appEl.querySelector('canvas'), tev = (type) => new Ev(type, { button: 0, buttons: type === 'pointerup' ? 0 : 1, pointerId: 9, pointerType: 'touch', clientX: 30, clientY: 30 });
+  const tDown = tev('pointerdown'), tMove = tev('pointermove'), tUp = tev('pointerup');
+  cv.dispatchEvent(tDown);
+  const atDown = asked.splice(0);
+  cv.dispatchEvent(tMove);
+  cv.dispatchEvent(tUp);
+  await settle();
+  const atUp = asked.splice(0);
+  check('start in full screen: a finger\'s press asks for it when lifted (not when pressed), the press and its moves kept from the session',
+    JSON.stringify([atDown, atUp, !!tDown.immediate, !!tMove.immediate, !!tUp.immediate]) === JSON.stringify([[], ['session'], true, true, true]),
+    JSON.stringify({ atDown, atUp, down: !!tDown.immediate, move: !!tMove.immediate, up: !!tUp.immediate }));
+  // in full screen, then out of it: left in the window in front (Esc: the user's), the next press is the session's; taken
+  // out while another window was in front (Firefox, as it comes, when a window opens or comes up), its first press brings
+  // it back (before: whichever, by the time it had been in full screen, 2 s)
+  const fsOut = async (inFront, token) => {
+    await open({ ask: false, has_pass: true });
+    await connected(token);
+    asked.length = 0;
+    document.fullscreenElement = appEl.querySelector('.session');
+    fire(docL0, 'fullscreenchange');
+    docFocus = inFront;
+    delete document.fullscreenElement;
+    fire(docL0, 'fullscreenchange');
+    docFocus = true;
+    return [...await press(appEl.querySelector('canvas'), 7), asked.splice(0)];
+  };
+  const leftByUser = await fsOut(true, 't36'), takenOut = await fsOut(false, 't37');
+  check('start in full screen: left in the window in front, the presses are the session\'s; taken out while another window was in front, its first press brings it back',
+    JSON.stringify([leftByUser, takenOut]) === JSON.stringify([[true, false, []], [false, true, ['session']]]), JSON.stringify({ leftByUser, takenOut }));
+  // refused while the window is not in front (Firefox gives full screen only to the window in front): asked again when it
+  // comes in front (its focus event: no timers), once; refused in front, it is left to its first press
+  refuse = true;
+  docFocus = false;
+  asked.length = 0;
+  await open({ ask: false, has_pass: true });
+  await settle();
+  const notFront = asked.splice(0);
+  docFocus = true;
+  fire(winL, 'focus');
+  await settle();
+  const cameFront = asked.splice(0);
+  fire(winL, 'focus');
+  await settle();
+  const cameAgain = asked.splice(0);
+  await open({ ask: false, has_pass: true });
+  await settle();
+  const inFront = asked.splice(0);
+  fire(winL, 'focus');
+  await settle();
+  const inFrontFocus = asked.splice(0);
+  // not in front when asked, in front by the time it was refused (its focus event already gone): asked again at once
+  docFocus = false;
+  onAsk = () => { docFocus = true; onAsk = null; };
+  await open({ ask: false, has_pass: true });
+  await settle();
+  const meanwhile = asked.splice(0);
+  fire(winL, 'focus');
+  await settle();
+  const meanwhileFocus = asked.splice(0);
+  refuse = false;
+  // a press while a request is pending (Chrome 158 refused the press's request while the one asked for as its window came
+  // in front, a moment before the press, was pending): its request made once that one is answered
+  held = [];
+  await open({ ask: false, has_pass: true });
+  await connected('t38');
+  const pending = asked.splice(0);
+  const pressed = await press(appEl.querySelector('canvas'), 8);
+  const whilePending = asked.splice(0);
+  held.shift()[1](new TypeError('Fullscreen request denied'));
+  await settle();
+  const answered = asked.splice(0);
+  held.splice(0).forEach(([ok]) => ok());
+  held = null;
+  check('start in full screen: a press while a request is pending asks once that one is answered (not refused with it)',
+    JSON.stringify([pending, pressed, whilePending, answered]) === JSON.stringify([['session'], [false, true], [], ['session']]),
+    JSON.stringify({ pending, pressed, whilePending, answered }));
+  check('start in full screen: refused while not in front, asked again when the window comes in front (once, or at once if it came meanwhile); refused in front, not asked again',
+    JSON.stringify([notFront, cameFront, cameAgain, inFront, inFrontFocus, meanwhile, meanwhileFocus])
+    === JSON.stringify([['session'], ['session'], [], ['session'], [], ['session', 'session'], []]),
+    JSON.stringify({ notFront, cameFront, cameAgain, inFront, inFrontFocus, meanwhile, meanwhileFocus }));
+  check('start in full screen: on by default among the options, unticked and remembered; full screen with Connect, then at the first press (which goes no further), the presses the session\'s once in full screen; at once without the dialog',
+    JSON.stringify([shown, remembered, offAsked, offPress, offShown, onAsked, first, inFull, later, direct, directPress, lostRelease, directOff])
+    === JSON.stringify([[true, true], false, 0, [true, false], false, ['session'], [false, true, ['session']], [true, false], [true, false, []], ['session'], [false, true, ['session']], [false, false], []]),
+    JSON.stringify({ shown, remembered, offAsked, offPress, offShown, onAsked, first, inFull, later, direct, directPress, lostRelease, directOff }));
+
+  // with "Use all my screens" (Window Management API): every screen's window asked for full screen (this one on its screen;
+  // the other at once and again from itself, brought to the front: a policy, or a Firefox setting, may allow it), and the
+  // other one at its first press; without "Start in full screen", the other screen's window opens and nothing is full screen
+  const screens = [{ left: 0, top: 0, width: 1920, height: 1080, isPrimary: true, availLeft: 0, availTop: 0, availWidth: 1920, availHeight: 1040 },
+    { left: 1920, top: 0, width: 1280, height: 1024, isPrimary: false, availLeft: 1920, availTop: 0, availWidth: 1280, availHeight: 984 }];
+  const [media, open0] = [globalThis.matchMedia, window.open];
+  globalThis.matchMedia = () => ({ matches: false });
+  screen.isExtended = true;
+  window.getScreenDetails = async () => ({ screens, currentScreen: screens[0] });
+  const mkWin = (frontOnly = false) => {               // frontOnly: full screen only for the window in front (Firefox)
+    const reqs = [], later = [], wl = {}, st = { front: !frontOnly };
+    const doc = { title: '', body: new El('body'), fullscreenElement: null, addEventListener() {}, exitFullscreen: async () => {}, hasFocus: () => st.front,
+      documentElement: { requestFullscreen: () => { reqs.push('full'); return st.front ? Promise.resolve() : Promise.reject(new TypeError('Fullscreen request denied')); } } };
+    doc.createElement = (tag) => Object.assign(new El(tag), { ownerDocument: doc });
+    doc.defaultView = { document: doc, innerWidth: 1280, innerHeight: 984, addEventListener: listen(wl), setTimeout: (f) => later.push(f), clearTimeout() {},
+      close() {}, focus: () => reqs.push('focus') };
+    return { w: doc.defaultView, doc, reqs, later, st, fire: (type) => fire(wl, type) };
+  };
+  const both = async (full) => {
+    const win = mkWin();
+    let opened = 0;
+    window.open = () => { opened++; return win.w; };
+    form = await open({});
+    form.querySelector('[name=password]').value = 'pw';
+    form.querySelector('[name=multi]').checked = true;
+    form.querySelector('[name=full]').checked = full;
+    asked.length = 0;
+    submit(form);
+    await settle();
+    const atOnce = [opened, asked.splice(0), win.reqs.splice(0)];
+    win.later.splice(0).forEach((f) => f());               // (its bar tucked, and full screen asked for again from it)
+    const again = win.reqs.splice(0);
+    await connected(full ? 't33' : 't34');
+    const p = await press(win.doc.body.querySelector('canvas'), 6);
+    return [...atOnce, again, p, win.reqs.splice(0)];
+  };
+  const allFull = await both(true), allNot = await both(false);
+  check('start in full screen with all the screens: this one on its screen, the other screen\'s window at once (no timers asking again), then at its first press; without it, the other screen\'s window opens and nothing is in full screen',
+    JSON.stringify([allFull, allNot]) === JSON.stringify([[1, ['session 0'], ['full'], [], [false, true], ['full']], [1, [], [], [], [true, false], []]]),
+    JSON.stringify({ allFull, allNot }));
+  // without the API (Firefox, Safari): the other screen found by a window opened past the edge; that window and this one in
+  // full screen only if chosen (before, this one always)
+  delete window.getScreenDetails;
+  delete screen.isExtended;
+  const ff = async (full) => {
+    const win = mkWin(true);
+    Object.assign(win.w, { screen: { availLeft: 1920, availTop: 0, availWidth: 1280, availHeight: 984, width: 1280, height: 1024 }, screenX: 1920, screenY: 0, resizeTo() {} });
+    let activation = false;                              // the click's (Firefox: one new window per click; full screen takes it)
+    onAsk = () => { activation = false; };
+    window.open = () => { asked.push(activation ? 'open' : 'blocked'); return activation ? win.w : null; };
+    form = await open({});
+    form.querySelector('[name=password]').value = 'pw';
+    form.querySelector('[name=multi]').checked = true;
+    form.querySelector('[name=full]').checked = full;
+    asked.length = 0;
+    activation = true;
+    submit(form);
+    await settle();
+    const atOnce = [asked.splice(0), win.reqs.splice(0), !!win.doc.body.querySelector('canvas')];
+    win.st.front = true;                                 // that window comes in front
+    win.fire('focus');
+    await settle();
+    const front = win.reqs.splice(0);
+    win.fire('focus');
+    await settle();
+    onAsk = null;
+    return [...atOnce, front, win.reqs.splice(0)];
+  };
+  const ffFull = await ff(true), ffNot = await ff(false);
+  // with the microphone (and camera) ticked, whether this computer has a camera is asked for after the window opened and
+  // full screen was asked for: in the click itself, before waiting (Firefox and Safari count the click only while handling it)
+  const nav0 = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', { value: { ...globalThis.navigator, mediaDevices: { enumerateDevices: () => new Promise(() => {}) } }, configurable: true });
+  CONN.mic = true;
+  const ffMic = (await ff(true)).slice(0, 2);
+  CONN.mic = false;
+  if (nav0) Object.defineProperty(globalThis, 'navigator', nav0);
+  else delete globalThis.navigator;
+  check('start in full screen without the Window Management API: the other screen\'s window opened first (asking for full screen first took the click: the window was blocked), then this one in full screen; that window refused until it comes in front, then asked once; nothing if not chosen',
+    JSON.stringify([ffFull, ffNot, ffMic]) === JSON.stringify([[['open', 'session'], ['full'], true, ['full'], []], [['open'], [], true, [], []], [['open', 'session'], ['full']]]),
+    JSON.stringify({ ffFull, ffNot, ffMic }));
+  // "Use all my screens" ticked by default as "Start in full screen" (before, only in Firefox, once its other screen was
+  // found): Chrome and Edge with several screens; Firefox and Safari once the other screen was found (they cannot know
+  // before, and a computer with one screen would get the looking window at every connection); unticked and remembered
+  const multiBox = async (setup) => {
+    const f = await open(setup);
+    const box = f.querySelector('[name=multi]');
+    return box ? box.checked : 'none';
+  };
+  const store = new Map();
+  globalThis.localStorage = { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, String(v)) };
+  const ffUnknown = await multiBox({ multi: undefined });
+  form = appEl.querySelector('.overlay').querySelector('form');     // remembered so, its box unticked as it came: not kept as off
+  form.querySelector('[name=password]').value = 'pw';
+  form.querySelector('[name=remember]').checked = true;
+  window.open = () => null;
+  submit(form);
+  await settle();
+  const unknownSaved = 'multi' in (calls.filter((c) => c.action === 'conns.options').at(-1)?.opts || { multi: 1 });
+  store.set('mudesk-other-screen', JSON.stringify({ x: 1920, y: 0, w: 1280, h: 1024 }));
+  const ffKnown = await multiBox({ multi: undefined }), ffOff = await multiBox({ multi: false });
+  screen.isExtended = true;
+  window.getScreenDetails = async () => ({ screens, currentScreen: screens[0] });
+  const apiOn = await multiBox({ multi: undefined }), apiOff = await multiBox({ multi: false });
+  screen.isExtended = false;
+  const apiOne = await multiBox({ multi: undefined });   // one screen: not offered
+  screen.isExtended = true;
+  form = await open({ multi: undefined });
+  form.querySelector('[name=password]').value = 'pw';
+  form.querySelector('[name=multi]').checked = false;
+  form.querySelector('[name=remember]').checked = true;
+  window.open = () => mkWin().w;
+  submit(form);
+  await settle();
+  const multiSaved = calls.filter((c) => c.action === 'conns.options').at(-1)?.opts?.multi;
+  delete globalThis.localStorage;
+  check('use all my screens: ticked by default (Chrome and Edge with several screens; Firefox once the other screen was found), unticked and remembered',
+    JSON.stringify([ffUnknown, unknownSaved, ffKnown, ffOff, apiOn, apiOff, apiOne, multiSaved]) === JSON.stringify([false, false, true, false, true, false, 'none', false]),
+    JSON.stringify({ ffUnknown, unknownSaved, ffKnown, ffOff, apiOn, apiOff, apiOne, multiSaved }));
+  globalThis.matchMedia = media;
+  window.open = open0;
+  delete screen.isExtended;
+  delete window.getScreenDetails;
+  El.prototype.requestFullscreen = rf0;
+  Object.assign(CONN, { ask: true, has_pass: false, full: true, multi: undefined });
 }
 
 // ------------------------------------------------------------ several screens without the API (Firefox, Safari)
@@ -999,12 +1395,12 @@ await settle();
     session_idle_minutes: 30, rdp_idle_minutes: 0, max_sessions_per_user: 3, max_sessions_total: 20, reconnect_attempts: 10, audit_retention_days: 90,
     files_quota_mb: 500, totp_required: true, trace_all: false };
   let sent = null;
-  answers['admin.settings'] = (b) => (b.settings ? (sent = b.settings, { error: 'totp_required_self' }) : { settings });
+  answers['admin.settings'] = (b) => (b.settings ? (sent = b.settings, { error: 'totp_required_self' }) : { settings: { ...settings, timezone: '' }, server_timezone: 'Europe/Madrid' });
   STATE.user.targets_all = true;
   // users: administrator rights are a box (several administrators), unticked for a new user and ticked for an administrator
-  const saves = [];
+  const saves = [], hoursSent = [];
   answers['admin.users'] = () => ({ users: [{ id: 'u9', username: 'jefa', role: 'admin', enabled: true, totp: false, passkeys: [], max_sessions: 0, last_login: null }] });
-  answers['admin.user.save'] = (b) => { saves.push([b.role, b.username ?? b.id]); return { user: {} }; };
+  answers['admin.user.save'] = (b) => { saves.push([b.role, b.username ?? b.id]); hoursSent.push(b.hours); return { user: {} }; };
   await go('#/admin/users');
   check('admin: warned while all remote computers are allowed', appEl.textContent.includes(t('targets_all_warn')));
   byText(t('new_user')).click();
@@ -1023,18 +1419,51 @@ await settle();
   const box1 = editForm?.querySelectorAll('input').find((i) => i.getAttribute('name') === 'admin');
   const ticked1 = !!box1?.checked;
   box1.checked = false;
+  // sign-in hours: off by default (any time); turned on, the working days ticked and Saturday added, the times as shown
+  const hoursOff = editForm.querySelector('input[name=hours_on]')?.checked === false;
+  editForm.querySelector('input[name=hours_on]').checked = true;
+  editForm.querySelector('input[name=day_6]').checked = true;
   byText(t('save'), document.body.querySelector('.modal')).click();
   await settle();
   check('admin: administrator rights as a box (unticked for a new user, ticked for an administrator), several possible',
     box0?.getAttribute('type') === 'checkbox' && !role0 && ticked1 && JSON.stringify(saves) === JSON.stringify([['admin', 'nuevo'], ['user', 'u9']]),
     JSON.stringify({ type: box0?.getAttribute('type'), role0, ticked1, saves }));
+  check('admin: sign-in hours of a user, off by default (sent as none), sent with the days ticked and the times',
+    hoursOff && JSON.stringify(hoursSent) === JSON.stringify([null, { days: [1, 2, 3, 4, 5, 6], from: '08:00', to: '18:00' }]), JSON.stringify({ hoursOff, hoursSent }));
   await go('#/admin/settings');
   const total = appEl.querySelector('input[name=max_sessions_total]');
   check('admin: RDP sessions of all users, with its help', total?.value === 20 && appEl.textContent.includes(t('s_max_sessions_total_help')));
+  const tzField = appEl.querySelector('input[name=timezone]');
+  const tzShown = tzField?.getAttribute('placeholder') === 'Europe/Madrid' && appEl.textContent.includes(t('s_timezone_help', 'Europe/Madrid'));
   byText(t('save')).click();
   await settle();
+  check('admin: the time zone of the sign-in hours, empty meaning the server one (shown), sent', tzShown && sent?.timezone === '', JSON.stringify({ tzShown, tz: sent?.timezone }));
   check('admin: sent, and 2FA for everyone refused while the administrator has none, said so', sent?.max_sessions_total === 20
     && appEl.querySelectorAll('.error').some((e) => e.textContent === t('e_totp_required_self')), JSON.stringify(sent));
+}
+
+// ------------------------------------------------------------ administration: an auditor reads the audit and the sessions only
+
+{
+  // the Administration link is there; its tabs are the audit log (first) and the active sessions, without "End"; any other
+  // tab asked for by its address shows the audit log; an administrator gives the role with its box
+  const role = STATE.user.role;
+  STATE.user.role = 'auditor';
+  answers['admin.sessions'] = () => ({ sessions: [{ sid: 's1', user: 'ana', conn: 'Oficina', host: 'pc', ip: '1.2.3.4', started: '2026-11-20T10:00:00Z' }] });
+  await go('#/admin/sessions');
+  const tabsOf = () => appEl.querySelectorAll('a').filter((a) => a.closest('nav.tabs'));
+  const navAdmin = appEl.querySelectorAll('a').some((a) => a.getAttribute('href') === '#/admin');
+  const tabLinks = tabsOf().map((a) => a.getAttribute('href'));
+  const noEnd = appEl.textContent.includes('Oficina') && !byText(t('terminate'));
+  await go('#/admin/users');
+  const usersBlocked = tabsOf().find((a) => a.className.includes('active'))?.getAttribute('href') === '#/admin/audit';
+  STATE.user.role = role;
+  await go('#/admin/sessions');
+  const endForAdmin = !!byText(t('terminate'));
+  check('auditor: the administration with the audit log and the active sessions only, no session ended; an administrator still ends them',
+    navAdmin && JSON.stringify(tabLinks) === JSON.stringify(['#/admin/audit', '#/admin/sessions']) && noEnd && usersBlocked && endForAdmin,
+    JSON.stringify({ navAdmin, tabLinks, noEnd, usersBlocked, endForAdmin }));
+  delete answers['admin.sessions'];
 }
 
 // ------------------------------------------------------------ administration: saving RDP passwords can be forbidden
@@ -1165,7 +1594,105 @@ await settle();
     JSON.stringify({ appField, app: savedConns.at(-1)?.app }));
   check('connections: the editor\'s RemoteApp fields folded for a desktop connection, unfolded for one with a program',
     JSON.stringify(folded) === JSON.stringify([true, null, t('remote_app_section'), true]) && unfolded === '', JSON.stringify({ folded, unfolded }));
+  // Wake-on-LAN in the editor: folded without a MAC address; what is typed is sent with the connection
+  savedConns.length = 0;
+  byText(t('new_conn'))?.click();
+  await settle();
+  const wm = document.body.querySelector('.modal');
+  const wolBox = wm?.querySelector('.wol-fields');
+  const wolFolded = !!wolBox && !wolBox.getAttribute('open') && wolBox.querySelector('summary')?.textContent === t('wol_section');
+  wm.querySelector('[name=host]').value = 'pc.apagado';
+  wm.querySelector('[name=wol]').value = ' AA:BB:CC:DD:EE:02 ';
+  wm.querySelector('[name=wol_ip]').value = '192.168.1.255';
+  const vmBox = wm.querySelector('.vm-fields');
+  const vmFolded = !!vmBox && !vmBox.getAttribute('open') && vmBox.querySelector('summary')?.textContent === t('vm_section');
+  wm.querySelector('[name=vm]').value = '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0';
+  wm.querySelector('[name=vm_enhanced]').checked = true;
+  byText(t('save'), document.body)?.click();
+  for (let i = 0; i < 3; i++) await settle();
+  check('connections: Wake-on-LAN and Hyper-V fields folded in the editor, what is typed saved with the connection',
+    wolFolded && savedConns[0]?.wol === 'AA:BB:CC:DD:EE:02' && savedConns[0]?.wol_ip === '192.168.1.255'
+    && vmFolded && savedConns[0]?.vm === '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0' && savedConns[0]?.vm_enhanced === true, JSON.stringify({ wolFolded, vmFolded, saved: savedConns[0] }));
+  // the editor in columns where they fit (app.css, .conn-edit): the password among the computer's fields, beside the user
+  // and the domain; the four folded sections side by side; the advanced options' lists, boxes and performance in columns
+  byText(t('new_conn'))?.click();
+  await settle();
+  const em = document.body.querySelector('.modal'), ef = em?.querySelector('form');
+  const inGroup = (sel, names) => names.filter((n) => ef.querySelector(`[name=${n}]`)?.closest(sel)?.closest('form') === ef);
+  const layout = {
+    form: ef?.className,
+    main: ef?.querySelector('.cols')?.querySelectorAll('input').map((i) => i.getAttribute('name')),
+    pw: ef?.querySelector('.cols')?.querySelector('.conn-pw')?.querySelector('[name=password]') ? 'beside' : 'apart',
+    sections: ef?.querySelector('.conn-sections')?.querySelectorAll('details').map((d) => d.className),
+    selects: inGroup('.conn-selects', ['kbd', 'bpp', 'gfx', 'security', 'resize', 'paste']),
+    checks: inGroup('.conn-checks', ['clipboard', 'drive', 'audio', 'mic', 'printer', 'touch', 'ask']),
+    perf: inGroup('.conn-perf', ['perf_wallpaper', 'perf_themes', 'perf_smoothing', 'perf_animations', 'perf_drag']).length,
+    // (every modal window: its content scrolls between the title and the buttons, always in sight)
+    scrolls: ef?.parentNode?.className === 'modal-body' && JSON.stringify(em.children.map((c) => c.tagName + '.' + c.className)) === '["H2.","DIV.modal-body","DIV.row end modal-foot"]',
+    buttons: em.querySelector('.modal-foot')?.parentNode === em ? em.querySelector('.modal-foot').querySelectorAll('button').map((b) => b.textContent) : null,
+  };
+  byText(t('cancel'), document.body)?.click();
+  await settle();
+  check('connections: the editor in columns (the password beside the user, the folded sections side by side, the advanced options in columns); its content scrolls, its buttons always in sight',
+    JSON.stringify(layout) === JSON.stringify({ form: 'conn-edit', main: ['name', 'group', 'host', 'port', 'user', 'domain', 'password'], pw: 'beside',
+      sections: ['rail-fields', 'vm-fields', 'farm-fields', 'wol-fields'], selects: ['kbd', 'bpp', 'gfx', 'security', 'resize', 'paste'],
+      checks: ['clipboard', 'drive', 'audio', 'mic', 'printer', 'touch', 'ask'], perf: 5, scrolls: true, buttons: [t('cancel'), t('save')] }), JSON.stringify(layout));
   delete answers['conns.save'];
+}
+
+// ------------------------------------------------------------ manual connections, not saved
+
+{
+  // only for whoever may make connections; its form without name, group, password or "ask" (always asked), said not saved;
+  // Connect has the gateway keep it in the web session and opens its session in a tab opened in that click (one opened once
+  // the answer came would be blocked), closed if the gateway refuses; that tab finds it among the web session's ones, and its
+  // connect dialog asks for the password without offering to save it or to remember the options
+  const was = STATE.user.create_conns;
+  STATE.user.create_conns = false;
+  await go('#/profile');
+  await go('#/conns');
+  const hidden = !byText(t('occasional_conn'));
+  STATE.user.create_conns = was;
+  await go('#/profile');
+  await go('#/conns');
+  byText(t('occasional_conn'))?.click();
+  await settle();
+  const m = document.body.querySelectorAll('.modal').at(-1);
+  const absent = ['name', 'group', 'password', 'ask'].map((n) => !m?.querySelector(`[name=${n}]`));
+  const said = (m?.textContent || '').includes(t('occasional_note')) && (m?.textContent || '').startsWith(t('occasional_conn'));
+  m.querySelector('[name=host]').value = 'pc.una.vez';
+  m.querySelector('[name=user]').value = 'invitado';
+  const tabs = [], open0 = window.open;
+  window.open = (url, name) => { const tab = { url, name, opener: 'x', closed: false, asked: calls.length, location: { href: '' }, close() { this.closed = true; } }; tabs.push(tab); return tab; };
+  answers['conns.occasional'] = (b) => ({ conn: { ...b.conn, id: 'o1234', name: b.conn.host, occasional: true, has_pass: false } });
+  const n0 = calls.length;
+  byText(t('connect'), m)?.click();
+  for (let i = 0; i < 3; i++) await settle();
+  const sent = calls.slice(n0).find((c) => c.action === 'conns.occasional')?.conn;
+  const gone = !document.body.querySelectorAll('.modal').includes(m);
+  answers['conns.occasional'] = () => ({ error: 'conns_locked' });
+  byText(t('occasional_conn'))?.click();
+  await settle();
+  const m2 = document.body.querySelectorAll('.modal').at(-1);
+  m2.querySelector('[name=host]').value = 'pc.dos';
+  byText(t('connect'), m2)?.click();
+  for (let i = 0; i < 3; i++) await settle();
+  const refused = [tabs[1]?.closed, document.body.querySelectorAll('.modal').includes(m2)];
+  byText(t('cancel'), m2)?.click();
+  await settle();
+  const list0 = answers['conns.list'];
+  answers['conns.list'] = () => ({ conns: [CONN], keyboards: [0x040A], occasional: [{ ...CONN, id: 'o1234', name: 'pc.una.vez', host: 'pc.una.vez', occasional: true, has_pass: false }] });
+  await go('#/s/o1234');
+  const form = appEl.querySelector('form');
+  const dialog = [!!form?.querySelector('[name=password]'), !form?.querySelector('[name=save_pw]'), !form?.querySelector('[name=remember]'), (appEl.textContent || '').includes('pc.una.vez')];
+  answers['conns.list'] = list0;
+  window.open = open0;
+  delete answers['conns.occasional'];
+  await go('#/conns');
+  check('manual connections: only for whoever may make connections; no name, group or password; kept by the gateway and opened in a tab of that click (closed if refused); found by its tab, nothing of it saved there',
+    hidden && absent.every(Boolean) && said && sent?.host === 'pc.una.vez' && sent?.user === 'invitado' && sent?.ask === true && !('password' in (sent || {}))
+    && tabs[0]?.opener === null && tabs[0]?.asked === n0 && tabs[0]?.location.href.endsWith('#/s/o1234') && gone && JSON.stringify(refused) === '[true,true]' && dialog.every(Boolean),
+    JSON.stringify({ hidden, absent, said, sent, tab: tabs[0]?.location.href, gone, refused, dialog }));
 }
 
 // ------------------------------------------------------------ connections of the administrator
@@ -1187,6 +1714,7 @@ await settle();
   const m = document.body.querySelector('.modal');
   const disabled = ['name', 'host', 'port', 'audio'].map((n) => !!m?.querySelector(`[name=${n}]`)?.disabled);
   const pwField = m?.querySelector('[name=password]');
+  const focusedPw = !!pwField && document.activeElement === pwField;   // (its first fields disabled: before, the focus stayed behind)
   if (pwField) pwField.value = 'mi-clave';
   byText(t('save'), document.body)?.click();
   for (let i = 0; i < 3; i++) await settle();
@@ -1203,8 +1731,10 @@ await settle();
   await settle();
   let f = document.body.querySelector('.modal');
   const noPw = !f?.querySelector('[name=password]') && (f?.textContent || '').includes(t('admin_pw_note'));
+  const varHint = (f?.textContent || '').includes(t('user_var_hint'));   // {username}: said where it works, not elsewhere
   f.querySelector('[name=host]').value = 'nuevo';
   f.querySelector('[name=all_users]').checked = false;
+  f.querySelector('[name=all_users]').dispatchEvent(new Ev('change'));   // (as a browser does: the users' boxes are enabled)
   f.querySelector('[name=u_u1]').checked = true;
   byText(t('save'), document.body)?.click();
   for (let i = 0; i < 3; i++) await settle();
@@ -1213,15 +1743,38 @@ await settle();
   await settle();
   f = document.body.querySelector('.modal');
   const ownTitle = f?.querySelector('h2,h3')?.textContent || f?.textContent.slice(0, 40);
+  const ownVarHint = (f?.textContent || '').includes(t('user_var_hint'));
   f.querySelector('[name=forget]').checked = true;
   byText(t('save'), document.body)?.click();
   for (let i = 0; i < 3; i++) await settle();
   check('connections of the administrator: marked for the user, no delete, only their password; the administration lists who sees each one and every user\'s own, creates one for chosen users, changes a user\'s own (its password only forgotten)',
-    marked && !titles?.includes(t('delete')) && JSON.stringify(disabled) === '[true,true,true,true]'
+    marked && !titles?.includes(t('delete')) && JSON.stringify(disabled) === '[true,true,true,true]' && focusedPw
     && JSON.stringify(rows) === JSON.stringify(['Común|ana @ rds|luis', 'Todos|ana @ rds|' + t('all_users'), 'ana|De Ana|ana @ pc.test']) && noPw
     && JSON.stringify(sent) === JSON.stringify([['conns.save', { id: 'm1', password: 'mi-clave' }], ['admin.conn.save', ['u1'], 'nuevo'], ['admin.user.conn.save', 'u1', 'De Ana', true]])
-    && ownTitle.includes('ana'), JSON.stringify({ marked, titles, disabled, rows, noPw, sent, ownTitle }));
-  ['admin.conns', 'admin.conn.save', 'admin.user.conn.save'].forEach((k) => delete answers[k]);
+    && ownTitle.includes('ana') && varHint && !ownVarHint, JSON.stringify({ marked, titles, disabled, focusedPw, rows, noPw, sent, ownTitle, varHint, ownVarHint }));
+  // CSV import: the file's text sent as it is; the result said (how many, each refused row with its reason, unknown users,
+  // unused columns); a file refused as a whole said in a notice
+  let csvSent = null;
+  answers['admin.conns.import'] = (b) => (csvSent = b.csv, b.csv.startsWith('name') ? { error: 'csv_no_host' }
+    : { created: ['A', 'B'], errors: [[3, 'host']], unknown: [[4, 'nadie']], ignored: ['notes'] });
+  await go('#/admin/conns');
+  const csvInput = appEl.querySelectorAll('input').find((i) => i.getAttribute('accept') === '.csv,text/csv');
+  const csvButton = !!byText(t('import_csv'));
+  csvInput.files = [new File(['host;name\npc;A\n'], 'conexiones.csv')];
+  csvInput.dispatchEvent(new Ev('change'));
+  for (let i = 0; i < 4; i++) await settle();
+  const summary = document.body.querySelector('.modal')?.textContent || '';
+  byText(t('close'), document.body)?.click();
+  await settle();
+  document.body.querySelector('.toasts')?.replaceChildren();
+  csvInput.files = [new File(['name;port\nx;1\n'], 'mal.csv')];
+  csvInput.dispatchEvent(new Ev('change'));
+  for (let i = 0; i < 4; i++) await settle();
+  const wholeRefused = (document.body.querySelector('.toasts')?.textContent || '').includes(t('e_csv_no_host'));
+  check('connections of the administrator: CSV import sends the file and says what was added and what was refused, by row',
+    csvButton && summary.includes(t('csv_imported', 2)) && summary.includes(t('csv_row', 3, t('e_host'))) && summary.includes(t('csv_unknown_users', 4, 'nadie'))
+    && summary.includes(t('csv_ignored', 'notes')) && wholeRefused && csvSent === 'name;port\nx;1\n', JSON.stringify({ csvButton, summary, wholeRefused, csvSent }));
+  ['admin.conns', 'admin.conn.save', 'admin.user.conn.save', 'admin.conns.import'].forEach((k) => delete answers[k]);
 }
 
 // ------------------------------------------------------------ shared folder: a file explorer
@@ -1733,20 +2286,42 @@ await settle();
       m?.querySelectorAll('button').find((x) => x.textContent === t('close'))?.click();
       return out;
     };
-    const mic = read(beside('mic')), scr = read(beside('multi'));
+    // the options folded (credentials and Connect not), unfolded to change them
+    const det = form.querySelector('.conn-more'), inside = (n) => form.querySelector(`[name=${n}]`)?.closest('.conn-more') === det;
+    folded.push({ open: !!det?.open || det?.getAttribute('open') != null, summary: det?.querySelector('summary')?.textContent,
+      inside: ['audio', 'mic', 'clipboard', 'paste', 'drive', 'printer', 'multi', 'full', 'gfx', 'bpp', 'remember', 'trace'].filter(inside),
+      outside: ['user', 'password', 'save_pw'].filter((n) => form.querySelector(`[name=${n}]`) && !inside(n)),
+      connect: !form.querySelectorAll('button').find((b) => b.textContent === t('connect'))?.closest('.conn-more') });
+    const mic = read(beside('mic')), scr = read(beside('multi')), full = read(beside('full'));
     delete screen.isExtended;
     delete window.getScreenDetails;
-    return { mic, scr };
+    return { mic, scr, full };
   };
+  const folded = [];
   const focused = [];
   const noApi = await infoOf(false), withApi = await infoOf(true);
   const micOk = noApi.mic.title === t('more_info') && noApi.mic.text.includes(t('mic_info_browser')) && t('mic_info_gpo').every((s) => noApi.mic.text.includes(s))
     && JSON.stringify(noApi.mic.cmds) === JSON.stringify(['reg add "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services" /v fDisableAudioCapture /t REG_DWORD /d 0 /f',
-      'Set-Service Audiosrv -StartupType Automatic; Start-Service Audiosrv']);
+      'Set-Service Audiosrv -StartupType Automatic; Start-Service Audiosrv',
+      'reg add "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services" /v fDisableCameraRedir /t REG_DWORD /d 0 /f'])
+    && noApi.mic.text.includes(t('cam_info'));         // (the camera goes with the microphone: one option)
   const first = (r) => r.scr.text.indexOf(t('screens_info_api')) < r.scr.text.indexOf(t('screens_info_popup')) ? 'api' : 'popup';
-  check('connect dialog: info beside the microphone (browser permission, policy, registry command) and the screens (this browser\'s permission first)',
+  check('connect dialog: info beside the microphone and camera (browser permission, policies, registry commands) and the screens (this browser\'s permission first)',
     micOk && first(noApi) === 'popup' && first(withApi) === 'api' && withApi.scr.title === t('more_info') && noApi.scr.text.includes(t('screens_info_general')),
     JSON.stringify({ micOk, cmds: noApi.mic.cmds, noApi: first(noApi), api: first(withApi) }));
+  // beside "Start in full screen": what each browser does with Connect, and how to let every screen go without a press
+  // (the policy's registry commands with this page's address, for Edge and Chrome; Firefox's three settings)
+  const fi = withApi.full;
+  const fullCmds = ['Microsoft\\Edge', 'Google\\Chrome'].map((k) => `reg add "HKLM\\SOFTWARE\\Policies\\${k}\\AutomaticFullscreenAllowedForUrls" /v 1 /t REG_SZ /d "https://gateway.test" /f`);
+  const fullOkInfo = fi.title === t('more_info') && [t('full_info_how'), ...t('full_info_browsers'), t('full_info_press'), t('full_info_auto', 'https://gateway.test'),
+    t('full_info_chromium'), t('full_info_chromium_after'), t('full_info_firefox'), 'full-screen-api.allow-trusted-requests-only', 'full-screen-api.exit-on.windowOpen',
+    'full-screen-api.exit-on.windowRaise'].every((s) => fi.text.includes(s)) && JSON.stringify(fi.cmds) === JSON.stringify(fullCmds) && noApi.full.text === fi.text;
+  check('connect dialog: info beside "Start in full screen" (each browser, the policy\'s commands with this address, Firefox\'s settings)', fullOkInfo,
+    JSON.stringify({ title: fi.title, cmds: fi.cmds, text: fi.text.slice(0, 120) }));
+  const want = JSON.stringify({ open: false, summary: t('connect_options'), inside: ['audio', 'mic', 'clipboard', 'paste', 'drive', 'printer', 'multi', 'full', 'gfx', 'bpp', 'remember', 'trace'],
+    outside: ['password', 'save_pw'], connect: true });
+  check('connect dialog: the options folded under their summary (the password, saving it and Connect outside them)', folded.length === 2 && folded.every((f) => JSON.stringify(f) === want),
+    JSON.stringify(folded));
   // with nothing to type (the password saved), Connect has the focus, not an info button: Enter connects
   check('connect dialog: with nothing to type, Enter is on Connect (not on an info button)', focused.length === 2 && focused.every((f) => f === t('connect') || f === 'password'),
     JSON.stringify(focused));
@@ -1762,6 +2337,261 @@ await settle();
   try { await go('#/conns'); await go('#/admin/users'); } catch (e) { err = e.message; }   // (administration reads it: the data folder check)
   globalThis.sessionStorage = store0;
   check('storage blocked by the browser: the page still works', err === '' && appEl.textContent.length > 0, err);
+}
+
+// ------------------------------------------------------------ sharing a session
+
+{
+  // the owner: a "Share" button (not for RemoteApp); its panel lists the links, makes one (view only by default) and shows its
+  // address, revokes it; while guests watch, how many is always in sight
+  Object.assign(CONN, { clipboard: false, ask: true, app: '' });
+  answers['session.shares'] = () => ({ shares: [] });
+  answers['session.share'] = (b) => ({ id: 's1', mode: b.mode, link: 'abc.SECRET', shares: [{ id: 's1', mode: b.mode, created: '2026-11-20T10:00:00+01:00' }] });
+  answers['session.unshare'] = () => ({ shares: [] });
+  await go('#/conns');
+  await go('#/s/c1');
+  const form = appEl.querySelector('.overlay').querySelector('form');
+  const pw = form.querySelector('[name=password]');   // (asked unless saved by a test above)
+  if (pw) pw.value = 'pw';
+  submit(form);
+  await settle();
+  const wk = workers.at(-1);
+  const status = (j) => wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify(j)) } });
+  status({ token: 't1' });
+  status({ connected: true });
+  await settle();
+  const shareBtn = appEl.querySelector('.bar').querySelectorAll('button').find((b) => b.getAttribute('title') === t('share'));
+  shareBtn.click();
+  await settle();
+  const panel = appEl.querySelector('.panel');
+  const empty = panel.textContent.includes(t('share_none'));
+  byText(t('share_make'), panel).click();
+  await settle();
+  const made = calls.filter((c) => c.action === 'session.share').at(-1);
+  const link = panel.querySelectorAll('input').find((i) => i.closest('.share-made'))?.value;
+  const listed = panel.querySelectorAll('li').length;
+  const firstMode = panel.querySelector('select')?.children[0]?.value;      // (the double has no select.value: the first option)
+  status({ viewers: 2 });
+  await settle();
+  const badge = appEl.querySelector('.watch-badge');
+  const shown = [badge.classList.contains('hidden'), badge.textContent.includes(t('share_viewers', 2)), panel.textContent.includes(t('share_viewers', 2))];
+  byText(t('share_revoke'), panel).click();
+  await settle();
+  const revoked = calls.filter((c) => c.action === 'session.unshare').at(-1);
+  status({ viewers: 0 });
+  await settle();
+  check('sharing, the owner: links listed, made (view only by default) with their address, revoked; how many guests watch in sight',
+    empty && firstMode === 'view' && made?.mode !== 'control' && /^[0-9a-f]{32}$/.test(made?.sid) && link === 'https://gateway.test/#/watch/abc.SECRET' && listed === 1
+      && JSON.stringify(shown) === '[false,true,true]' && revoked?.id === 's1' && revoked?.sid === made?.sid && !panel.querySelector('.share-made')
+      && badge.classList.contains('hidden'),
+    JSON.stringify({ empty, made, link, listed, shown, revoked }));
+  await go('#/conns');
+
+  // a guest: the link's page, without the toolbar, says whose session it watches; when it ends, said so
+  await go('#/watch/abc.SECRET');
+  const gw = workers.at(-1);
+  const req = gw?.sent?.at(-1);
+  gw?.onmessage?.({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify({ watch: 'control', owner: 'ana', conn: 'PC', sid: 'abc' })) } });
+  await settle();
+  const gBadge = appEl.querySelector('.watch-badge');
+  const watching = [gBadge?.classList.contains('hidden'), gBadge?.textContent.trim(), !appEl.querySelector('.bar'), appEl.querySelector('.overlay')?.classList.contains('hidden')];
+  gw?.onmessage?.({ data: { t: 'end' } });
+  await settle();
+  const over = appEl.querySelector('.overlay')?.textContent || '';
+  check('sharing, a guest: the link\'s page watches the session (whose, with control or not), no toolbar; its end said',
+    req?.url?.endsWith('rdp.php?a=watch') && JSON.parse(req.body).link === 'abc.SECRET'
+      && JSON.stringify(watching) === JSON.stringify([false, t('share_watching_control', 'ana', 'PC'), true, true])
+      && over.includes(t('share_over')) && over.includes(t('share_over_text')),
+    JSON.stringify({ req, watching, over }));
+  await go('#/conns');
+  delete answers['session.shares'];
+  delete answers['session.share'];
+  delete answers['session.unshare'];
+}
+
+// ------------------------------------------------------------ connections by users
+
+{
+  // not allowed by the administrator: no "New connection" or "Import .rdp", the empty list says who gives them; the user's own
+  // connection keeps its target (fields locked, said why); the administrator's setting
+  const was = STATE.user.create_conns;
+  STATE.user.create_conns = false;
+  const conns0 = answers['conns.list'];
+  answers['conns.list'] = () => ({ conns: [], keyboards: [0x040A] });
+  await go('#/profile');
+  await go('#/conns');
+  const empty = [!byText(t('new_conn')), !byText(t('import_rdp')), appEl.textContent.includes(t('no_conns_given'))];
+  answers['conns.list'] = () => ({ conns: [{ ...CONN, id: 'own1', name: 'Mía', managed: false }], keyboards: [0x040A] });
+  await go('#/profile');
+  await go('#/conns');
+  appEl.querySelectorAll('button').find((b) => b.getAttribute('title') === t('edit'))?.click();
+  await settle();
+  const m = document.body.querySelectorAll('.modal').at(-1);
+  const locked = ['host', 'port', 'user', 'domain', 'security', 'gw', 'lb'].map((n) => !!m?.querySelector(`[name=${n}]`)?.disabled);
+  const farmHints = m?.querySelector('[name=gw]')?.getAttribute('placeholder') === t('gw_placeholder') && m?.querySelector('[name=lb]')?.getAttribute('placeholder') === t('lb_placeholder');
+  const free = !m?.querySelector('[name=name]')?.disabled && !m?.querySelector('[name=audio]')?.disabled;
+  const said = (m?.textContent || '').includes(t('conns_locked_hint'));
+  const sent0 = calls.length;
+  answers['conns.save'] = (b) => ({ conn: b.conn });
+  byText(t('save'), document.body)?.click();
+  for (let i = 0; i < 3; i++) await settle();
+  const saved = calls.slice(sent0).find((c) => c.action === 'conns.save')?.conn;
+  delete answers['conns.save'];
+  answers['conns.list'] = conns0;
+  STATE.user.create_conns = was;
+  await go('#/profile');
+  await go('#/conns');
+  const allowed = !!byText(t('new_conn')) && !!byText(t('import_rdp'));
+  answers['admin.settings'] = () => ({ settings: { clients: { mode: 'all', list: [] }, targets: { mode: 'all', list: [] }, users_create_conns: false, timezone: '' }, server_timezone: 'UTC' });
+  await go('#/admin/settings');
+  const setting = appEl.querySelectorAll('input').some((i) => i.getAttribute('name') === 'users_create_conns');
+  const box = appEl.querySelectorAll('input').find((i) => i.getAttribute('name') === 'users_create_conns');
+  if (box) box.checked = true;
+  const n1 = calls.length;
+  byText(t('save'))?.click();
+  for (let i = 0; i < 3; i++) await settle();
+  const savedSetting = calls.slice(n1).find((c) => c.action === 'admin.settings' && c.settings)?.settings?.users_create_conns;
+  delete answers['admin.settings'];
+  await go('#/conns');
+  check('connections by users: none made or imported unless allowed, their own keep their target (the form sends it as it was), the administrator\'s setting',
+    empty.every(Boolean) && locked.every(Boolean) && farmHints && free && said && saved?.host === CONN.host && saved?.port === CONN.port && saved?.user === CONN.user && allowed && setting
+      && savedSetting === true,
+    JSON.stringify({ empty, locked, free, said, saved, allowed, setting, savedSetting }));
+}
+{
+  // Kerberos with RC4 (Administration -> Settings): off as it comes, its risk said next to it as a warning, saved when ticked
+  answers['admin.settings'] = () => ({ settings: { clients: { mode: 'all', list: [] }, targets: { mode: 'all', list: [] }, kerberos_rc4: false, timezone: '' }, server_timezone: 'UTC' });
+  await go('#/admin/settings');
+  const box = appEl.querySelectorAll('input').find((i) => i.getAttribute('name') === 'kerberos_rc4');
+  const off = !!box && !box.checked;
+  const note = appEl.querySelectorAll('small.warn').some((x) => x.textContent === t('s_kerberos_rc4_help'));
+  if (box) box.checked = true;
+  const n1 = calls.length;
+  byText(t('save'))?.click();
+  for (let i = 0; i < 3; i++) await settle();
+  const saved = calls.slice(n1).find((c) => c.action === 'admin.settings' && c.settings)?.settings?.kerberos_rc4;
+  delete answers['admin.settings'];
+  check('settings: Kerberos with RC4 off as it comes, its risk said next to it, saved when ticked', off && note && saved === true, JSON.stringify({ off, note, saved }));
+}
+
+// ------------------------------------------------------------ recorded sessions
+
+{
+  // the administrator's editors have "Record" (a user's own does not); the user sees the connection marked, is told in the
+  // connect dialog and during the session; the audit plays a recorded session; the player: its position, speed, a jump and its end
+  Object.assign(CONN, { record: true, ask: true, app: '', clipboard: false });
+  await go('#/conns');
+  const card = appEl.querySelectorAll('.badge').some((b) => b.textContent === t('rec_conn'));
+  appEl.querySelectorAll('button').find((b) => b.getAttribute('title') === t('edit'))?.click();
+  await settle();
+  const userEditor = !!document.body.querySelectorAll('.modal').at(-1)?.querySelector('[name=record]');
+  byText(t('cancel'), document.body)?.click();
+  await settle();
+  await go('#/s/c1');
+  const dialog = (appEl.querySelector('.overlay')?.textContent || '').includes(t('rec_notice'));
+  const form = appEl.querySelector('.overlay').querySelector('form');
+  const pw = form.querySelector('[name=password]');
+  if (pw) pw.value = 'pw';
+  submit(form);
+  await settle();
+  const wk = workers.at(-1);
+  wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode('{"token":"t5"}') } });
+  wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode('{"recording":true}') } });
+  wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode('{"connected":true}') } });
+  await settle();
+  const recBadge = appEl.querySelector('.rec-badge');
+  const during = !!recBadge && !recBadge.classList.contains('hidden') && recBadge.textContent === t('rec_badge');
+  await go('#/conns');
+  Object.assign(CONN, { record: false });
+  // the administrator's editor of a managed connection
+  answers['admin.conns'] = () => ({ conns: [], users: [{ id: 'u1', username: 'ana', conns: [] }], keyboards: [0x040A], all_users: [{ id: 'u1', username: 'ana' }] });
+  await go('#/admin/conns');
+  byText(t('new_conn'))?.click();
+  await settle();
+  const adminEditor = !!document.body.querySelectorAll('.modal').at(-1)?.querySelector('[name=record]');
+  byText(t('cancel'), document.body)?.click();
+  await settle();
+  delete answers['admin.conns'];
+  // the audit: a recorded session's start plays it
+  const sid = 'ab'.repeat(16);
+  answers['admin.audit'] = () => ({ rows: [{ t: '2026-11-20T10:00:00.000+01:00', ip: '203.0.113.9', user: 'ana', event: 'rdp_start', ok: true, sid, conn: 'PC', recording: true, _d: '2026-11-20', _n: 1 }],
+    total: 1, events: {}, failures: 0 });
+  answers['admin.recording'] = () => ({ recording: { sid, user: 'ana', conn: 'PC', started: '2026-11-20T10:00:00+01:00', ended: '2026-11-20T10:02:05+01:00', seconds: 125, bytes: 1000 } });
+  await go('#/admin/audit');
+  const marked = (appEl.querySelector('tbody')?.textContent || '').includes(t('rec_conn'));
+  appEl.querySelector('tbody').children[0].click();
+  await settle();
+  byText(t('rec_play'), document.body)?.click();
+  await settle();
+  const hash = location.hash;
+  (winL.hashchange || []).forEach((f) => f());
+  for (let i = 0; i < 3; i++) await settle();
+  const player = workers.at(-1), first = player.sent.at(-1);
+  player.onmessage({ data: { t: 'pos', ms: 65000 } });
+  const time = appEl.querySelector('.rec-time')?.textContent;
+  const speed = appEl.querySelector('.rec-bar')?.querySelector('select');
+  if (speed) { speed.value = '4'; speed.dispatchEvent(new Ev('change')); }
+  const speedCmd = player.sent.at(-1);
+  const seek = appEl.querySelector('.rec-bar')?.querySelector('input');
+  if (seek) { seek.value = '90000'; seek.dispatchEvent(new Ev('change')); }
+  await settle();
+  const jumped = workers.at(-1).sent.at(-1);
+  workers.at(-1).onmessage({ data: { t: 'end' } });
+  await settle();
+  const over = appEl.querySelector('.overlay')?.textContent || '';
+  check('recording: set in the administrator\'s editors only; the user told (card, dialog, session); played from the audit with its position, speed, a jump and its end',
+    card && !userEditor && dialog && during && adminEditor && marked && hash === '#/rec/' + sid && first?.timed === true && JSON.parse(first?.body || '{}').sid === sid
+      && time === '1:05 / 2:05' && speedCmd?.cmd === 'speed' && speedCmd?.v === 4 && jumped?.from === 90000 && jumped?.speed === 4 && over.includes(t('rec_end')),
+    JSON.stringify({ card, userEditor, dialog, during, adminEditor, marked, hash, first, time, speedCmd, jumped, over }));
+  delete answers['admin.audit'];
+  delete answers['admin.recording'];
+  await go('#/conns');
+}
+
+// ------------------------------------------------------------ signing in with a company account
+
+{
+  // the profile of an OpenID Connect account: no second step or passkeys to add, its password is the provider's; a Windows
+  // account: its password is changed in Windows. The connection editor in a session without the user's key: why no password
+  const user0 = { ...STATE.user };                         // (the page holds this same object: changed in place)
+  Object.assign(STATE.user, { role: 'user', source: 'oidc', save_passwords: false, no_key: true });
+  await go('#/profile');
+  const oidcProfile = [!appEl.textContent.includes(t('twofa')), !appEl.textContent.includes(t('passkeys')), appEl.textContent.includes(t('password_external_oidc')),
+    !appEl.querySelector('input[type=password]')];
+  await go('#/conns');
+  appEl.querySelectorAll('button').find((b) => b.getAttribute('title') === t('edit'))?.click();
+  await settle();
+  const noKeyText = (document.body.querySelectorAll('.modal').at(-1)?.textContent || '').includes(t('pw_no_key'));   // (the last one opened)
+  byText(t('cancel'), document.body)?.click();
+  await settle();
+  Object.assign(STATE.user, { source: 'ad', save_passwords: true, no_key: false });
+  await go('#/profile');
+  const adProfile = appEl.textContent.includes(t('twofa')) && appEl.textContent.includes(t('password_external_ad'));
+  // signed out: the provider's button; back from it without signing in, the reason said once and the address cleaned
+  delete STATE.user.source;
+  delete STATE.user.no_key;
+  Object.assign(STATE.user, user0);
+  Object.defineProperty(El.prototype, 'lang', { get() { return this.querySelector('[name=lang]'); }, configurable: true });   // (form.lang)
+  answers.state = answers.logout = () => ({ ...STATE, user: null, oidc: 'Prueba' });
+  byText(t('logout')).click();
+  await settle();
+  const button = appEl.querySelectorAll('a').find((a) => a.getAttribute('href') === 'oidc.php?start=1');
+  const cleaned = [];
+  globalThis.history = { replaceState: (...a) => cleaned.push(a[2]) };
+  Object.assign(location, { search: '?oidc_error=oidc_unknown_user', pathname: '/mudesk/' });
+  await go('#/');
+  const said = appEl.querySelector('.error')?.textContent;
+  location.search = '?oidc_error=' + encodeURIComponent('Llame al 900 000 000');   // a link made up: not shown as given
+  await go('#/x');
+  await go('#/');
+  const madeUp = appEl.querySelector('.error')?.textContent;
+  location.search = '';
+  answers.state = () => STATE;
+  delete answers.logout;
+  delete El.prototype.lang;
+  check('company account: the provider button on the sign-in screen, its error said once; an OIDC or Windows profile without a password of its own; no saved password without the key',
+    button?.textContent === t('oidc_signin', 'Prueba') && said === t('e_oidc_unknown_user') && cleaned[0] === '/mudesk/#/' && madeUp === t('e_oidc_provider')
+    && oidcProfile.every(Boolean) && noKeyText && adProfile, JSON.stringify({ button: button?.textContent, said, cleaned, oidcProfile, noKeyText, adProfile }));
 }
 
 console.log(failed ? `\n${failed} failed` : '\nAll tests passed');

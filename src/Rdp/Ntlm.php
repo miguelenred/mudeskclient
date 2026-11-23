@@ -26,6 +26,9 @@ final class Ntlm
     public ?array $serverVersion = null;
     public string $exportedKey = '';
 
+    /** MD5 of the channel bindings (RFC 5929 tls-server-end-point) when NTLM goes over TLS to an HTTP server; '' for none */
+    public string $bindings = '';
+
     public function __construct(private string $user, public string $domain, #[\SensitiveParameter] private string $password, private string $spn = '')
     {
     }
@@ -83,7 +86,7 @@ final class Ntlm
         if ($useMic) { // announce MIC, no channel binding, SPN
             $pairs   = array_values(array_filter($pairs, static fn($p) => !in_array($p[0], [6, 9, 10], true)));
             $pairs[] = [6, pack('V', 2)];
-            $pairs[] = [10, str_repeat("\0", 16)];
+            $pairs[] = [10, strlen($this->bindings) === 16 ? $this->bindings : str_repeat("\0", 16)];   // (see Gateway::bindings)
             if ($this->spn !== '') {
                 $pairs[] = [9, Text::toUtf16($this->spn)];
             }
@@ -208,6 +211,31 @@ final class Ntlm
             $sum = $this->sendSeal->crypt($sum);
         }
         return pack('V', 1) . $sum . $seq . $enc;
+    }
+
+    /**
+     * GSS_GetMICEx (MS-NLMP 3.4.4): the 16-byte signature of $msg, which is not encrypted (DCE/RPC's packet integrity). The
+     * sealing key's RC4 stream is the one Seal uses: signing and sealing go on from each other.
+     */
+    public function sign(string $msg): string
+    {
+        $seq = pack('V', $this->sendSeq++);
+        $sum = substr(hash_hmac('md5', $seq . $msg, $this->sendSign, true), 0, 8);
+        if ($this->flags & self::KEY_EXCH) {
+            $sum = $this->sendSeal->crypt($sum);
+        }
+        return pack('V', 1) . $sum . $seq;
+    }
+
+    /** Whether $signature is the server's for $msg (GSS_VerifyMICEx), its sequence number the next one. */
+    public function verify(string $msg, string $signature): bool
+    {
+        $seq = pack('V', $this->recvSeq++);
+        $sum = substr(hash_hmac('md5', $seq . $msg, $this->recvSign, true), 0, 8);
+        if ($this->flags & self::KEY_EXCH) {
+            $sum = $this->recvSeal->crypt($sum);
+        }
+        return strlen($signature) === 16 && hash_equals(substr($signature, 4, 8), $sum) && substr($signature, 12, 4) === $seq;
     }
 
     public function unseal(string $data): ?string

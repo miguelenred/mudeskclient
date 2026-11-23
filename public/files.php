@@ -123,6 +123,10 @@ switch ($a) {
         Http::json(['dirs' => Files::subdirs($u['id'], $open, 2000)]);
 
     case 'move':      // ?p=from&to=destination: moved or renamed (the destination must not exist)
+        // under the lock of the user's uploads: a file uploaded meanwhile to the destination was replaced by the move (a
+        // rename replaces what is there; it was checked for just before)
+        $lock = fopen(Config::dir('tmp/upload-' . $u['id'] . '.lock'), 'c');
+        flock($lock, LOCK_EX);
         $to  = $q('to');
         $err = Files::move($u['id'], $p, $to);
         if ($err !== null) {
@@ -182,7 +186,10 @@ switch ($a) {
         $in   = fopen('php://input', 'rb');
         $size = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);          // none with a chunked body: the copy below stops anyway
         // a file replaced gives its room back first: a new version that fits was refused near the quota
-        $left = Files::quotaLeft($u['id']) + ($offset === 0 && is_file($path) ? (int)filesize($path) : 0);
+        $left = Files::quotaLeft($u['id']);
+        if ($left !== PHP_INT_MAX && $offset === 0 && is_file($path)) {
+            $left += (int)filesize($path);
+        }
         if ($size > $left) {
             Http::fail('quota');
         }

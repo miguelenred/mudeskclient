@@ -29,9 +29,9 @@ final class Trace
     {
         $dir = Config::dir('trace');
         if (!is_dir($dir)) {
-            mkdir($dir, 0700, true);
+            @mkdir($dir, 0700, true);
         }
-        $this->fh   = fopen("$dir/$sid.log", 'xb') ?: null;
+        $this->fh   = @fopen("$dir/$sid.log", 'xb') ?: null;
         @chmod("$dir/$sid.log", 0600);
         $this->t0   = microtime(true);
         $this->next = $this->t0 + self::EVERY;
@@ -88,6 +88,9 @@ final class Trace
     /** Counts a message ("fastpath:bitmap", "channel:cliprdr"…) and its size; statistics are written every 10 s. */
     public function count(string $key, int $bytes): void
     {
+        if (!isset($this->stats[$key]) && count($this->stats) >= 500) {
+            $key = 'other';                          // (the server chooses channel ids: 300,000 of them took 100 MB)
+        }
         $s                  = &$this->stats[$key];
         $s                  = [($s[0] ?? 0) + 1, ($s[1] ?? 0) + $bytes];
         if (microtime(true) >= $this->next) {

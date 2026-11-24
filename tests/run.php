@@ -6074,7 +6074,7 @@ $expoSeen[] = [$cliFirst, $cliState['state'], strlen($cliState['token']), $cliPr
     MuDesk\Exposure::state()['token'] !== $cliState['token']];
 // what it knows is no session (before, a fresh one was taken for one: listed without its id or user, and counted against the
 // limits of sessions)
-$expoSeen[] = [array_filter(MuDesk\Sessions::active(), static fn(array $s): bool => !isset($s['sid'])), is_file(MuDesk\Config::dir('run/exposure.json'))];
+$expoSeen[] = [array_filter(MuDesk\Sessions::active(), static fn(array $s): bool => isset($s['state'])), is_file(MuDesk\Config::dir('run/exposure.json'))];
 @unlink("$app/public/index.php");
 @unlink(MuDesk\Config::dir('run/exposure.json'));
 foreach ($expoSrv as $p) {

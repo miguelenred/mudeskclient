@@ -23,7 +23,9 @@ final class Settings
         'trace_all'             => false,  // diagnostic trace of every RDP session (data/trace/, kept 7 days)
         'reconnect_attempts'    => 10,     // automatic reconnections after the connection is lost (0 = none)
         'save_passwords'        => true,   // users may save the password of their RDP connections; turned off, those saved are erased
-        'record_days'           => 30,     // session recordings are kept this long (Recording)
+        'record_days'           => 0,      // session recordings are kept this long (Recording); 0: until deleted by hand
+        'record_users'          => false,  // users who are not administrators may record their own sessions (start and stop it)
+        'share_control_idle_minutes' => 15, // a guest given control loses it after this long without using it (0: never)
         'users_create_conns'    => false,  // users who are not administrators may create connections (and import .rdp files)
         'kerberos_rc4'          => false,  // Kerberos may use RC4 (a Windows Server 2003 domain): off, see Kerberos::types()
         'timezone'              => '',     // of the users' sign-in hours (an IANA name); empty: PHP's own
@@ -71,6 +73,12 @@ final class Settings
         return self::all()[$key];
     }
 
+    /** Read again next time (a backup restored put its own in place). */
+    public static function forget(): void
+    {
+        self::$cache = null;
+    }
+
     /** The settings the last save() changed (their names), which restore() puts back. */
     private static array $saved = [];
 
@@ -110,7 +118,7 @@ final class Settings
         $was  = $s;
         $ints = ['login_max_attempts' => [1, 100], 'login_lock_minutes' => [1, 1440], 'login_global_max' => [5, 100000], 'session_idle_minutes' => [5, 1440],
                  'rdp_idle_minutes' => [0, 1440], 'max_sessions_per_user' => [1, 50], 'max_sessions_total' => [0, 10000], 'audit_retention_days' => [0, 36500], 'reconnect_attempts' => [0, 50],
-                 'files_quota_mb' => [0, 100000], 'record_days' => [1, 3650]];
+                 'files_quota_mb' => [0, 100000], 'record_days' => [0, 3650], 'share_control_idle_minutes' => [0, 1440]];
         foreach (['clients', 'targets'] as $k) {
             $a = $in[$k] ?? [];
             if (!is_array($a) || is_array($a['mode'] ?? null) || array_filter((array)($a['list'] ?? []), 'is_array') !== []) {
@@ -193,7 +201,7 @@ final class Settings
                 $s[$k] = max($min, min($max, Http::int($in[$k])));   // (a float past the int range warned on PHP 8.5)
             }
         }
-        foreach (['totp_required', 'trace_all', 'save_passwords', 'users_create_conns', 'kerberos_rc4'] as $k) {
+        foreach (['totp_required', 'trace_all', 'save_passwords', 'users_create_conns', 'kerberos_rc4', 'record_users'] as $k) {
             if (isset($in[$k])) {
                 $s[$k] = (bool)$in[$k];
             }

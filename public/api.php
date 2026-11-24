@@ -2,12 +2,13 @@
 // MuDeskClient - https://miguelenred.es/mudeskclient - Apache License 2.0
 declare(strict_types=1);
 
-use MuDesk\{Access, Audit, Auth, Connections, Crypto, Http, Oidc, Recording, Sessions, Settings, Text, Totp, Users, WebAuthn, WindowsLogin};
+use MuDesk\{Access, Audit, Auth, Connections, Crypto, Http, Maintenance, Oidc, Recording, Sessions, Settings, Text, Totp, Users, WebAuthn, WindowsLogin};
 use MuDesk\Rdp\Trace;
 
 require __DIR__ . '/../src/bootstrap.php';
 
 Http::guard();
+Maintenance::maybe();                    // (at most once an hour: leftovers of killed processes, expired files)
 // the page asking how long its session has left is not activity: counted as such, it would keep an idle session open
 $peek = Http::input();                           // (decoded once, at most Http::BODY_MAX)
 if (!isset($_COOKIE['MUDESKSID']) && (!is_array($peek) || ($peek['action'] ?? null) !== 'state')) {
@@ -49,7 +50,7 @@ function state(): never
     Http::json([
         'setup'   => Users::all() === [],
         'csrf'    => Auth::csrf(),
-        'version' => MuDesk\VERSION,
+        'version' => $u === null ? null : MuDesk\VERSION,   // (only to a signed-in user: not which version runs to anyone)
         'build'   => Http::build(__DIR__ . '/assets'),   // the page compares it with its own: an older page says so
         'second'  => ($p = $_SESSION['pending'] ?? null) === null || !($pu = Users::get($p['uid'])) ? null
                      : ['totp' => !empty($pu['totp']['enabled']), 'passkey' => !empty($pu['passkeys'])],
@@ -57,8 +58,9 @@ function state(): never
         'user'    => $u === null ? null : Users::view($u) + ['totp_required' => Settings::get('totp_required') && ($_SESSION['via'] ?? '') !== 'oidc',
                      'reconnect' => Settings::get('reconnect_attempts'), 'save_passwords' => Settings::get('save_passwords') && Auth::dek() !== null,
                      'no_key' => Settings::get('save_passwords') && Auth::dek() === null,   // (a session opened with OpenID Connect)
-                     'create_conns' => Auth::createsConns($u)]
-                     + ($u['role'] === 'admin' ? ['targets_all' => Settings::get('targets')['mode'] === 'all'] : []),   // warned in the panel
+                     'create_conns' => Auth::createsConns($u), 'record_own' => Auth::recordsOwn($u)]
+                     + ($u['role'] === 'admin' ? ['targets_all' => Settings::get('targets')['mode'] === 'all',   // warned in the panel
+                        'check_php' => is_file(__DIR__ . '/check.php')] : []),   // the hosting diagnostics left in the web root
         'previous' => $u === null ? null : Auth::takePrevious(),   // right after signing in: last sign-in and failures since
         'session'  => $u === null ? null : ['idle' => Settings::get('session_idle_minutes') * 60, 'max' => Auth::maxLeft()],   // when it expires
         'closed'   => Auth::closedReason(),               // closed by this request: why (idle, max_duration...)
@@ -238,6 +240,26 @@ switch ($action) {
         Audit::log('session_kill', ['sid' => $str('sid'), 'conn' => $info['conn'] ?? '', 'by' => 'owner'], null, true);
         Http::json(['ok' => true]);
 
+    case 'session.record':         // the user's running session recorded from now on (on), or no longer: administrators, and
+        $u    = Auth::require();       // users when the settings allow it (record_users)
+        $sid  = $str('sid');
+        $info = Sessions::info($sid);
+        if (($info['uid'] ?? null) !== $u['id']) {
+            Http::fail('not_found', 404);
+        }
+        $admin = $u['role'] === 'admin';
+        if (!Auth::recordsOwn($u)) {
+            Http::fail('forbidden', 403);
+        }
+        if (!empty($info['app'])) {    // (RemoteApp: its connection is not made again in the session, see rdp.php)
+            Http::fail('record_unavailable');
+        }
+        if (empty($in['on']) && !$admin && in_array($info['record_by'] ?? null, ['policy', 'admin'], true)) {
+            Http::fail('record_locked', 403);   // (the connection's recording, or an administrator's: only an administrator stops it)
+        }
+        Sessions::record($sid, !empty($in['on']), $u['username'], $admin) || Http::fail('not_found', 404);
+        Http::json(['ok' => true]);
+
     case 'session.share':          // a link to the user's running session for a guest without an account: view, or control
     case 'session.shares':         // the session's links
     case 'session.unshare':        // a link revoked (id): its guests stop seeing the session at once
@@ -247,7 +269,8 @@ switch ($action) {
         if (($info['uid'] ?? null) !== $u['id']) {
             Http::fail('not_found', 404);
         }
-        $list = static fn(array $i): array => array_values(array_map(static fn($id, $x) => ['id' => (string)$id, 'mode' => $x['mode'], 'created' => $x['created']],
+        $list = static fn(array $i): array => array_values(array_map(static fn($id, $x) => ['id' => (string)$id, 'mode' => $x['mode'], 'created' => $x['created'],
+            'expires' => empty($x['expires']) ? null : date('c', (int)$x['expires'])],
             array_keys((array)($i['shares'] ?? [])), (array)($i['shares'] ?? [])));
         if ($action === 'session.unshare') {
             if (!Sessions::unshare($sid, $str('id'))) {
@@ -258,9 +281,10 @@ switch ($action) {
             if (!empty($info['app']) || count((array)($info['shares'] ?? [])) >= Sessions::MAX_SHARES) {
                 Http::fail(empty($info['app']) ? 'too_many_shares' : 'share_unavailable');
             }
-            $mode = $str('mode') === 'control' ? 'control' : 'view';
-            $new  = Sessions::share($sid, $mode) ?? Http::fail((string)@file_get_contents(MuDesk\Config::dir('run/' . $sid . '.mode')) === 'file' ? 'share_unavailable' : 'share_failed');
-            Audit::log('share_create', ['sid' => $sid, 'conn' => $info['conn'] ?? '', 'share' => $new['id'], 'mode' => $mode], null, true);
+            $mode    = $str('mode') === 'control' ? 'control' : 'view';
+            $minutes = in_array($int('minutes'), [15, 60, 240], true) ? $int('minutes') : 0;   // (0: as long as the session)
+            $new     = Sessions::share($sid, $mode, $minutes) ?? Http::fail((string)@file_get_contents(MuDesk\Config::dir('run/' . $sid . '.mode')) === 'file' ? 'share_unavailable' : 'share_failed');
+            Audit::log('share_create', ['sid' => $sid, 'conn' => $info['conn'] ?? '', 'share' => $new['id'], 'mode' => $mode] + ($minutes ? ['minutes' => $minutes] : []), null, true);
             Http::json(['id' => $new['id'], 'mode' => $mode, 'link' => $sid . '.' . $new['secret'], 'shares' => $list(Sessions::info($sid) ?? [])]);
         }
         Http::json(['shares' => $list(Sessions::info($sid) ?? [])]);
@@ -329,7 +353,7 @@ switch ($action) {
         $u    = Auth::require();
         $conn = $obj('conn');
         $old  = empty($conn['id']) || is_array($conn['id']) ? [] : (Connections::all($u['id'])[(string)$conn['id']] ?? []);
-        $r    = Connections::save($u['id'], $conn, Auth::dek(), Auth::createsConns($u));
+        $r    = Connections::save($u['id'], $conn, Auth::dek(), Auth::createsConns($u), ($u['role'] ?? '') === 'admin');   // (recording: administrators only)
         if (is_string($r)) {
             Http::fail($r, $r === 'conns_locked' ? 403 : 400);
         }
@@ -400,6 +424,10 @@ switch ($action) {
             Audit::log('user_create', ['target' => $u['username'], 'role' => $u['role']], null, true);
         }
         $target = Users::get($id) ?? Http::fail('not_found', 404);
+        // what is not sent stays as the user has it (a new one: as created). Before, a field left out was taken as its
+        // default: changing one thing through the API gave the user any hour, the default sessions, enabled them again or
+        // took their role away
+        $sent   = array_intersect_key($in, array_flip(['role', 'enabled', 'max_sessions', 'hours']));
         $role   = in_array($str('role'), ['admin', 'auditor'], true) ? $str('role') : 'user';
         $on     = (bool)($in['enabled'] ?? true);
         $max    = max(0, min(50, $int('max_sessions')));
@@ -407,11 +435,9 @@ switch ($action) {
         if ($hours === false) {
             Http::fail('invalid_hours');
         }
-        $u = Users::updateKeepingAdmin($id, static function (array &$x) use ($role, $on, $max, $hours): void {
-            $x['role']         = $role;
-            $x['enabled']      = $on;
-            $x['max_sessions'] = $max;
-            $x['hours']        = $hours;
+        $set = array_intersect_key(['role' => $role, 'enabled' => $on, 'max_sessions' => $max, 'hours' => $hours], $sent);
+        $u   = Users::updateKeepingAdmin($id, static function (array &$x) use ($set): void {
+            $x = array_replace($x, $set);
         }) ?? Http::fail('not_found', 404);
         if ($u === 'last_admin') {   // no enabled administrator would be left (counted under the lock of the users)
             Http::fail('last_admin');
@@ -420,7 +446,7 @@ switch ($action) {
         if ($changes !== []) {
             Audit::log('user_update', ['target' => $u['username'], 'changes' => $changes], null, true);
         }
-        if (!$on) {
+        if (empty($u['enabled'])) {
             Sessions::killUser($id);   // its remote desktops end too, not only the web sessions
         }
         Http::json(['user' => Users::view($u)]);
@@ -570,7 +596,8 @@ switch ($action) {
             Http::fail('invalid_input');
         }
         $f      = array_map('strval', $f);
-        $export = in_array($str('export'), ['csv', 'json'], true) ? $str('export') : '';
+        // 'json': the signed file; 'rows': the same rows unsigned, which the page turns into CSV (formulas neutralized there)
+        $export = in_array($str('export'), ['rows', 'json'], true) ? $str('export') : '';
         $offset = max(0, $int('offset'));
         $filter = static fn(array $res): array => array_filter($f, 'strlen') + ['from' => $res['from'], 'to' => $res['to']];
         if ($export) {             // the file itself, sent as the rows are found; the JSON one is followed by its signature in base64
@@ -582,7 +609,7 @@ switch ($action) {
             $res = Audit::export($f, static function (string $s): void {   // pieces of 64 KB
                 echo $s;
             }, $export === 'json');
-            Audit::log('audit_export', ['filter' => $filter($res), 'rows' => $res['rows'], 'format' => $export] + array_filter(['sha256' => $res['sha256']]), null, true);
+            Audit::log('audit_export', ['filter' => $filter($res), 'rows' => $res['rows'], 'format' => $export === 'rows' ? 'csv' : 'json'] + array_filter(['sha256' => $res['sha256']]), null, true);
             exit($res['sig'] === null ? '' : base64_encode($res['sig']));
         }
         $res = Audit::search($f, $offset, 100);
@@ -631,14 +658,134 @@ switch ($action) {
         }
         Http::json(['name' => 'mudesk-trace-' . $str('sid') . '.log', 'text' => (string)file_get_contents($file)]);
 
-    case 'admin.recording':                // a session's recording: who, which connection, when, how long (played with rdp.php?a=replay)
+    case 'admin.recording':                // a session's recording: who, which connection, when, how long (played with rdp.php?a=replay):
+    case 'recording.info':                 // any for administrators and auditors, a user's own (started in their session) for them
+        $u = Auth::require();
+        Recording::cleanup();
+        $info = Recording::info($str('sid'));
+        if ($info === null || (!in_array($u['role'], ['admin', 'auditor'], true) && !Recording::ownedBy($info, $u))) {
+            Http::fail('not_found', 404);
+        }
+        Http::json(['recording' => $info]);
+
+    case 'admin.recordings':               // every recording, the newest first, for administrators and auditors: watched, made into a video
         Auth::requireAuditor();
         Recording::cleanup();
-        Http::json(['recording' => Recording::info($str('sid')) ?? Http::fail('not_found', 404)]);
+        Http::json(['recordings' => array_map(static fn(array $r): array => array_intersect_key($r, array_flip(['id', 'user', 'conn', 'host', 'started',
+            'ended', 'seconds', 'bytes', 'sound', 'truncated', 'width', 'height', 'started_as', 'by', 'kind', 'mime', 'running'])), Recording::all()), 'keep_days' => Settings::get('record_days')]);
+
+    case 'recordings.mine':                // the recordings the user started in their own sessions: watched, made into a video, deleted
+        $u = Auth::require();
+        Recording::cleanup();
+        Http::json(['recordings' => array_map(static fn(array $r): array => array_intersect_key($r, array_flip(['id', 'conn', 'host', 'started', 'ended',
+            'seconds', 'bytes', 'sound', 'truncated', 'width', 'height', 'kind', 'mime', 'running'])), Recording::mine($u))]);
+
+    case 'recordings.delete':              // one of them deleted (not while it is being recorded); audited
+        $u    = Auth::require();
+        $info = Recording::info($str('id'));
+        if ($info === null || !Recording::ownedBy($info, $u)) {
+            Http::fail('not_found', 404);
+        }
+        if (!Recording::delete($str('id'))) {
+            Http::fail('recording_running');
+        }
+        Audit::log('recording_delete', ['rec' => $str('id'), 'sid' => $info['sid'] ?? '', 'conn' => $info['conn'] ?? ''], null, true);
+        Http::json(['ok' => true]);
+
+    case 'admin.recordings.delete':        // an administrator deletes any recording (not while it is being recorded); audited
+        Auth::require(true);
+        $info = Recording::info($str('id'));
+        if ($info === null) {
+            Http::fail('not_found', 404);
+        }
+        if (!Recording::delete($str('id'))) {
+            Http::fail('recording_running');
+        }
+        Audit::log('recording_delete', ['rec' => $str('id'), 'sid' => $info['sid'] ?? '', 'conn' => $info['conn'] ?? '', 'owner' => $info['user'] ?? '',
+            'as' => 'admin'], null, true);
+        Http::json(['ok' => true]);
+
+    case 'data.exposed':                   // a page read data/web-check.txt: its code, if the file's now, stops the gateway
+        Http::json(['stopped' => MuDesk\Exposure::proof($raw('proof'))]);
+
+    case 'admin.backup.prepare':           // a backup asked for: its key (from its password) kept for its download, once
+        Auth::require(true);
+        if (preg_match_all('/./su', $raw('password')) < 10) {   // (characters, not bytes; no mbstring)
+            Http::fail('backup_weak');
+        }
+        $salt = random_bytes(16);
+        $id   = bin2hex(random_bytes(8));
+        $with = array_values(array_intersect(MuDesk\Backup::OPTIONAL, array_filter((array)($in['with'] ?? []), 'is_string')));
+        foreach (MuDesk\Backup::entries($with) as [$name, $path]) {   // (a file the server cannot read: said now, not a backup that stops)
+            if (!is_readable($path)) {
+                error_log("MuDeskClient: a backup cannot be made: the web server cannot read $path");
+                Http::fail('backup_unreadable');
+            }
+        }
+        $_SESSION['backups'] = array_slice(($_SESSION['backups'] ?? []) + [$id => ['key' => base64_encode(MuDesk\Backup::key($raw('password'), $salt)),
+            'salt' => base64_encode($salt), 'with' => $with]], -2, null, true);
+        Http::json(['id' => $id]);
+
+    case 'admin.backup.restore':           // the backup uploaded (backup.php) put in place: checked whole first; every session ends
+        $a    = Auth::require(true);
+        $id   = $str('id');
+        $file = MuDesk\Config::dir("tmp/restore-$id.mudeskbackup");
+        if (!preg_match('/^[0-9a-f]{16}$/D', $id) || !is_file($file)) {
+            Http::fail('not_found', 404);
+        }
+        @set_time_limit(0);
+        $dir = MuDesk\Config::dir("tmp/restore-$id");
+        MuDesk\Files::remove($dir);
+        @mkdir($dir, 0700, true);
+        $m = MuDesk\Backup::extract($file, $raw('password'), $dir);
+        if (is_string($m)) {
+            MuDesk\Files::remove($dir);
+            $m === 'backup_password' || @unlink($file);     // (another password may still open it)
+            Audit::log('backup_restore', ['error' => $m], null, false);
+            Http::fail($m);
+        }
+        Auth::release();                                  // (its web session ends too: its file is let go first)
+        $done = MuDesk\Backup::restore($dir, array_filter((array)($m['with'] ?? []), 'is_string'));
+        MuDesk\Files::remove($dir);
+        @unlink($file);
+        Audit::log('backup_restore', ['created' => $m['created'] ?? null, 'by' => $m['by'] ?? null, 'version' => $m['version'] ?? null,
+            'with' => $m['with'] ?? [], 'restored_by' => $a['username']] + ($done === true ? [] : ['error' => $done]), null, $done === true);
+        $done === true || Http::fail($done);
+        Http::json(['ok' => true]);
+
+    case 'admin.status':                   // the gateway now: sessions, processes, memory, disk, recent problems (auditors too)
+        Auth::requireAuditor();
+        Http::json(['status' => MuDesk\Status::now()]);
+
+    case 'admin.usage':                    // the use of the last 30 days, from the audit (auditors too)
+        Auth::requireAuditor();
+        Http::json(MuDesk\Status::usage(30));
+
+    case 'admin.certs':                    // the certificates fixed for every connection to their computers
+        Auth::require(true);
+        Http::json(['certs' => Connections::fixedCerts()]);
+
+    case 'admin.cert.fix':                 // one fixed ({host, port, fingerprint}; '' forgets it), for every connection to it
+        $a  = Auth::require(true);
+        $fp = Connections::fixCert($str('host'), $int('port'), $str('fingerprint'), $a['username']);
+        if ($fp === 'cert_fixed') {
+            Http::fail('cert_fixed');
+        }
+        Audit::log($fp === '' ? 'cert_unfixed' : 'cert_fixed', ['host' => strtolower($str('host')), 'port' => $int('port')] + ($fp === '' ? [] : ['fingerprint' => $fp]), null, true);
+        Http::json(['certs' => Connections::fixedCerts()]);
 
     case 'admin.sessions':                 // seen by auditors too; ended only by an administrator
         Auth::requireAuditor();
         Http::json(['sessions' => Sessions::active()]);
+
+    case 'admin.sessions.record':  // any running session recorded from now on (on), or no longer (also one recorded by its connection)
+        $a    = Auth::require(true);
+        $info = Sessions::info($str('sid')) ?? Http::fail('not_found', 404);
+        if (!empty($in['on']) && !empty($info['app'])) {
+            Http::fail('record_unavailable');
+        }
+        Sessions::record($str('sid'), !empty($in['on']), $a['username'], true) || Http::fail('not_found', 404);
+        Http::json(['ok' => true]);
 
     case 'admin.sessions.kill':
         Auth::require(true);

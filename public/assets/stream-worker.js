@@ -19,12 +19,33 @@ let gfx = new GfxPipeline(gfxOut);
 
 /**
  * A recording played back (rdp.php?a=replay): frames with their time, [u32 ms][u8 type][u32 length][payload], given at the
- * pace they were recorded (times speed). What comes before `from` is decoded at once (a jump forward). The page pauses,
- * plays and changes the speed; the position is told four times a second.
+ * pace they were recorded (times speed). What comes before `from` is decoded at once (a jump forward), without its sound.
+ * The page pauses, plays and changes the speed; the position is told four times a second.
+ * Made into a video (exp): as fast as it goes, the page told to take a picture ('cap', its time) before a frame that comes
+ * at least STEP after the last one, if something was drawn since: once every decoded picture is drawn there, the page
+ * answering ('ack') when it took it. Each frame goes with its time (the sound is placed by it).
  */
-const play = { on: false, from: 0, speed: 1, paused: false, at: 0, ms: 0, told: 0, whole: false };
+const STEP = 1000 / 15;                                  // the video's pictures: 15 a second at most
+const play = { on: false, from: 0, speed: 1, paused: false, at: 0, ms: 0, told: 0, whole: false, exp: false, cur: 0,
+  dirty: false, drawn: 0, cap: -1, ack: null };
 const clock = () => (play.paused || !play.at ? play.ms : play.ms + (performance.now() - play.at) * play.speed);
+/** A picture taken by the page: at the time of the last thing drawn, STEP after the one before at least (the first at 0). */
+async function capture(ms) {
+  await gfx.idle();                                      // the video frames being decoded, drawn there first
+  if (ctrl?.signal.aborted) throw new Error('stopped');   // (stopped while waiting for them)
+  const at = play.cap < 0 ? 0 : Math.max(play.drawn, play.cap + STEP);
+  if (at > ms) return;
+  Object.assign(play, { cap: at, dirty: false });
+  postMessage({ t: 'cap', ms: at });
+  await new Promise((r) => { play.ack = r; });
+  if (ctrl?.signal.aborted) throw new Error('stopped');   // (the page stopped it meanwhile)
+  if (performance.now() - play.told >= 250) { play.told = performance.now(); postMessage({ t: 'pos', ms: at }); }
+}
 async function pace(ms) {
+  if (play.exp) {
+    if (play.dirty && (play.cap < 0 || ms >= play.cap + STEP)) await capture(ms);
+    return;
+  }
   if (ms < play.from) return;
   if (!play.at && !play.paused) play.at = performance.now();   // the clock starts where asked (play.ms: from, or where it was paused)
   for (;;) {
@@ -36,6 +57,7 @@ async function pace(ms) {
   }
 }
 function playCmd({ cmd, v }) {
+  if (cmd === 'ack') { const r = play.ack; play.ack = null; r?.(); return; }
   const now = clock();
   if (cmd === 'pause') Object.assign(play, { ms: now, paused: true });
   else if (cmd === 'play') Object.assign(play, { ms: now, at: performance.now(), paused: false });
@@ -47,9 +69,9 @@ function reset() {
   for (const d of gfx.decoders.values()) {
     try { d.dec.close(); } catch { /* already closed */ }
   }
-  const stats = gfx.stats;
+  const { stats, software } = gfx;
   gfx = new GfxPipeline(gfxOut);
-  gfx.stats = stats;
+  Object.assign(gfx, { stats, software });
   orders = new OrderParser();
   bulk = new CompressedStream();
   palette.fill(0);
@@ -103,7 +125,9 @@ function frame(type, d) {
       bpp = d[4];
       maxBitmap = Math.min(1 << 26, (((d[0] | (d[1] << 8)) + 63) & ~63) * (((d[2] | (d[3] << 8)) + 63) & ~63));   // (desktops past that are refused)
     }
-    postMessage({ t: 'frame', type, d }, [d.buffer]);
+    // a recording: its sound left out while what comes before `from` is decoded at once (its formats kept); with its time
+    if (play.on && !play.exp && play.cur < play.from && ((type === 7 && d[0] !== 70) || type === 32)) return;
+    postMessage(play.on ? { t: 'frame', type, d, ms: play.cur } : { t: 'frame', type, d }, [d.buffer]);
   }
 }
 
@@ -114,6 +138,7 @@ async function read(reader) {
     const { value, done } = await reader.read();
     if (done) {
       if (play.on && (!play.whole || len > 0)) throw new Error('recording damaged');   // not read to its end (the gateway's "end")
+      if (play.exp && play.dirty) await capture(Infinity);   // the last picture
       if (play.on) postMessage({ t: 'pos', ms: last, done: true });
       return;
     }
@@ -136,6 +161,8 @@ async function read(reader) {
       if (play.on && buf[q] !== 0) {                     // (the gateway's "end" has no time of its own)
         last = (buf[p] | (buf[p + 1] << 8) | (buf[p + 2] << 16) | (buf[p + 3] << 24)) >>> 0;
         await pace(last);
+        play.cur = last;
+        if (![3, 6, 7, 13, 32].includes(buf[q])) Object.assign(play, { dirty: true, drawn: last });   // (not the state, a ping or sound)
       }
       if (play.on && buf[q] === 0 && n === 3 && buf[q + 5] === 101) play.whole = true;   // "end": all of it was read
       frame(buf[q], buf.slice(q + 5, q + 5 + n));
@@ -149,10 +176,15 @@ async function read(reader) {
 }
 
 onmessage = async ({ data }) => {
-  if (data.cmd === 'stop') { ctrl?.abort(); clearInterval(diag); clearInterval(rate); return; }
+  if (data.cmd === 'stop') { ctrl?.abort(); play.ack?.(); for (const r of gfx.idlers.splice(0)) r(); clearInterval(diag); clearInterval(rate); return; }
   if (data.cmd === 'diag') { gfx.stats = {}; diag ||= setInterval(diagTick, 10000); return; }
   if (data.cmd) { playCmd(data); return; }
-  Object.assign(play, { on: !!data.timed, from: data.from || 0, speed: data.speed || 1, paused: false, at: 0, ms: data.from || 0, told: 0, whole: false });
+  Object.assign(play, { on: !!data.timed, from: data.from || 0, speed: data.speed || 1, paused: false, at: 0, ms: data.from || 0, told: 0, whole: false,
+    exp: !!data.exp, cur: 0, dirty: false, drawn: 0, cap: -1, ack: null });
+  if (play.exp) {                                       // a video made: H.264 decoded in software, each picture out at once, where
+    gfx.software = await (globalThis.VideoDecoder?.isConfigSupported({ codec: 'avc1.42e01f', hardwareAcceleration: 'prefer-software' })   // the browser has it
+      .then((r) => !!r.supported, () => false) ?? false);
+  }
   ctrl = new AbortController();
   rate ||= setInterval(() => postMessage({ t: 'bytes', n: received, at: Date.now() }), 1000);   // for the quality indicator
   let err = null, end, reason;

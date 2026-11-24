@@ -66,13 +66,38 @@ final class Sessions
     private static function sockPath(string $sid): string
     {
         $p = self::file($sid, 'sock');
-        return strlen($p) < 100 ? $p : sys_get_temp_dir() . '/mudesk-' . $sid . '.sock';   // (16 characters: two sessions could share it)
+        return strlen($p) < 100 ? $p : self::tmpSock($sid);
+    }
+
+    /**
+     * A session's socket when the data folder's path is too long for one (about 100 bytes): in the system's temporary
+     * folder, named after this installation (its data folder) and the session. Before, after the session alone: the
+     * housekeeping of another installation on the same server took this one's for dead and removed them, its sessions
+     * then left without keyboard or mouse.
+     */
+    public static function tmpSock(string $sid): string
+    {
+        return sys_get_temp_dir() . '/' . self::tmpPrefix() . $sid . '.sock';
+    }
+
+    /** The start of this installation's names in the system's temporary folder. */
+    public static function tmpPrefix(): string
+    {
+        return 'mudesk-' . substr(hash('sha256', (string)(realpath(Config::dir()) ?: Config::dir())), 0, 12) . '-';
     }
 
     public static function info(string $sid): ?array
     {
         $f = self::file($sid, 'json');
         return self::validSid($sid) && is_file($f) ? json_decode((string)file_get_contents($f), true) : null;
+    }
+
+    /** Whether session $sid runs: registered, and its file touched within STALE seconds (a process killed leaves it behind). */
+    public static function alive(string $sid): bool
+    {
+        $f = self::file($sid, 'json');
+        clearstatcache(true, $f);
+        return self::validSid($sid) && is_file($f) && (int)@filemtime($f) >= time() - self::STALE;
     }
 
     /** Running sessions (stale entries are cleaned up), without their input token: only the session's browser has it. */
@@ -90,12 +115,20 @@ final class Sessions
     {
         $out = [];
         foreach (glob(Config::dir('run/*.json')) ?: [] as $f) {
+            if (!self::validSid(basename($f, '.json'))) {
+                continue;                       // not a session's (run/exposure.json: before, taken for one, counted and listed)
+            }
             // a session that ends meanwhile takes its file with it (no warning); one being written is not a dead one:
             // only a file not touched for STALE seconds is cleaned up (one read empty while written was removed with
             // the session's queue, and its input got 404)
             $s     = json_decode((string)@file_get_contents($f), true);
             $mtime = @filemtime($f);
             if ($mtime !== false && $mtime < time() - self::STALE) {
+                // (its process killed by the hosting, say: what its clipboard files and print jobs took of its user's
+                // quota goes back with them, as its own end would have given it back)
+                if (is_array($s) && is_string($s['uid'] ?? null) && self::validSid(basename($f, '.json'))) {
+                    Files::charge($s['uid'], -self::quotaBytes(basename($f, '.json')));
+                }
                 self::cleanup(basename($f, '.json'));
                 continue;
             }
@@ -162,6 +195,7 @@ final class Sessions
         $s    = new self($sid);
         $path = self::sockPath($sid);
         @unlink($path);
+        // its socket, mode file (on Windows the secret of its TCP port) and queue: this account's only
         $old = umask(0077);
         $ok  = Config::get('ipc') !== 'file' && function_exists('stream_socket_server');
         // Windows has no Unix sockets for PHP: a TCP port of this computer only (127.0.0.1), whose messages must start with
@@ -169,7 +203,6 @@ final class Sessions
         // mouse move and frame acknowledgement waited up to 20 ms for it
         $tcp = $ok && PHP_OS_FAMILY === 'Windows';
         $srv = !$ok ? false : @stream_socket_server($tcp ? 'tcp://127.0.0.1:0' : 'unix://' . $path, $en, $es);
-        umask($old);
         if ($srv !== false) {
             stream_set_blocking($srv, false);
             $s->server = $srv;
@@ -184,6 +217,10 @@ final class Sessions
             $s->queue = self::file($sid, 'q');
             file_put_contents($s->queue, '');
             file_put_contents(self::file($sid, 'mode'), 'file');
+        }
+        umask($old);
+        foreach (['mode', 'q'] as $ext) {
+            is_file(self::file($sid, $ext)) && @chmod(self::file($sid, $ext), 0600);   // (also where umask is not honoured)
         }
         return $s;
     }
@@ -361,6 +398,16 @@ final class Sessions
         }
     }
 
+    /** Bytes of a session's clipboard files and print jobs: counted in its user's quota until the session ends. */
+    public static function quotaBytes(string $sid): int
+    {
+        if (!self::validSid($sid)) {
+            return 0;
+        }
+        return (int)array_sum(array_map(static fn($f) => (int)@filesize($f),
+            preg_grep('~/(\d{1,4}|image\.dib|print-\d+)$~', glob(Config::dir('tmp/' . $sid) . '/*') ?: [])));
+    }
+
     /** Removes the files of a session, its uploads and print jobs too (a process killed by the hosting leaves them). */
     public static function cleanup(string $sid): void
     {
@@ -387,6 +434,38 @@ final class Sessions
             }
             $this->viewers[$i][2] = (string)substr($wait, (int)$n);
         }
+    }
+
+    /**
+     * The shares with control whose guests have not used it for $limit seconds ($at: share id => when they last used it or
+     * came; 0: never ends): their control ended (they watch on), their guests sent $frame($id) (that it ended). Returns their
+     * ids, out of $at.
+     */
+    public function endIdleControls(string $sid, array &$at, int $now, int $limit, callable $frame): array
+    {
+        $ended = [];
+        foreach ($limit > 0 ? $at : [] as $id => $t) {
+            if ($now - $t < $limit) {
+                continue;
+            }
+            unset($at[$id]);
+            if (self::controlEnd($sid, (string)$id)) {
+                $this->toViewersOf((string)$id, $frame((string)$id));
+                $ended[] = (string)$id;
+            }
+        }
+        return $ended;
+    }
+
+    /** What only the guests of share $id are sent (whole frames, between the session's own). */
+    public function toViewersOf(string $id, string $data): void
+    {
+        foreach ($this->viewers as $i => [, $vid]) {
+            if ($vid === $id) {
+                $this->viewers[$i][2] .= $data;
+            }
+        }
+        $this->toViewers('');
     }
 
     /** Lets go of the guests of share $id (revoked), or of all of them; returns how many remain. */
@@ -425,11 +504,11 @@ final class Sessions
     // ---- sharing: a link for a guest, view only or with control, while the session runs
 
     /**
-     * A new share of session $sid ('view' or 'control'): [id, secret]. Its file keeps the secret's SHA-256, never the
+     * A new share of session $sid ('view' or 'control'), for $minutes or (0) as long as the session: [id, secret]. Its file keeps the secret's SHA-256, never the
      * secret, which goes only in the link the owner gives (sid.secret). Null when the session uses the queue file (no
      * sockets: a guest cannot be sent the session).
      */
-    public static function share(string $sid, string $mode): ?array
+    public static function share(string $sid, string $mode, int $minutes = 0): ?array
     {
         $info = self::info($sid);
         if ($info === null || (string)@file_get_contents(self::file($sid, 'mode')) === 'file') {
@@ -437,10 +516,68 @@ final class Sessions
         }
         $id     = bin2hex(random_bytes(8));
         $secret = rtrim(strtr(base64_encode(random_bytes(24)), '+/', '-_'), '=');
-        $saved = self::rewrite($sid, static function (array &$i) use ($id, $secret, $mode): void {
-            $i['shares'][$id] = ['hash' => hash('sha256', $secret), 'mode' => $mode === 'control' ? 'control' : 'view', 'created' => date('c')];
+        $saved = self::rewrite($sid, static function (array &$i) use ($id, $secret, $mode, $minutes): void {
+            $i['shares'][$id] = ['hash' => hash('sha256', $secret), 'mode' => $mode === 'control' ? 'control' : 'view', 'created' => date('c')]
+                + ($minutes > 0 ? ['expires' => time() + $minutes * 60] : []);   // (else, with the session)
         });
         return $saved ? ['id' => $id, 'secret' => $secret] : null;   // (a link never saved is never given)
+    }
+
+    /**
+     * What session $sid's process says of itself for the administration's status: the memory it takes now and at most ('mem',
+     * 'mem_peak', once a minute) and how many guests watch it ('viewers', when it changes). Other keys are left out.
+     */
+    public static function report(string $sid, array $what): bool
+    {
+        $what = array_map('intval', array_intersect_key($what, ['mem' => 0, 'mem_peak' => 0, 'viewers' => 0]));
+        return $what !== [] && self::rewrite($sid, static function (array &$i) use ($what): void {
+            $i = array_replace($i, $what);
+        });
+    }
+
+    /**
+     * Whether session $sid is recorded, and who started it ($by: 'policy', 'admin' or 'owner'; null: not recorded), as the
+     * session says once it did (its page, its guests and the active sessions read it here).
+     */
+    public static function recording(string $sid, ?string $by): bool
+    {
+        return self::rewrite($sid, static function (array &$i) use ($by): void {
+            $i['record']    = $by !== null;
+            $i['record_by'] = $by;
+        });
+    }
+
+    /**
+     * Asks session $sid to start or stop its recording ($on), on behalf of $by (a user name) as an administrator or as the
+     * session's user (rdp.php decides what each may do); false when the session is not running.
+     */
+    public static function record(string $sid, bool $on, string $by, bool $asAdmin): bool
+    {
+        return self::validSid($sid) && self::info($sid) !== null
+            && self::send($sid, pack('V', self::OUT_OF_BAND) . "\x23" . json_encode(['on' => $on, 'by' => $by, 'as' => $asAdmin ? 'admin' : 'owner']));
+    }
+
+    /** Share $id's guests no longer have control (they watch on): false when it had none, or the session ended. */
+    public static function controlEnd(string $sid, string $id): bool
+    {
+        $had = false;
+        return self::rewrite($sid, static function (array &$i) use ($id, &$had): void {
+            if (($i['shares'][$id]['mode'] ?? '') === 'control') {
+                [$i['shares'][$id]['mode'], $had] = ['view', true];
+            }
+        }) && $had;
+    }
+
+    /** The shares of session $sid past their time (their ids). */
+    public static function expiredShares(string $sid): array
+    {
+        $out = [];
+        foreach ((array)(self::info($sid)['shares'] ?? []) as $id => $s) {
+            if (!empty($s['expires']) && (int)$s['expires'] <= time()) {
+                $out[] = (string)$id;
+            }
+        }
+        return $out;
     }
 
     /** Share $id revoked: its guests are let go at once. */
@@ -464,6 +601,9 @@ final class Sessions
         [$sid, $secret] = explode('.', $link, 2) + [1 => ''];
         $info = self::validSid($sid) && $secret !== '' ? self::info($sid) : null;
         foreach ((array)($info['shares'] ?? []) as $id => $s) {
+            if (!empty($s['expires']) && (int)$s['expires'] <= time()) {
+                continue;                                // (past its time: the session lets its guests go)
+            }
             if (hash_equals((string)$s['hash'], hash('sha256', $secret))) {
                 return [$sid, (string)$id, $s['mode'], $info];
             }
@@ -512,10 +652,14 @@ final class Sessions
     {
         $file = self::file($sid, 'json');
         $tmp  = $file . '.' . bin2hex(random_bytes(4)) . '.tmp';
-        if (file_put_contents($tmp, json_encode($info)) === false) {
+        $old  = umask(0077);                     // (this account's only, as the stores: never readable by other sites' users)
+        $ok   = file_put_contents($tmp, json_encode($info));
+        umask($old);
+        if ($ok === false) {
             @unlink($tmp);
             return false;
         }
+        @chmod($tmp, 0600);
         for ($i = 0; !@rename($tmp, $file); $i++) {
             if ($i >= 50) {
                 @unlink($tmp);

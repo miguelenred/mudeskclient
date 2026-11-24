@@ -36,7 +36,7 @@ final class Rdpdr implements Channel
     /** Requests to this computer's folder the browser may owe at once (each answered, or the session's devices stall) */
     private const LOCAL_WAIT_MAX = 4096;
     private const PRINT_DRIVER = 'Microsoft Print To PDF';
-    private const PRINT_MAX = 200 * 1048576;   // all the print jobs of a session together (kept until it ends)
+    private const PRINT_MAX = 200 * 1048576;   // all the print jobs of a session together (kept until it ends; in the quota too)
     /** Quota taken from the user's counter at a time (shared with the other sessions and the file manager: a lock at every write was slow) */
     private const BATCH = 8 * 1048576;
 
@@ -897,7 +897,9 @@ final class Rdpdr implements Channel
                 $r->skip(28);
                 $data = $r->bytes(min($len, $r->left()));
                 $path = $this->jobs[$fileId] ?? null;
-                if ($path === null || $this->printed + strlen($data) > self::PRINT_MAX) {
+                // counted in the user's quota too until the session ends (as clipboard files): sessions printing at once
+                // filled the disk otherwise, 200 MB each
+                if ($path === null || $this->printed + strlen($data) > self::PRINT_MAX || !$this->charge(strlen($data))) {
                     $this->reply($cid, self::DISK_FULL, pack('VC', 0, 0));
                     break;
                 }

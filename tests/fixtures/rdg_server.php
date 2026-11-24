@@ -8,7 +8,7 @@
 // Prints its port, then one line per event: "auth ok <bindings ok|bindings bad>[ negotiate]", "auth ok kerberos <bindings
 // ok|bindings bad>", "auth bad", "bad host", "quarantined", "policy", "refused", "tunnel refused", "channel <host>:<port>", "denied
 // <host>", "keepalive answered" (the client's answer to its own), "keepalive" (one the client sent on its own), "close
-// answered", "cookie ok", "bad cookie", "legacy in", "caps <n>", "consent sent", "tunnel auth", and last, for each connection
+// answered", "client waited", "client gone", "cookie ok", "bad cookie", "legacy in", "caps <n>", "consent sent", "tunnel auth", and last, for each connection
 // signed in, "relayed <bytes up> <bytes down>".
 // What it does differently, to test the client:
 //   - the 401 of the first round has a chunked body;
@@ -32,7 +32,9 @@
 //   - client name "QUARANTINE": the tunnel authorization answers E_PROXY_QUARANTINE_ACCESSDENIED (a tunnel all the same);
 //   - client name "REFUSED": the tunnel authorization refused, E_PROXY_RAP_ACCESSDENIED ("refused");
 //   - computer "denied.test": the channel refused; "bye.test": the gateway itself sends "adios" and closes the channel in
-//     the same write; "slow.test": the channel answered after 9 s;
+//     the same write; "slow.test": the channel answered after 9 s; "lateclose.test": the client's close of the channel
+//     answered 250 ms later, "client waited" (its connection still open then) or "client gone" said first, and its
+//     connections kept open after the answer (no close frame either: the client ends them); no computer behind it;
 //   - a keep-alive sent right after the channel is opened.
 declare(strict_types=1);
 
@@ -257,6 +259,7 @@ while ($c = @stream_socket_accept($srv, 60)) {
     $to = null;
     $up = $down = $keepalives = 0;
     $end = microtime(true) + 30;
+    $host = '';
     while (microtime(true) < $end) {
         $r = array_values(array_filter([$src, $to]));
         $w = $e = null;
@@ -281,6 +284,7 @@ while ($c = @stream_socket_accept($srv, 60)) {
                 }
             }
         }
+        $bye = false;
         while (!$legacy && strlen($in) >= 6) {                  // whole client frames (masked)
             $len = ord($in[1]) & 0x7F;
             $p   = 2;
@@ -298,8 +302,9 @@ while ($c = @stream_socket_accept($srv, 60)) {
             $mask  = substr($in, $p, 4);
             $data  = substr(substr($in, $p + 4, $len) ^ str_repeat($mask, intdiv($len, 4) + 1), 0, $len);
             $in    = substr($in, $p + 4 + $len);
-            if ($op === 0x8) {                                // the client's close frame: the end
-                break 2;
+            if ($op === 0x8) {                                // the client's close frame: the end (what came before it answered)
+                $bye = true;
+                break;
             }
             $pkts .= $data;
         }
@@ -352,7 +357,7 @@ while ($c = @stream_socket_accept($srv, 60)) {
                 if ($host === 'bye.test') {                   // the last bytes and the channel's end, in one write
                     $out($packet(0x0A, pack('v', 5) . 'adios') . $packet(0x10, pack('V', 0)));
                     $down += 5;
-                } elseif ($host !== 'slow.test') {
+                } elseif ($host !== 'slow.test' && $host !== 'lateclose.test') {   // (lateclose: no computer, its close alone)
                     $to = @stream_socket_client("tcp://127.0.0.1:$relay", $en, $es, 5) ?: null;
                 }
             } elseif ($t === 0x0A && $to) {                  // data: to the computer
@@ -362,7 +367,17 @@ while ($c = @stream_socket_accept($srv, 60)) {
             } elseif ($t === 0x0D) {
                 echo $keepalives++ === 0 ? "keepalive answered\n" : "keepalive\n";
             } elseif ($t === 0x10) {                          // the client closes the channel: answered
+                if ($host === 'lateclose.test') {             // (later: whether the client waits for it, its connection open)
+                    usleep(250000);
+                    while (($d = @fread($src, 65536)) !== false && $d !== '') {
+                    }
+                    echo feof($src) ? "client gone\n" : "client waited\n";
+                }
                 $out($packet(0x11, pack('V', 0)));
+                for ($t = microtime(true) + 3; $host === 'lateclose.test' && microtime(true) < $t && !feof($src); usleep(10000)) {
+                    while (($d = @fread($src, 65536)) !== false && $d !== '') {   // (kept open: the client ends it)
+                    }
+                }
                 if ($legacy) {
                     break 2;
                 }
@@ -370,6 +385,9 @@ while ($c = @stream_socket_accept($srv, 60)) {
                 echo "close answered\n";
                 break 2;
             }
+        }
+        if ($bye) {
+            break;
         }
         if ($to) {                                            // the computer's bytes: back in data packets
             stream_set_blocking($to, false);

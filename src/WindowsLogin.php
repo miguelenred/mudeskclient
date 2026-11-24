@@ -42,16 +42,17 @@ final class WindowsLogin
         }
         for ($kerberos = true; ; $kerberos = false) {
             try {
-                $t = self::connect();
+                $t = self::secured();
                 if (is_string($t)) {
                     return $t;
                 }
-                $cert = $t->startTls();
+                [$t, $cert, $tlsKey] = $t;
                 $pin  = (string)Settings::get('ad_cert');
                 if ($pin === '' || !hash_equals($pin, (string)openssl_x509_fingerprint($cert, 'sha256'))) {
                     fclose($t->sock);
                     return 'ad_cert';
                 }
+                Transport::tlsWorked($tlsKey, $t->tlsInfo()['protocol']);
                 CredSsp::authenticate($t, Der::subjectPublicKey($cert), $user, $domain, $password, (string)Settings::get('ad_host'), false, $kerberos);
                 fclose($t->sock);
                 return 'ok';
@@ -68,15 +69,40 @@ final class WindowsLogin
     public static function fingerprint(): ?string
     {
         try {
-            $t = self::connect();
+            $t = self::secured();
             if (is_string($t)) {
                 return null;
             }
-            $fp = (string)openssl_x509_fingerprint($t->startTls(), 'sha256');
-            fclose($t->sock);
+            $fp = (string)openssl_x509_fingerprint($t[1], 'sha256');
+            fclose($t[0]->sock);
             return $fp !== '' ? $fp : null;
         } catch (ProtocolException) {
             return null;
+        }
+    }
+
+    /**
+     * The connection to the computer of the settings with its TLS handshake: [Transport, certificate, its key for
+     * Transport::tlsWorked()]; or why not (as connect()). TLS 1.2 or later first, TLS 1.0 and
+     * triple DES on a new connection only to a computer never seen with it (as Client: see Transport::tlsSeen()).
+     */
+    private static function secured(): array|string
+    {
+        $key  = strtolower((string)Settings::get('ad_host')) . ':' . (int)Settings::get('ad_port');
+        $seen = Transport::tlsSeen($key);
+        for ($legacy = $seen === 'legacy'; ; $legacy = true) {
+            $t = self::connect();
+            if (is_string($t)) {
+                return $t;
+            }
+            try {
+                return [$t, $t->startTls($legacy), $key];
+            } catch (ProtocolException $e) {
+                fclose($t->sock);
+                if ($legacy || $seen !== null) {
+                    throw $e;
+                }
+            }
         }
     }
 

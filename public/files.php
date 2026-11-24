@@ -31,7 +31,6 @@ if ($a === 'download') {
         Http::fail('not_found', 404);
     }
     @set_time_limit(0);                                   // wall time on Windows: a big file takes longer
-    header('Cross-Origin-Resource-Policy: same-origin');
     if ($type !== null) {                                 // a thumbnail: not a download nor an audit line each time the folder is shown
         // revalidated each time (Last-Modified, 304): kept for minutes, the next user of the browser could see it after sign-out
         $mtime = gmdate('D, d M Y H:i:s', (int)filemtime($file)) . ' GMT';

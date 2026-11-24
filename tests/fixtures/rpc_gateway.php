@@ -17,12 +17,15 @@
 // 2008), inrecycle (each IN channel takes 128 KB at most, the least the specification allows, whatever its Content-Length
 // says: the client makes it again, IN_R2 as this gateway knows the connection; its balancer's cookie set and wanted back),
 // inrecycle1 (the same with IN_R1, as another gateway of a farm would take the new IN channel; and the OUT channel made
-// again after 32 KB). A request with bytes before its request line is refused (400, "bad request"), as IIS does; bytes past
-// an IN channel's length too ("in overrun": IIS reads them as a new request), and that ends the connection.
+// again after 32 KB), lateclose (the channel's close answered 200 ms later; "close answered" once it goes), closefull (the
+// channel's close answered after 72 KB more of the computer's bytes, more than the client's window: only once it
+// acknowledges them), closerecycle (the channel's close answered by asking for a new OUT channel, never otherwise). A request with bytes before its request line
+// is refused (400, "bad request"), as IIS does; bytes past an IN channel's length too ("in overrun": IIS reads them as a new
+// request), and that ends the connection.
 // Prints its port, then one line per event: "probe 404", "auth ok <in|out> <bindings ok|bindings bad|no bindings>",
 // "auth bad", "rpc auth ok", "bad signature", "tunnel caps <hex>", "authorize <name>", "message call", "channel <name>:<port>",
 // "pipe", "ping", "recycled", "in recycled", "in recycle bad", "in lifetime bad", "in overrun", "in after its end",
-// "close channel", and when a client's channel ends "relayed <bytes up> <bytes down>".
+// "close channel", "close answered", and when a client's channel ends "relayed <bytes up> <bytes down>".
 declare(strict_types=1);
 
 use MuDesk\Rdp\{Ntlm, Rc4};
@@ -209,8 +212,18 @@ $request = static function (array &$vc, string $p) use ($resp, $mode, $relay, $t
         $vc['q'][] = [$resp($vc, $call, pack('V', 0)), true];
     } elseif ($op === 6) {                               // TsProxyCloseChannel: the pipe's end, then its answer
         echo "close channel\n";
-        $vc['q'][] = [$resp($vc, $vc['pipe'], pack('V', 0x4CA), 0x02), true];
-        $vc['q'][] = [$resp($vc, $call, str_repeat("\0", 20) . pack('V', 0)), true];
+        $say    = $mode === 'lateclose' || $mode === 'closefull' ? 'close answered' : null;   // (said once it goes)
+        $answer = [[$resp($vc, $vc['pipe'], pack('V', 0x4CA), 0x02), true, $say], [$resp($vc, $call, str_repeat("\0", 20) . pack('V', 0)), true]];
+        if ($mode === 'lateclose') {                     // (later: whether the client waits for it, its channels still open)
+            $vc['late'] = [microtime(true) + 0.2, $answer];
+        } elseif ($mode === 'closerecycle') {            // (a new OUT channel wanted instead: none made while closing)
+            $vc['askNew'] = true;
+        } else {
+            for ($i = 0; $mode === 'closefull' && $i < 18; $i++) {   // (the computer's last bytes first, past the window)
+                $vc['q'][] = [$resp($vc, $vc['pipe'], str_repeat('x', 4000), 0x00), true];
+            }
+            array_push($vc['q'], ...$answer);
+        }
         $vc['closing'] = true;
     } elseif ($op === 7) {
         $vc['q'][] = [$resp($vc, $call, str_repeat("\0", 20) . pack('V', 0)), true];
@@ -219,7 +232,7 @@ $request = static function (array &$vc, string $p) use ($resp, $mode, $relay, $t
 
 $newVc = static fn(): array => ['in' => null, 'out' => null, 'succ' => null, 'outCookie' => '', 'ch' => '', 'srv' => null, 'q' => [], 'sent' => 0, 'acked' => 0,
     'total' => 0, 'relay' => null, 'pipe' => 0, 'msgCall' => 0, 'msgSent' => false, 'tunnel' => '', 'channel' => '', 'up' => 0, 'down' => 0, 'recycled' => 0,
-    'closing' => false, 'ended' => false, 'stalled' => false, 'inCookie' => '', 'inSucc' => null, 'inSuccCookie' => ''];
+    'closing' => false, 'ended' => false, 'stalled' => false, 'inCookie' => '', 'inSucc' => null, 'inSuccCookie' => '', 'late' => null, 'askNew' => false];
 $commands = static function (string $p): array {
     $out = [];
     for ($o = 20, $i = 0, $n = unpack('v', $p, 18)[1]; $i < $n && $o + 4 <= strlen($p); $i++) {
@@ -243,7 +256,7 @@ for ($idle = microtime(true); microtime(true) - $idle < 60;) {
         is_resource($vc['relay']) && $r[] = $vc['relay'];
     }
     $e = null;
-    if (@stream_select($r, $w, $e, 0, 200000) === false) {
+    if (@stream_select($r, $w, $e, 0, array_filter(array_column($vcs, 'late')) !== [] ? 20000 : 200000) === false) {
         break;
     }
     foreach ($r as $s) {
@@ -511,14 +524,23 @@ for ($idle = microtime(true); microtime(true) - $idle < 60;) {
         if ($vc['out'] === null || !isset($conns[$vc['out']]) || $vc['succ'] !== null) {
             continue;
         }
+        if ($vc['late'] !== null && microtime(true) >= $vc['late'][0] && !$vc['ended']) {   // (lateclose: the close answered now)
+            array_push($vc['q'], ...$vc['late'][1]);
+            $vc['late'] = null;
+        }
+        if ($vc['askNew']) {                             // (closerecycle: OUT_R2/A2, a new OUT channel wanted)
+            $conns[$vc['out']]['w'] .= $rts(0x0004, [[13, pack('V', 0)]]);
+            [$vc['askNew'], $vc['recycled']] = [false, -1];
+        }
         while ($vc['q'] !== []) {
-            [$pdu, $counted] = $vc['q'][0];
+            [$pdu, $counted, $say] = $vc['q'][0] + [2 => null];
             if ($counted && $vc['sent'] - $vc['acked'] + strlen($pdu) > 65536) {
                 $vc['stalled'] = true;                           // (a client that never acknowledges stops here)
                 break;
             }
             array_shift($vc['q']);
             $conns[$vc['out']]['w'] .= $pdu;
+            $say !== null && print("$say\n");
             if ($counted) {
                 $vc['sent'] += strlen($pdu);
                 $vc['total'] += strlen($pdu);

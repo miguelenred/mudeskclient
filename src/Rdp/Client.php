@@ -105,6 +105,7 @@ final class Client
     private ?RdpSecurity $sec = null;
     /** @var bool the server refused TLS (SSL_NOT_ALLOWED_BY_SERVER): asked again without it */
     private bool $legacyOnly = false;
+    private bool $tlsLegacy = false;           // TLS 1.0 and triple DES offered too (a computer without TLS 1.2)
     private bool $licenseEncrypt = false;      // the server asked for the client's licensing PDUs encrypted (SEC_LICENSE_ENCRYPT_CS)
     /** @var array{0:int,1:string,2:string}|null the server's encryption method, random and certificate (Server Security Data) */
     private ?array $serverSec = null;
@@ -188,7 +189,10 @@ final class Client
 
     // ------------------------------------------------------------------ connection sequence
 
-    /** @param callable(string):void $verifyCert receives the SHA-256 certificate fingerprint; throw to abort */
+    /**
+     * @param callable(string, string):void $verifyCert receives the SHA-256 certificate fingerprint and its SHA-1 (as Windows shows
+     *                                          a certificate; '' for Standard RDP Security's key); throw to abort
+     */
     /**
      * RDP_PRECONNECTION_PDU_V2 (MS-RDPEPS 2.2.1.2): cbSize, Flags 0, Version 2, Id, cchPCB and the UTF-16 text with its
      * terminating null, which cchPCB counts (as in the specification's examples). For Hyper-V the text is the virtual
@@ -278,15 +282,32 @@ final class Client
         }
 
         if ($val !== 0) {
+            // TLS 1.2 or later first; TLS 1.0 and triple DES only to a computer never seen with TLS 1.2 (see Transport::tlsSeen())
+            $tlsKey = strtolower((string)$o['host']) . ':' . (int)$o['port'];
+            $seen   = Transport::tlsSeen($tlsKey);
+            $legacy = $this->tlsLegacy || $seen === 'legacy';
             try {
-                $cert = $this->t->startTls();
+                $cert = $this->t->startTls($legacy);
             } catch (ProtocolException $e) {
+                if (!$legacy && $seen === null) {
+                    // (the handshake failed on this connection: made again, as Windows' own client does)
+                    $this->trace?->log('tls', ['failed' => $e->getMessage(), 'then' => 'TLS 1.0 and triple DES too']);
+                    $this->t->close();
+                    $this->tlsLegacy = true;
+                    $this->connect($verifyCert);
+                    return;
+                }
+                if ($seen === 'modern') {                // someone in between, or the computer changed: never less than before
+                    $this->trace?->log('tls', ['failed' => $e->getMessage(), 'then' => 'nothing: TLS 1.2 or later was seen there before']);
+                    throw $e;
+                }
                 if ($val !== 1 || $o['security'] !== 'auto' || $this->legacyOnly) {
                     throw $e;
                 }
                 // no TLS this server and OpenSSL share (Windows Server 2003 offers RC4 and triple DES, which OpenSSL 3 leaves
                 // out): Standard RDP Security instead, as with a server that refuses TLS
                 $this->trace?->log('tls', ['failed' => $e->getMessage(), 'then' => 'Standard RDP Security']);
+                Transport::tlsWorked($tlsKey, 'none');    // (next time TLS 1.0 at once, then this: not TLS 1.2 first each time)
                 $this->t->close();
                 $this->legacyOnly = true;
                 $this->connect($verifyCert);
@@ -298,7 +319,8 @@ final class Client
                 $this->trace->log('tls', $this->t->tlsInfo() + ['subject' => $x['subject']['CN'] ?? null, 'issuer' => $x['issuer']['CN'] ?? null,
                     'validTo' => date('c', $x['validTo_time_t'] ?? 0), 'fingerprint' => $this->certFingerprint]);
             }
-            $verifyCert($this->certFingerprint);
+            $verifyCert($this->certFingerprint, (string)openssl_x509_fingerprint($cert, 'sha1'));
+            Transport::tlsWorked($tlsKey, $this->t->tlsInfo()['protocol']);   // (once its certificate is the one pinned)
         }
         if ($val === 4) {
             $this->rdstls($o['rdstls'] ?? throw new ProtocolException('Server chose RDSTLS, not offered', 'protocol'));
@@ -338,7 +360,7 @@ final class Client
             $this->rdpSecurity     = [1 => '40-bit', 2 => '128-bit', 8 => '56-bit', 0x10 => 'FIPS'][$this->serverSec[0]] ?? 'unknown';
             $this->trace?->log('rdp security', ['method' => $this->rdpSecurity,
                 'level' => $this->serverSec[3], 'key_bits' => strlen($key[0]) * 8, 'fingerprint' => $this->certFingerprint]);
-            $verifyCert($this->certFingerprint);
+            $verifyCert($this->certFingerprint, '');
         }
         $this->t->send(self::tpkt("\x02\xf0\x80\x04\x01\x00\x01\x00"));       // Erect Domain
         $this->t->send(self::tpkt("\x02\xf0\x80\x28"));                       // Attach User

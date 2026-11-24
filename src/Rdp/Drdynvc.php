@@ -242,12 +242,10 @@ final class Drdynvc implements Channel
         }
     }
 
-    /** Microphone audio from the browser (16-bit PCM in the format it was told). */
-    public function micData(string $pcm): void
+    /** Microphone audio from the browser (16-bit PCM in the format it was told); what the remote computer was sent of it (see Audin::fromBrowser). */
+    public function micData(string $pcm): string
     {
-        if ($this->micId !== null) {
-            $this->mic->fromBrowser($pcm);
-        }
+        return $this->micId !== null ? $this->mic->fromBrowser($pcm) : '';
     }
 
     /** From the browser's camera: u8 the start it belongs to (F_CAM), then a picture (JPEG), or nothing when it could not open its camera. */

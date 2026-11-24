@@ -371,6 +371,38 @@ $_SERVER['REMOTE_ADDR'] = '10.22.0.1';
 check('sign-in: a typo after byte 72 is a wrong password (no reset), such passwords no longer accepted',
     [$try('longpass', substr($long, 0, 75) . 'Q' . substr($long, 76)), MuDesk\Users::get($ub['id'])['sv'], $try('longpass', $long),
      MuDesk\Users::validPassword($long), MuDesk\Users::validPassword("Abcdefgh-123\0x")], ['invalid', 1, 'ok', false, false]);
+// first run: the setup code works a day, then another one takes its place in its file (a copy of data/ that went astray
+// before the installation was finished gave the administrator for good); an address already locked is refused without
+// writing the failures again (each refused request wrote that file)
+$setupFile = "$tmp/data/setup-code.php";
+$setupRead = static fn(): string => trim(substr((string)file_get_contents($setupFile), 15));
+$_SERVER['REMOTE_ADDR'] = '10.23.0.1';
+MuDesk\Auth::setupCode();
+$setupA = $setupRead();
+touch($setupFile, time() - 86400 - 5);
+$setupOld = MuDesk\Auth::setupAllowed($setupA);
+$setupB   = $setupRead();
+$setupNew = MuDesk\Auth::setupAllowed($setupB);
+// ... expired, and a new one cannot take its place (the file read-only: Windows does not replace it): refused all the same
+touch($setupFile, time() - 86400 - 5);
+chmod($setupFile, 0444);
+$setupStale = MuDesk\Auth::setupAllowed($setupB);
+chmod($setupFile, 0644);
+MuDesk\Store::update('ratelimit', static function (array &$d): void {
+    $d['ip:10.23.0.2'] = ['n' => 5, 'first' => time(), 'until' => time() + 900];
+});
+$_SERVER['REMOTE_ADDR'] = '10.23.0.2';
+touch("$tmp/data/ratelimit.json", $rlPast = time() - 50);
+$rlBefore = (string)file_get_contents("$tmp/data/ratelimit.json");
+$setupLocked = MuDesk\Auth::setupAllowed($setupB);
+clearstatcache();
+check('first run: the setup code works a day, then a new one (refused when expired, also if no new one could be written); an address locked refused without writing', [preg_match('/^(\w{5}-){3}\w{5}$/', $setupA),
+    $setupOld, $setupB !== $setupA, $setupNew, $setupStale, $setupLocked, file_get_contents("$tmp/data/ratelimit.json") === $rlBefore, filemtime("$tmp/data/ratelimit.json"),
+    glob("$tmp/data/setup-code.php.*") ?: []], [1, false, true, true, false, false, true, $rlPast, []]);
+@unlink($setupFile);
+MuDesk\Store::update('ratelimit', static function (array &$d): void {
+    unset($d['ip:10.23.0.1'], $d['ip:10.23.0.2'], $d['u:#setup']);
+});
 // a data key that the right password cannot open (a damaged users file): the user signs in with a new one, and the loss of
 // the saved RDP passwords is in the audit and the log (it was done in silence)
 $pk_ = 'Key-lost-' . bin2hex(random_bytes(6));
@@ -627,8 +659,49 @@ foreach (['6.6.6.6, 203.0.113.7', '6.6.6.6, 203.0.113.7, 10.0.0.2', '203.0.113.8
     $ips[] = MuDesk\Http::clientIp();
 }
 unset($_SERVER['HTTP_X_FORWARDED_FOR']);
+// ... an IPv6 proxy written otherwise than the request's address (upper case, not shortened): the same address (before, it
+// was not trusted); an entry that is no address (a range, a name, a list), refused at once with a page that says so (before,
+// it matched nothing, and every client had the proxy's address, without a word)
+file_put_contents("$tmp/proxy.php", '<?php return ["data_dir" => ' . var_export("$tmp/data", true) . ', "trusted_proxies" => ["2001:DB8:0:0:0:0:0:2"]];');
+MuDesk\Config::load("$tmp/proxy.php");
+[$ra0, $_SERVER['REMOTE_ADDR'], $_SERVER['HTTP_X_FORWARDED_FOR']] = [$_SERVER['REMOTE_ADDR'], '2001:db8::2', '203.0.113.10'];
+$ips[] = MuDesk\Http::clientIp();
+[$_SERVER['REMOTE_ADDR']] = [$ra0];
+unset($_SERVER['HTTP_X_FORWARDED_FOR']);
+$badProxy = [];
+foreach (['["10.0.0.0/8"]', '["proxy.local"]', '[["10.0.0.2"]]', '[" 10.0.0.2 ", "[::1]"]'] as $pl) {
+    file_put_contents("$tmp/proxy.php", '<?php return ["data_dir" => ' . var_export("$tmp/data", true) . ', "trusted_proxies" => ' . $pl . '];');
+    $pp = proc_open([PHP_BINARY, '-r', 'require ' . var_export(dirname(__DIR__) . '/src/bootstrap.php', true) . '; MuDesk\Config::load(' . var_export("$tmp/proxy.php", true) . '); echo "loaded";'],
+        [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $ppp);
+    $badProxy[] = [trim((string)stream_get_contents($ppp[1])), str_contains((string)stream_get_contents($ppp[2]), 'MuDeskClient: config_proxies'), proc_close($pp)];
+}
+@unlink("$tmp/proxy.php");
 MuDesk\Config::load("$tmp/config.php");
-check('client IP: right-most address that is not a trusted proxy', $ips, ['203.0.113.7', '203.0.113.7', '203.0.113.8', '203.0.113.9']);
+check('client IP: right-most address that is not a trusted proxy; an IPv6 proxy however written; one that is no address refused, said', [$ips, $badProxy],
+    [['203.0.113.7', '203.0.113.7', '203.0.113.8', '203.0.113.9', '203.0.113.10'], [...array_fill(0, 3, ['', true, 1]), ['loaded', false, 0]]]);
+
+// the public address fixed in config.php (public_url): OpenID Connect's return address and the passkeys' RP ID from it,
+// never from the request's Host header (a proxy that did not pass the public name on broke them); without it, or with
+// something that is no http(s) address, from the request as before
+$host0 = $_SERVER['HTTP_HOST'] ?? null;
+$_SERVER['HTTP_HOST'] = 'otro.test';
+$pubCfg = static function (string $url) use ($tmp): void {
+    file_put_contents("$tmp/pub.php", '<?php return ["data_dir" => ' . var_export("$tmp/data", true) . ', "public_url" => ' . var_export($url, true) . '];');
+    MuDesk\Config::load("$tmp/pub.php");
+};
+$pubCfg('https://Mudesk.Example.com:8443/remoto/');
+$pubSet = [MuDesk\Oidc::redirectUri(), MuDesk\WebAuthn::rpId()];
+$pubCfg('javascript:alert(1)');
+$pubBad = MuDesk\WebAuthn::rpId();
+MuDesk\Config::load("$tmp/config.php");
+$pubNone = MuDesk\WebAuthn::rpId();
+if ($host0 === null) {
+    unset($_SERVER['HTTP_HOST']);
+} else {
+    $_SERVER['HTTP_HOST'] = $host0;
+}
+check('public address: OpenID Connect and passkeys from public_url when set (not from the Host header), else from the request',
+    [$pubSet, $pubBad, $pubNone], [['https://mudesk.example.com:8443/remoto/oidc.php', 'mudesk.example.com'], 'otro.test', 'otro.test']);
 
 // running sessions: the list has no input tokens; disabling, deleting or resetting a user ends them
 $ksid = bin2hex(random_bytes(16));
@@ -1197,7 +1270,8 @@ check('TOTP: a used code answered apart from a wrong one, refused and not counte
 $_SERVER['REMOTE_ADDR'] = '127.0.0.1';
 
 // RDP targets: with all allowed, never the gateway itself, link-local (cloud metadata) or unspecified addresses, also
-// IPv4-mapped; private networks are allowed. In the list, a name rule (exact or *.domain) allows it whatever it resolves to.
+// IPv4-mapped; private networks are allowed. In the list, a name rule (exact or *.domain) allows what it resolves to, but
+// those addresses only when listed themselves too.
 $targets = static function (string $mode, array $list, array $hosts): array {
     MuDesk\Settings::save(['targets' => ['mode' => $mode, 'list' => $list]]);
     return array_map([Access::class, 'resolveTarget'], $hosts);
@@ -1209,15 +1283,17 @@ check('targets, all allowed: private and public addresses', $targets('all', [], 
 check('targets, all allowed: IPv4 inside IPv6 (NAT64, compatible) and cloud metadata addresses refused', $targets('all', [], ['64:ff9b::7f00:1',
     '64:ff9b::a9fe:a9fe', '::7f00:1', '::a9fe:a9fe', '::0.0.0.5', 'fd00:ec2::254', '100.100.100.200', '64:ff9b::808:808', '100.100.100.201']),
     [null, null, null, null, null, null, null, '64:ff9b::808:808', '100.100.100.201']);
-// a *.domain rule trusts the DNS of every name under it: one resolving to this computer (or link-local, cloud metadata) is
-// refused, as with "Allow all"; the exact name listed reaches it. (Linux and this Windows resolve any *.localhost name to
-// 127.0.0.1, which proves it; a system that resolves none only shows nothing is reached)
+// a name rule (the name itself or *.domain) trusts its DNS: one resolving to this computer (or link-local, cloud metadata)
+// is refused, as with "Allow all", unless that address is listed too (before, the name itself listed reached whatever its
+// DNS said). (Linux and this Windows resolve any *.localhost name to 127.0.0.1, which proves it; a system that resolves
+// none only shows nothing is reached)
 $mlh = (gethostbynamel('mudesk.localhost') ?: [null])[0];
-check('targets, list: what is listed, loopback too; exact names before the IP check; *.domain never to this computer',
+check('targets, list: what is listed, loopback too; names before the IP check; a name rule never to this computer unless its address is listed',
     [$targets('list', ['127.0.0.1', 'localhost'], ['127.0.0.1', 'LOCALHOST']),
      $targets('list', ['10.0.0.0/8', '*.localhost'], ['mudesk.localhost', 'localhost', '10.1.2.3', '11.0.0.1']),
-     $targets('list', ['mudesk.localhost'], ['mudesk.localhost']), $mlh],
-    [['127.0.0.1', '127.0.0.1'], [null, null, '10.1.2.3', null], [$mlh], $mlh === null ? null : '127.0.0.1']);
+     $targets('list', ['mudesk.localhost'], ['mudesk.localhost', 'localhost']), $targets('list', ['mudesk.localhost', '127.0.0.0/8'], ['mudesk.localhost']),
+     $targets('list', ['*.localhost', '127.0.0.1'], ['mudesk.localhost']), $mlh],
+    [['127.0.0.1', '127.0.0.1'], [null, null, '10.1.2.3', null], [null, null], [$mlh], [$mlh], $mlh === null ? null : '127.0.0.1']);
 check('settings: a list where a number or a rule goes refused, nothing stored', [MuDesk\Settings::save(['login_max_attempts' => [1]]),
     MuDesk\Settings::save(['targets' => ['mode' => 'all', 'list' => [['x']]]]), MuDesk\Settings::save(['clients' => 'all']), MuDesk\Settings::get('targets')['mode']],
     ['invalid_input', 'invalid_input', 'invalid_input', 'list']);
@@ -1355,6 +1431,12 @@ if (is_file(__DIR__ . '/../Dockerfile') && !str_contains((string)file_get_conten
     $noUrl[] = 'Dockerfile';
 }
 check('every file of code carries the project\'s address (miguelenred.es/mudeskclient) in its header', $noUrl, []);
+// Docker Compose runs the image of this version (a tag that does not change), not "latest": a new version reached the
+// server without anyone asking for it (and not the code that was checked)
+if (is_file(__DIR__ . '/../compose.yaml')) {
+    preg_match('~^\s*image:\s*ghcr\.io/miguelenred/mudeskclient:(\S+)\s*$~m', (string)file_get_contents(__DIR__ . '/../compose.yaml'), $cm);
+    check('Docker Compose: the image of this version, not the latest', $cm[1] ?? null, MuDesk\VERSION);
+}
 // Wake-on-LAN of a connection: the MAC address in any usual form kept as AA:BB:..., where the packet goes as an IPv4 address
 // with an optional port; anything else refused; the packet is 6 bytes 0xFF and the MAC 16 times, and it arrives
 $wsrv  = stream_socket_server('udp://127.0.0.1:0', $en, $es, STREAM_SERVER_BIND);
@@ -1576,6 +1658,22 @@ check('printer capability announced', [unpack('v', $caps)[1], substr($caps, 48, 
 $dev->onData($irp(0, 4, 0x00, str_repeat("\0", 32)));
 check('print jobs of a session limited together', $st($dev, $irp(1, 5, 0x04, pack('VP', 13, 0) . str_repeat("\0", 20) . '%PDF-1.7 test')), 0xC000007F);
 MuDesk\Files::remove($dir);
+// print jobs count in the user's quota (as clipboard files do) until the session ends: several sessions printing at once
+// took 200 MB each of the server's disk, out of any quota
+$q0 = MuDesk\Settings::get('files_quota_mb');
+MuDesk\Settings::save(['files_quota_mb' => 1]);
+$pq   = 'printquota';
+$pdev = new Rdpdr($client, $pq, false, true, $dir);
+$pdev->onData($irp(0, 6, 0x00, str_repeat("\0", 32)));
+$half = str_repeat('x', 600 * 1024);
+$pqs  = [$st($pdev, $irp(1, 7, 0x04, pack('VP', strlen($half), 0) . str_repeat("\0", 20) . $half)),
+    $st($pdev, $irp(1, 8, 0x04, pack('VP', strlen($half), 0) . str_repeat("\0", 20) . $half))];
+$pdev->release();
+check('print jobs: counted in the quota', [$pqs, MuDesk\Files::quotaLeft($pq) <= 1048576 - 600 * 1024, filesize("$dir/print-1")], [[0, 0xC000007F], true, 600 * 1024]);
+MuDesk\Files::charge($pq, -600 * 1024);
+MuDesk\Settings::save(['files_quota_mb' => $q0]);
+MuDesk\Files::remove($dir);
+MuDesk\Files::removeAll($pq);
 
 // shared drive announce: Windows reads the drive name (DeviceData) as 8-bit text (in UTF-16 it showed "M") and shows it as
 // "<drive> on <client name>": "Carpeta compartida en MuDesk", in the language of the page (before: "MuDesk en MUDESK")
@@ -2307,6 +2405,8 @@ for ($i = 0; $i < $chunks; $i++) {
 }
 check('server pieces limited, channel message joined once', [$tooBig instanceof MuDesk\Rdp\ProtocolException, $longer instanceof MuDesk\Rdp\ProtocolException,
     strlen($sink->msg) === $chunks * 1600 && $sink->msg[1600] === "\1", microtime(true) - $t0 < 1], [true, true, true, true]);
+unset($fc, $tooBig, $longer);                                                       // (megabytes the tests after need: 128 MB in all)
+$sink->msg = '';
 // a channel message is at most 64 MB, its length the one its first chunk announced (each chunk announcing 4 GB grew the
 // memory to the limit); dynamic channel messages too, and at most 8 of them being joined at a time
 $cl = new Client(['width' => 800, 'height' => 600], static fn() => null);
@@ -2651,6 +2751,39 @@ check('clipboard: formatted text both ways', [
 $out();
 $clip->onData(pack('vvV', 2, 0, 36) . pack('V', 0xC1A1) . $name('HTML Format'));   // HTML only (PowerShell Set-Clipboard -AsHtml)
 check('clipboard: HTML without plain text is requested too', str_contains($out(), pack('vvV', 4, 0, 4) . pack('V', 0xC1A1)), true);
+
+// a diagnostic trace keeps no content: what is copied either way, files through the clipboard and what is printed are only
+// counted (the trace's channel statistics), never written down, not even in hexadecimal
+$secret = 'SecretoDelUsuario-' . bin2hex(random_bytes(4));
+$gsid   = bin2hex(random_bytes(16));
+$gc     = new Client(['width' => 800, 'height' => 600], static fn() => null);
+$gc->t  = $tr;
+(new ReflectionProperty(Client::class, 'channelIds'))->setValue($gc, ['cliprdr' => 1006, 'rdpdr' => 1004]);
+(new ReflectionProperty(Client::class, 'channelOpts'))->setValue($gc, ['cliprdr' => 0xC0000000, 'rdpdr' => 0x80800000]);
+$gc->trace = new MuDesk\Rdp\Trace($gsid, []);
+$gclip     = new MuDesk\Rdp\Cliprdr($gc, 'tracetest');
+(new ReflectionProperty(MuDesk\Rdp\Cliprdr::class, 'ready'))->setValue($gclip, true);
+$gclip->fromBrowser('T' . $secret);                                                       // copied in the browser
+$gclip->onData(pack('vvV', 4, 0, 4) . pack('V', 13));                                     // ... and pasted remotely
+$gclip->onData(pack('vvV', 2, 0, 36) . pack('V', 13) . $name(''));                         // copied remotely
+$gclip->onData(pack('vvV', 5, 1, strlen(Text::toUtf16($secret)) + 2) . Text::toUtf16($secret) . "\0\0");
+$gclip->onData(pack('vvV', 9, 1, 4 + strlen($secret)) . pack('V', 1) . $secret);        // file contents
+$gdir = "$tmp/trace-print";
+$gdev = new Rdpdr($gc, 'tracetest', false, true, $gdir);
+$gdev->onData(pack('vvvvV', 0x4472, 0x4343, 1, 12, 7));
+$gdev->onData($irp(0, 1, 0x00, str_repeat("\0", 32)));
+$gdev->onData($irp(1, 2, 0x04, pack('VP', strlen($secret), 0) . str_repeat("\0", 20) . $secret));   // printed
+$gdev->onData($irp(1, 3, 0x02, str_repeat("\0", 32)));
+$gc->trace->close([]);
+$glog = (string)file_get_contents("$tmp/data/trace/$gsid.log");
+check('trace: no clipboard, file or print content in it', [substr_count($glog, ' clipboard ') >= 3, str_contains($glog, ' rdpdr '),
+    array_filter([$secret, Text::toUtf16($secret), bin2hex($secret), bin2hex(Text::toUtf16($secret)), bin2hex(substr(Text::toUtf16($secret), 0, 16)),
+        bin2hex(substr($secret, 0, 8))],
+        static fn($s) => str_contains($glog, $s))], [true, true, []]);
+unlink("$tmp/data/trace/$gsid.log");
+array_map('unlink', glob("$gdir/*") ?: []);
+is_dir($gdir) && rmdir($gdir);
+$out();
 
 // phone keyboard through the clipboard (option): text in one go is pasted. What was copied on the remote side is read
 // first (all its formats) and offered again after; Ctrl+V once Windows takes the announcement and the screen shows the
@@ -3114,9 +3247,9 @@ $mi_formats  = $dvcOut();
 $mdvc->onData("\x30\x07" . pack('CVV', 3, 441, 0) . $mi_fmt(1, 2, 44100, 16));   // Open: 441 frames, the first format agreed
 $mi_opened   = [$dvcOut(), $mframes];
 $mframes  = [];
-$mdvc->micData(str_repeat("\x11", 2000));
+$mi_heard1   = $mdvc->micData(str_repeat("\x11", 2000));
 $mi_data1    = $dvcOut();
-$mdvc->micData(str_repeat("\x22", 646));                                       // 236 waiting + 646 = one more packet
+$mi_heard2   = $mdvc->micData(str_repeat("\x22", 646));                        // 236 waiting + 646 = one more packet
 $mi_data2    = $dvcOut();
 $mdvc->onData("\x30\x07" . pack('CV', 7, 2));                                 // Format Change to the third: stereo 44.1 kHz
 $mi_changed  = [$dvcOut(), $mframes];
@@ -3133,8 +3266,11 @@ $mdvc->onData("\x30\x07" . pack('CVV', 2, 3, 0) . $mi_fmt(1, 1, 8000, 16));     
 $mi_short    = [$dvcOut(), $mframes];
 $mdvc->onData("\x40\x07");                                                    // closed
 $mi_closed   = [$dvcOut(), $mframes];
-$mdvc->micData(str_repeat("\x55", 2000));
+$mi_heardAfter = $mdvc->micData(str_repeat("\x55", 2000));
 $mi_after    = $dvcOut();
+check('microphone: what the remote computer was sent of it given back, whole packets (as a recording keeps it); nothing once closed or without the option', [
+    $mi_heard1 === str_repeat("\x11", 1764), $mi_heard2 === str_repeat("\x11", 236) . str_repeat("\x22", 646), $mi_heardAfter,
+    (new MuDesk\Rdp\Drdynvc($mc, false))->micData(str_repeat("\x11", 2000))], [true, true, '', '']);
 $mi_infoFlags = static function (bool $mic): int {                               // the Client Info flags sent
     $mi_mem = fopen('php://memory', 'w+b');
     $mi_tr  = (new ReflectionClass(Transport::class))->newInstanceWithoutConstructor();
@@ -3377,8 +3513,8 @@ $mi_early->onData("\x30\x07" . pack('CVV', 2, 1, 0) . $mi_fmt(1, 1, 44100, 16));
 $dvcOut();
 $mframes = [];
 $mi_early->onData("\x30\x07" . pack('CV', 7, 0));
-$mi_early->micData(str_repeat("\x01", 2000));
-check('microphone: a format change before the open left out', [$dvcOut(), $mframes], [[], []]);
+$mi_earlyHeard = $mi_early->micData(str_repeat("\x01", 2000));
+check('microphone: a format change before the open left out (nothing of the audio sent, nor given back to be recorded)', [$dvcOut(), $mframes, $mi_earlyHeard], [[], [], '']);
 check('dynamic channels: a long message split within 1600-byte chunks and joined back the same', $mi_sizes,
     [[1, true, true, 1], [1, true, true, 2], [1, true, true, 1], [1, true, true, 2], [1, true, true, 44]]);
 
@@ -3535,7 +3671,7 @@ $legacy = static function (string $mode, int $method, int $level, string $cert, 
     proc_close($p);
     return [$r, $pin !== '' ? 'pinned' : 'none', $got, $said, $c->rdpSecurity];
 };
-check('Standard RDP Security: XP (no negotiation), 2003 refusing TLS or sharing no TLS, PROTOCOL_RDP chosen; proprietary and X.509 keys; each method; licensing asked encrypted; redirection; TLS-only connection refused', [
+check('Standard RDP Security: XP (no negotiation), 2003 refusing TLS or sharing no TLS (TLS 1.2, then 1.0, then without), PROTOCOL_RDP chosen; proprietary and X.509 keys; each method; licensing asked encrypted; redirection; TLS-only connection refused', [
     $legacy('xp', 2, 2, 'proprietary'), $legacy('refuse', 16, 3, 'x509'), $legacy('select0', 1, 1, 'proprietary'), $legacy('licreq', 8, 2, 'x509'),
     $legacy('redirect', 2, 3, 'proprietary'), $legacy('xp', 2, 2, 'proprietary', 'tls'), $legacy('tlsfail', 2, 2, 'proprietary')],
     [['connected', 'pinned', ['05'], ['x224 3', 'methods 0x1b', 'info ana Clave-XP-1', 'confirm ok', 'input 001e011e events 2'], '128-bit'],
@@ -3544,7 +3680,7 @@ check('Standard RDP Security: XP (no negotiation), 2003 refusing TLS or sharing 
      ['connected', 'pinned', ['05'], ['x224 3', 'methods 0x1b', 'info ana Clave-XP-1', 'license reply encrypted', 'confirm ok', 'input 001e011e events 2'], '56-bit'],
      ['redirected to 10.9.8.7', 'pinned', [], ['x224 3', 'methods 0x1b', 'info ana Clave-XP-1'], '128-bit'],
      ['rdp_security', 'none', [], ['x224 1', 'methods none', 'error closed'], null],
-     ['connected', 'pinned', ['05'], ['x224 3', 'x224 none', 'methods 0x1b', 'info ana Clave-XP-1', 'confirm ok', 'input 001e011e events 2'], '128-bit']]);
+     ['connected', 'pinned', ['05'], ['x224 3', 'x224 3', 'x224 none', 'methods 0x1b', 'info ana Clave-XP-1', 'confirm ok', 'input 001e011e events 2'], '128-bit']]);
 // ... and a License Request that does not ask for the client's licensing PDUs encrypted: answered in the clear, as the
 // specification has it (an encrypted one is not read as a licensing PDU there)
 check('Standard RDP Security: a License Request not asking for encryption answered in the clear', $legacy('licplain', 2, 2, 'x509'),
@@ -3607,6 +3743,77 @@ proc_terminate($v3p);
 proc_close($v3p);
 check('NLA: CredSSP version 3 (Windows 7, Server 2008 R2): the key bound without a nonce, the credentials delegated', [$v3r, $v3said], ['closed', 'ok creds']);
 
+// TLS 1.2 or later first: TLS 1.0 and triple DES only to a computer never seen with TLS 1.2 (on a new connection, as Windows'
+// own client), and then at once for a day (not after a failed handshake each time); a computer seen with TLS 1.2 is never
+// offered less (someone in between who made the first handshake fail took any computer back to TLS 1.0)
+$t10p = proc_open([PHP_BINARY, __DIR__ . '/fixtures/nla_server.php', 'ana', 'TEST', 'Clave-Win7-1', $cnf, 'tls10'], [1 => ['pipe', 'w'], 2 => ['file', PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null', 'w']], $t10pp);
+$t10port = (int)trim((string)fgets($t10pp[1]));
+$t10c = static function (string $host) use ($t10port): string {
+    $c = new Client(['host' => $host, 'ip' => '127.0.0.1', 'port' => $t10port, 'user' => 'ana', 'domain' => 'TEST', 'password' => 'Clave-Win7-1',
+        'security' => 'nla', 'width' => 800, 'height' => 600, 'bpp' => 16, 'kbd' => 0x040A, 'clientName' => 'c', 'monitors' => [], 'channels' => [], 'audio' => false,
+        'mic' => false, 'orders' => false, 'gfx' => 'auto', 'compression' => 0, 'perf' => 0, 'tzBias' => 0, 'app' => '', 'vm' => '', 'lb' => ''], static fn() => null);
+    try {
+        $c->connect(static fn() => null);
+        return 'connected';
+    } catch (MuDesk\Rdp\ProtocolException $e) {
+        return $e->key;
+    } finally {
+        isset($c->t) && $c->disconnect();
+    }
+};
+$t10said = static function () use ($t10pp): array {
+    $l = [];
+    while (($s = trim((string)fgets($t10pp[1]))) !== '') {
+        $l[] = $s;
+        if ($s !== 'tls') {
+            break;
+        }
+    }
+    return $l;
+};
+$t10a = [$t10c('viejo2008'), $t10said(), Transport::tlsSeen("viejo2008:$t10port")];
+$t10b = [$t10c('viejo2008'), $t10said()];
+Transport::tlsWorked("nuevo2019:$t10port", 'TLSv1.3');   // seen with TLS 1.3 before
+$t10m = [$t10c('nuevo2019'), trim((string)fgets($t10pp[1]))];   // (its line, once the server wrote it)
+proc_terminate($t10p);
+$t10m[] = trim((string)stream_get_contents($t10pp[1]));   // no other connection after it
+proc_close($t10p);
+check('TLS: 1.2 first, 1.0 only to a computer never seen with 1.2 (then at once), never to one seen with it', [$t10a, $t10b, $t10m],
+    [['closed', ['tls', 'ok creds'], 'legacy'], ['closed', ['ok creds']], ['tls', 'tls', '']]);
+// ... remembered: changed, or once a day (not written on every connection); TLS 1.0 asked again after a day, TLS 1.2 kept a year
+$tlsFile = $tmp . '/data/tls.json';
+$tlsAt   = static fn(string $k, string $kind, int $ago) => MuDesk\Store::update('tls', static function (array &$d) use ($k, $kind, $ago): void {
+    $d[$k] = [$kind, time() - $ago];
+});
+touch($tlsFile, $tlsPast = time() - 100);
+Transport::tlsWorked("viejo2008:$t10port", 'TLSv1');    // (as it went an instant ago)
+clearstatcache();
+$tlsUnwritten = filemtime($tlsFile) === $tlsPast;
+$tlsAt('a:1', 'legacy', 86400 + 5);
+$tlsAt('b:1', 'modern', 364 * 86400);
+$tlsAt('c:1', 'modern', 366 * 86400);
+// ... by the version agreed, not by what was offered (TLS 1.0 offered after a handshake that failed once, TLS 1.2 agreed)
+Transport::tlsWorked('e:1', 'TLSv1.2');
+Transport::tlsWorked('f:1', 'TLSv1.1');
+$tlsKinds = [$tlsUnwritten, Transport::tlsSeen('a:1'), Transport::tlsSeen('b:1'), Transport::tlsSeen('c:1'), Transport::tlsSeen('d:1'), Transport::tlsSeen('e:1'),
+    Transport::tlsSeen('f:1'), decoct(fileperms($tlsFile) & 0777) === '600' || PHP_OS_FAMILY === 'Windows'];
+// ... its file damaged (a crash, edited by hand), or one that cannot be written: never a reason for a connection to fail
+file_put_contents($tlsFile, '{"cut');
+$tlsDamaged = [Transport::tlsSeen('b:1'), count(glob("$tlsFile.damaged-*") ?: [])];
+array_map('unlink', glob("$tlsFile.damaged-*") ?: []);
+@unlink($tlsFile);
+mkdir($tlsFile);                                         // (a folder where the file goes: neither read nor written)
+$tlsBlocked = [Transport::tlsSeen('b:1')];
+try {
+    Transport::tlsWorked('g:1', 'TLSv1.3');
+    $tlsBlocked[] = 'no error';
+} catch (Throwable $e) {
+    $tlsBlocked[] = get_class($e);
+}
+rmdir($tlsFile);
+check('TLS: how it went remembered, written when it changed or once a day, by the version agreed; TLS 1.0 asked again after a day, TLS 1.2 kept a year; its file damaged or unwritable never fails a connection',
+    [...$tlsKinds, $tlsDamaged, $tlsBlocked], [true, null, 'modern', null, null, 'modern', 'legacy', true, [null, 1], [null, 'no error']]);
+
 // TLS 1.0 with AES128-SHA, all Windows 7 and Server 2008 R2 offer without updates: the handshake made; and with
 // ECDHE-RSA-AES128-SHA, what they choose first with their cipher suites put in another order (its key exchange signed with
 // MD5 and SHA-1, as TLS 1.0 signs: OpenSSL 3 takes that only at security level 0)
@@ -3617,14 +3824,14 @@ $t10cert = (static function () use ($cnf): string {
     file_put_contents($f = sys_get_temp_dir() . '/mudesk-tls10-' . bin2hex(random_bytes(4)) . '.pem', $p . $kp);
     return $f;
 })();
-$t10hand = static function (string $cipher) use ($t10cert): array|string {
+$t10hand = static function (string $cipher, bool $legacy = true) use ($t10cert): array|string {
     $t10 = proc_open([PHP_BINARY, '-r', '$ctx = stream_context_create(["ssl" => ["local_cert" => $argv[1], "security_level" => 0, "ciphers" => $argv[2] . ":@SECLEVEL=0",
         "crypto_method" => STREAM_CRYPTO_METHOD_TLSv1_0_SERVER]]); $s = stream_socket_server("tcp://127.0.0.1:0", $en, $es, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $ctx);
         echo substr(strrchr(stream_socket_get_name($s, false), ":"), 1), "\n"; $c = stream_socket_accept($s, 10); stream_set_blocking($c, true);
         @stream_socket_enable_crypto($c, true, STREAM_CRYPTO_METHOD_TLSv1_0_SERVER); fread($c, 1);', $t10cert, $cipher], [1 => ['pipe', 'w']], $t10p);
     $t10t = new Transport('127.0.0.1', (int)trim((string)fgets($t10p[1])));
     try {
-        $t10t->startTls();
+        $t10t->startTls($legacy);
         $r = $t10t->tlsInfo();
     } catch (MuDesk\Rdp\ProtocolException $e) {
         $r = $e->getMessage();
@@ -3633,10 +3840,10 @@ $t10hand = static function (string $cipher) use ($t10cert): array|string {
     proc_close($t10);
     return $r;
 };
-$t10r = [$t10hand('AES128-SHA'), $t10hand('ECDHE-RSA-AES128-SHA')];
+$t10r = [$t10hand('AES128-SHA'), $t10hand('ECDHE-RSA-AES128-SHA'), is_string($t10hand('AES128-SHA', false))];
 @unlink($t10cert);
-check('TLS 1.0 with AES128-SHA (Windows 7, Server 2008 R2), and with ECDHE-RSA-AES128-SHA', $t10r,
-    [['protocol' => 'TLSv1', 'cipher' => 'AES128-SHA'], ['protocol' => 'TLSv1', 'cipher' => 'ECDHE-RSA-AES128-SHA']]);
+check('TLS 1.0 with AES128-SHA (Windows 7, Server 2008 R2), and with ECDHE-RSA-AES128-SHA; only when offered (legacy)', $t10r,
+    [['protocol' => 'TLSv1', 'cipher' => 'AES128-SHA'], ['protocol' => 'TLSv1', 'cipher' => 'ECDHE-RSA-AES128-SHA'], true]);
 
 // a server's answer read when it closed straight after it, both there before the client reads (2003 refusing TLS: its
 // X.224 answer, then its close); then the close (before, the close was seen first, "closed", and the answer thrown away)
@@ -3707,7 +3914,7 @@ check('NLA: dropped is a wrong password, silent is no answer', array_map(static 
 $app = "$tmp/app";
 mkdir("$app/public", 0700, true);
 mkdir("$app/src");
-foreach (['rdp.php', 'files.php', 'api.php', 'oidc.php'] as $f) {
+foreach (['rdp.php', 'files.php', 'api.php', 'oidc.php', 'health.php'] as $f) {
     copy(__DIR__ . "/../public/$f", "$app/public/$f");
 }
 $stub = <<<'PHP'
@@ -3721,10 +3928,16 @@ spl_autoload_register(static function (string $class): void {
         require $file;
     }
 });
+// (the tests rewrite config.php between requests: never an older copy from OPcache, on by itself in PHP's web server since 8.5)
+\function_exists('opcache_invalidate') && \opcache_invalidate(__DIR__ . '/../config.php', true);
 Config::load(__DIR__ . '/../config.php');
 PHP;
 file_put_contents("$app/src/bootstrap.php", str_replace('SRC', var_export(realpath(__DIR__ . '/../src'), true), $stub));
-file_put_contents("$app/config.php", '<?php return ["data_dir" => ' . var_export("$tmp/data", true) . '];');
+// (a computer never seen trusted at once, as before 1.2, but where its confirmation is the point: see $askCerts)
+$askCerts = static function (bool $on) use ($app, $tmp): void {
+    file_put_contents("$app/config.php", '<?php return ["data_dir" => ' . var_export("$tmp/data", true) . ', "confirm_new_certificates" => ' . var_export($on, true) . '];');
+};
+$askCerts(false);
 $tsid = str_repeat('ab', 16);
 file_put_contents("$tmp/data/run/$tsid.json", json_encode(['uid' => 'u1', 'token' => hash('sha256', 'secret-token')]));
 file_put_contents("$tmp/data/run/$tsid.mode", 'file');
@@ -3982,6 +4195,23 @@ $authRefusedSeen = $rdgLines();
 $certOther = $gwOpen('Clave-Gw-1', 'pc.test', 'legacycert.test');
 $certOther instanceof MuDesk\Rdp\Gateway && $certOther->close();
 $certOtherSeen = $rdgLines();
+// the channel's close answered late, on the WebSocket and on the older transport's two connections (kept open after it: the
+// client ends them once it has its answer, 250 ms after it asked, not at its second's end)
+$lateClose = [];
+foreach (['127.0.0.1', 'legacy.test'] as $gwHost) {
+    $g    = $gwOpen('Clave-Gw-1', 'lateclose.test', $gwHost);
+    $took = null;
+    if ($g instanceof MuDesk\Rdp\Gateway) {
+        for ($i = 0; $i < 10; $i++) {                                    // (the keep-alive's answer out)
+            $g->pump();
+            usleep(10000);
+        }
+        $t = microtime(true);
+        $g->close();
+        $took = microtime(true) - $t;
+    }
+    $lateClose[] = [$rdgLines(), $took !== null && $took < 0.75];
+}
 proc_terminate($echoP);
 proc_close($echoP);
 proc_terminate($rdg);
@@ -4005,6 +4235,12 @@ check('RD Gateway: its cookies sent back; one that wants a capability this clien
       ['auth ok bindings ok', 'policy', 'channel bye.test:3389', 'keepalive answered', 'close answered', 'relayed 0 5']]]);
 // a tunnel authorization the gateway refuses: no channel asked for; the older transport's second connection with another
 // certificate than the first's (a man in the middle on it): refused
+// ... the end: the channel closed, its answer waited for (within a second) before the connections are (before, they were at
+// once: the older transport's gateway could take the OUT one's end before the close the IN one carried, and a connection
+// closed with something unread is reset, which can lose what came last on it)
+check('RD Gateway: the channel\'s close answered before its connections are closed (late too: ended at its answer), on the WebSocket and the older transport', $lateClose, [
+    [['auth ok bindings ok', 'channel lateclose.test:3389', 'keepalive answered', 'client waited', 'relayed 0 0'], true],
+    [['auth ok bindings ok', 'auth ok bindings ok', 'legacy in', 'channel lateclose.test:3389', 'keepalive answered', 'client waited', 'relayed 0 0'], true]]);
 check('RD Gateway: a tunnel authorization refused; the older transport\'s second connection with another certificate refused', [
     is_string($authRefused) ? $authRefused : 'open', $authRefusedSeen, is_string($certOther) ? $certOther : 'open', $certOtherSeen],
     ['gateway_denied', ['auth ok bindings ok', 'refused', 'relayed 0 0'], 'gateway', ['auth ok bindings ok', 'bad in']]);
@@ -4020,7 +4256,7 @@ $rpcEcho = proc_open([PHP_BINARY, '-r', '$s = stream_socket_server("tcp://127.0.
     . ' while ($c = @stream_socket_accept($s, 30)) { while (($d = fread($c, 65536)) !== false && $d !== "") { for ($w = 0; $w < strlen($d); $w += $n) { if (!($n = @fwrite($c, strtoupper(substr($d, $w))))) { break 2; } } } fclose($c); }'],
     [1 => ['pipe', 'w']], $rpcEchoPipes);
 $rpcEchoPort = (int)trim((string)fgets($rpcEchoPipes[1]));
-$rpcRun = static function (string $mode, int $bytes = 20000, string $pw = 'Clave-Gw-1', bool $agree = true) use ($cnf, $nul, $rpcEchoPort): array {
+$rpcRun = static function (string $mode, int $bytes = 20000, string $pw = 'Clave-Gw-1', bool $agree = true, ?callable $before = null) use ($cnf, $nul, $rpcEchoPort): array {
     $p     = proc_open([PHP_BINARY, __DIR__ . '/fixtures/rpc_gateway.php', 'ana', 'TEST', 'Clave-Gw-1', $cnf, (string)$rpcEchoPort, $mode], [1 => ['pipe', 'w'], 2 => ['file', $nul, 'w']], $pp);
     $port  = (int)trim((string)fgets($pp[1]));
     $asked = [];
@@ -4044,6 +4280,7 @@ $rpcRun = static function (string $mode, int $bytes = 20000, string $pw = 'Clave
             $g->wait(0.01);
         }
         $r = ["$g->transport/$g->auth", $got === strtoupper($send), $g->denied, $asked, $g->messages];
+        $before && $before($g);                                          // (something set before the end)
         $g->close();
     } catch (MuDesk\Rdp\ProtocolException $e) {
         $r = [$e->key, preg_match('~0x[0-9a-f]{8}~', $e->getMessage(), $m) ? $m[0] : '', $asked];
@@ -4065,6 +4302,15 @@ foreach ([['', 300000], ['consent'], ['policy'], ['nap'], ['rapdenied'], ['recyc
     $rpcSeen[] = $rpcRun(...$a);
 }
 $rpcNapFull = $rpcRun('napfull');
+// the end: the channel's close answered late (the client waits for it, its channels open till then), after more than the
+// client's window (acknowledged meanwhile), answered by asking for a new OUT channel, or sent as the IN channel is half used
+// (no channel made again while closing)
+$rpcLateClose = $rpcRun('lateclose');
+$rpcFullClose = $rpcRun('closefull');
+$rpcCloseNew  = $rpcRun('closerecycle');
+$rpcCloseIn   = $rpcRun('', 20000, 'Clave-Gw-1', true, static function (MuDesk\Rdp\Gateway $g): void {
+    (new ReflectionProperty($g, 'inSent'))->setValue($g, (new ReflectionProperty(MuDesk\Rdp\Gateway::class, 'inLifetime'))->getValue() >> 1);
+});
 $rpcCert = $rpcRun('recyclecert', 300000);
 $rpcLate = $rpcRun('recyclelate', 300000);
 // (the IN channel's length lowered to the least the specification allows, 128 KB, all the gateway takes in these modes: a
@@ -4108,6 +4354,15 @@ $rpcInSum = static fn(array $run): array => [$run[0], [...array_slice($run[1], 0
 check('RD Gateway, RPC transport: its IN channel made again (IN_R2; IN_R1 with the OUT channel made again too), 300 KB each way', array_map($rpcInSum, $rpcIn), [
     [['rpc/ntlm', true, [], [], []], [...$rpcOpen, 'tunnel caps e', ...$rpcChan, 'close channel', 'relayed 300000 300000'], true, 0],
     [['rpc/ntlm', true, [], [], []], [...$rpcOpen, 'tunnel caps e', ...$rpcChan, 'close channel', 'relayed 300000 300000'], true, 1]]);
+// ... the end: the channel closed, its answer waited for before both channels are (before, they were at once, and the
+// gateway could take the OUT channel's end before the close the IN channel carried: lost, at times); none made again
+// meanwhile, the gateway's answer or not within a second
+check('RD Gateway, RPC transport: the channel\'s close answered before its channels are closed (late too, after a full window); none made again while closing',
+    [$rpcLateClose, $rpcFullClose, $rpcCloseNew, $rpcCloseIn], [
+    [['rpc/ntlm', true, [], [], []], [...$rpcOpen, 'tunnel caps e', ...$rpcChan, 'close channel', 'close answered', 'relayed 20000 20000']],
+    [['rpc/ntlm', true, [], [], []], [...$rpcOpen, 'tunnel caps e', ...$rpcChan, 'close channel', 'close answered', 'relayed 20000 20000']],
+    [['rpc/ntlm', true, [], [], []], [...$rpcOpen, 'tunnel caps e', ...$rpcChan, 'close channel', 'relayed 20000 20000']],
+    [['rpc/ntlm', true, [], [], []], [...$rpcOpen, 'tunnel caps e', ...$rpcChan, 'close channel', 'relayed 20000 20000']]]);
 // ... its OUT channel made again at a gateway with another certificate (a man in the middle on the new one): refused
 check('RD Gateway, RPC transport: its OUT channel made again with another certificate refused',
     [$rpcCert[0], preg_replace('~^relayed .*~', 'relayed', $rpcCert[1])], [['gateway', '', []], [...$rpcOpen, 'tunnel caps e', ...$rpcChan, 'close channel', 'relayed']]);
@@ -4889,16 +5144,32 @@ check('RD Gateway: a session through it reaches the computer behind it with TLS 
     substr($x224, 0, 2), str_contains($x224, "tsv://MS Terminal Services Plugin.1.Prueba\r\n"), str_contains($x224, 'mstshash'), $nlaSaid, $gwLines, strlen($gwPinned),
     [$connectLog['gateway'] ?? null, $connectLog['routing_token'] ?? null]],
     ["\x03\x00", true, false, 'ok creds', ['auth ok bindings ok', 'channel pc.test:3389'], 64, ['127.0.0.1', true]]);
+// a gateway never seen is asked about as a computer is (cert_new, with its name) before the user's password goes to it, and
+// nothing is pinned until the user trusts it (before 1.2, trusted at once)
+$askCerts(true);
+$rdgN = proc_open([PHP_BINARY, __DIR__ . '/fixtures/rdg_server.php', 'ana', 'TEST', 'Clave-Gw-1', $cnf, (string)$nlaGwPort], [1 => ['pipe', 'w'], 2 => ['file', $nul, 'w']], $rdgNPipes);
+$rdgNPort = (int)trim((string)fgets($rdgNPipes[1]));
+$gcN = MuDesk\Connections::save($wu['id'], ['host' => 'pc.test', 'port' => 3389, 'user' => 'ana', 'domain' => 'TEST', 'gw' => "127.0.0.1:$rdgNPort",
+    'clipboard' => false, 'drive' => false, 'printer' => false, 'audio' => false], null);
+[, $gwNewBody] = $wres($wreq('rdp.php?a=stream', json_encode(['c' => $gcN['id'], 'sid' => bin2hex(random_bytes(16)), 'w' => 800, 'h' => 600, 'password' => 'Clave-Gw-1'])));
+$gwNew = [$endsOf($gwNewBody), str_contains($gwNewBody, '"host":"127.0.0.1"'), MuDesk\Connections::all($wu['id'])[$gcN['id']]['certs']['gw:127.0.0.1'] ?? ''];
+$askCerts(false);
+proc_terminate($rdgN);
+proc_close($rdgN);
+MuDesk\Connections::delete($wu['id'], $gcN['id']);
+check('RD Gateway: one never seen asked about before the password goes to it (its name said), nothing pinned meanwhile', $gwNew, [['cert_new'], true, '']);
 // a connection broker's redirection followed by the web gateway: its computer's first address does not answer, so the next one
 // it named is taken (before, only the first was tried: the session failed); the next connection carries the session, the user
 // and the password the broker gave; the target's certificate the broker vouched for is the one taken there (pinned for it), and
 // another one is refused as a changed certificate, even on a first use; audited
 MuDesk\Settings::save(['targets' => ['mode' => 'list', 'list' => ['127.0.0.1', '127.0.0.2', '127.0.0.3']]]);
-$brokerRun = static function (string $mode) use ($cnf, $nul, $wu, $wreq, $wres, $endsOf): array {
+$brokerRun = static function (string $mode, ?string $pinned = null, ?string $fixed = null) use ($cnf, $nul, $wu, $wreq, $wres, $endsOf): array {
     $bp   = proc_open([PHP_BINARY, __DIR__ . '/fixtures/broker_server.php', $cnf, $mode], [1 => ['pipe', 'w'], 2 => ['file', $nul, 'w']], $bpipes);
     $port = (int)trim((string)fgets($bpipes[1]));
     $bc   = MuDesk\Connections::save($wu['id'], ['host' => '127.0.0.1', 'port' => $port, 'user' => 'otro', 'security' => 'tls',
         'clipboard' => false, 'drive' => false, 'printer' => false, 'audio' => false], null);
+    $pinned !== null && MuDesk\Connections::trust($wu['id'], $bc, $pinned, '127.0.0.2');   // the target's, pinned before
+    $fixed !== null && MuDesk\Connections::fixCert('127.0.0.2', $port, $fixed, 'admin');    // the target's, fixed by an administrator
     [, $body] = $wres($wreq('rdp.php?a=stream', json_encode(['c' => $bc['id'], 'sid' => bin2hex(random_bytes(16)), 'w' => 800, 'h' => 600])));
     $lines = [];
     while (($l = fgets($bpipes[1])) !== false && ($l = trim($l)) !== 'done') {
@@ -4907,12 +5178,15 @@ $brokerRun = static function (string $mode) use ($cnf, $nul, $wu, $wreq, $wres, 
     proc_close($bp);
     $certs = array_keys(MuDesk\Connections::all($wu['id'])[$bc['id']]['certs'] ?? []);
     MuDesk\Connections::delete($wu['id'], $bc['id']);
+    $fixed !== null && MuDesk\Connections::fixCert('127.0.0.2', $port, '', 'admin');
     return [$lines, $endsOf($body), $certs];
 };
 $brokerOk    = $brokerRun('');
 $redirLog    = array_slice(MuDesk\Audit::search(['event' => 'rdp_redirect', 'user' => 'webuser'])['rows'], 0, 2);
 $vouchLog    = MuDesk\Audit::search(['event' => 'cert_trusted', 'user' => 'webuser'])['rows'][0] ?? [];
 $brokerWrong = $brokerRun('wrongcert');
+$brokerPinned = $brokerRun('', str_repeat('ab', 32));
+$brokerFixed = $brokerRun('', null, str_repeat('cd', 32));
 $brokerRdstls = $brokerRun('rdstls');
 $brokerLate = $brokerRun('late');
 $lateLog = array_values(array_filter(MuDesk\Audit::search(['event' => 'rdp_redirect', 'user' => 'webuser'])['rows'],
@@ -4938,6 +5212,11 @@ check('connection broker: followed by the web gateway to the next address when t
     [['redirect sent', 'target Cookie: mstshash=ana cluster=13 session=42 user=ana password=Galleta-1'], ['127.0.0.2'],
      [['127.0.0.2', '127.0.0.3', 'unreachable'], ['127.0.0.3', null, null]], ['127.0.0.2', true],
      ['redirect sent', 'target gone'], ['cert_changed'], []]);
+// ... the certificate the broker vouches for never replaces one pinned for that computer before: a changed certificate (the
+// user decides; a broker taken over could vouch for an impostor)
+check('connection broker: its word does not replace a certificate pinned before', [$brokerPinned[1], $brokerPinned[2]], [['cert_changed'], ['127.0.0.2']]);
+check('connection broker: the computer it sends to accepts only the certificate an administrator fixed for it (not the word of the broker, nor the user)',
+    [$brokerFixed[1], $brokerFixed[2], MuDesk\Connections::fixedCerts()], [['cert_unexpected'], [], []]);
 // ... a password the broker encrypted for its computer (LB_PASSWORD_IS_PK_ENCRYPTED): given to it with RDSTLS, as it came,
 // with the redirection's GUID (before, the session went on without it, to the target's logon screen); refused by the target:
 // said so (RDSTLS_RESULT_LOGON_FAILURE: a wrong password)
@@ -5166,18 +5445,58 @@ $own   = [$wres($anon("rdp.php?a=send&sid=$shSid", pack('V', 0) . "\x21" . $shCt
           $wres($anon("rdp.php?a=send&sid=$shSid", pack('V', 0) . "\x22" . $mouse, "X-MuDesk-Token: owner-token\r\n"))[0],
           $wres($anon("rdp.php?a=send&sid=$shSid", pack('V', 0) . "\x06", "X-MuDesk-Token: owner-token\r\n"))[0]];
 $ownIn = $pump(static fn($got) => $got !== []);
-check('sharing: a guest with control sends keyboard, mouse and touch on its own lane; view only, other messages, a wrong secret refused; the owner cannot pose as one', [
+check('sharing: a guest with control sends keyboard, mouse and touch on its own lane (with its link, whose control it is); view only, other messages, a wrong secret refused; the owner cannot pose as one', [
     $gst, $gIn, MuDesk\Rdp\Client::mouseAt(substr($mouse, 2)), MuDesk\Rdp\Client::mouseAt("\x00\x1e\x20\x00\x08\x01\x00\x02\x00\x00\x9e\x60"), MuDesk\Rdp\Client::mouseAt("\x00\x1e"),
     $own, $ownIn],
-    [[404, 404, 404, 404, 404, 204], ["\x22" . $mouse], pack('vv', 16, 32), pack('vv', 1, 2), null, [404, 404, 204], ["\x06"]]);
+    [[404, 404, 404, 404, 404, 204], ["\x22" . $shCtl['id'] . $mouse], pack('vv', 16, 32), pack('vv', 1, 2), null, [404, 404, 204], ["\x06"]]);
 // the owner's out-of-order lane (Sessions::OUT_OF_BAND): its camera's pictures and its folder's answers only, each taken as
 // it comes, with no sequence number (no key waits behind a picture); anything else on it, or on the guests' lane, refused
 $laneSend = static fn(int $seq, string $payload): int => $wres($anon("rdp.php?a=send&sid=$shSid", pack('V', $seq) . $payload, "X-MuDesk-Token: owner-token\r\n"))[0];
-$lane = [$laneSend(0xFFFFFFFF, "\x12JPEG"), $laneSend(0xFFFFFFFF, "\x14\x03\x00\x00\x00"), $laneSend(0xFFFFFFFF, "\x15\x01"), $laneSend(0xFFFFFFFF, "\x06"),
-         $laneSend(0xFFFFFFFF, "\x13\x00"), $laneSend(0xFFFFFFFE, $mouse), $laneSend(0xFFFFFFFE, "\x12JPEG")];
-$laneIn = $pump(static fn($got) => count($got) >= 3);
-check('the browser\'s out-of-order lane: the camera\'s pictures and the folder\'s answers only, taken as they come; nothing else on it, nor on the guests\' lane',
-    [$lane, $laneIn], [[204, 204, 204, 404, 404, 404, 404], ["\x12JPEG", "\x14\x03\x00\x00\x00", "\x15\x01"]]);
+$lane = [$laneSend(0xFFFFFFFF, "\x12JPEG"), $laneSend(0xFFFFFFFF, "\x14\x03\x00\x00\x00"), $laneSend(0xFFFFFFFF, "\x15\x01"), $laneSend(0xFFFFFFFF, "\x16\x01\x00PIECE"),
+         $laneSend(0xFFFFFFFF, "\x06"), $laneSend(0xFFFFFFFF, "\x13\x00"), $laneSend(0xFFFFFFFE, $mouse), $laneSend(0xFFFFFFFE, "\x12JPEG"), $laneSend(0xFFFFFFFE, "\x16\x01\x00PIECE")];
+$laneIn = $pump(static fn($got) => count($got) >= 4);
+check('the browser\'s out-of-order lane: the camera\'s pictures, the folder\'s answers and a recording\'s pieces only, taken as they come; nothing else on it, nor on the guests\' lane',
+    [$lane, $laneIn], [[204, 204, 204, 204, 404, 404, 404, 404, 404], ["\x12JPEG", "\x14\x03\x00\x00\x00", "\x15\x01", "\x16\x01\x00PIECE"]]);
+// a link for a while: refused past its time, which the session finds (to let its guests go); a guest given control that has
+// not used it for the administrator's minutes loses it: its link's mode is view from then on (its input refused), and its
+// guests are told in their stream (not those of another link); 0 minutes: never. The setting: 15 minutes as it comes
+$tSid  = bin2hex(random_bytes(16));
+$tSess = MuDesk\Sessions::register($tSid, ['uid' => $wu['id'], 'user' => 'webuser', 'conn' => 'Por un rato', 'host' => '127.0.0.1', 'token' => hash('sha256', 't')]);
+$tA    = MuDesk\Sessions::share($tSid, 'control', 15);
+$tB    = MuDesk\Sessions::share($tSid, 'view');
+$tC    = MuDesk\Sessions::share($tSid, 'control');
+$tExp  = (int)(MuDesk\Sessions::info($tSid)['shares'][$tA['id']]['expires'] ?? 0) - time();
+$tj    = json_decode((string)file_get_contents("$tmp/data/run/$tSid.json"), true);
+$tj['shares'][$tA['id']]['expires'] = time() - 1;
+file_put_contents("$tmp/data/run/$tSid.json", json_encode($tj));
+$tLink = [$tExp >= 895 && $tExp <= 900, MuDesk\Sessions::findShare("$tSid.{$tA['secret']}"), MuDesk\Sessions::expiredShares($tSid), MuDesk\Sessions::findShare("$tSid.{$tB['secret']}")[2] ?? null];
+$cB = MuDesk\Sessions::watch($tSid, $tB['id']);
+$cC = MuDesk\Sessions::watch($tSid, $tC['id']);
+for ($end = microtime(true) + 5, $joined = 0; microtime(true) < $end && $joined < 2; usleep(20000)) {
+    $joined += count($tSess->read());
+}
+$tSess->admitViewers();
+$at    = [$tC['id'] => time() - 901, 'f00df00df00df00d' => time() - 10];
+$kept  = [$tSess->endIdleControls($tSid, $at, time(), 0, static fn(): string => 'X'), count($at)];   // (0: never)
+$ended = $tSess->endIdleControls($tSid, $at, time(), 900, static fn(string $id): string => "ENDED:$id");
+$readOf = static function ($c): string {
+    stream_set_blocking($c, false);
+    $r = '';
+    for ($end = microtime(true) + 1; microtime(true) < $end; usleep(20000)) {
+        $r .= (string)fread($c, 65536);
+    }
+    return $r;
+};
+$tSeen = [$readOf($cC), $readOf($cB)];
+$tCtl  = [MuDesk\Sessions::findShare("$tSid.{$tC['secret']}")[2] ?? null, MuDesk\Sessions::controlEnd($tSid, $tC['id']), MuDesk\Sessions::controlEnd($tSid, $tB['id']),
+    $wres($anon("rdp.php?a=send&sid=$tSid", pack('V', 7) . $mouse, "X-MuDesk-Share: {$tC['secret']}\r\n"))[0]];
+fclose($cB);
+fclose($cC);
+$tSess->dropViewers();
+MuDesk\Sessions::cleanup($tSid);
+check('sharing: a link for a while refused past its time (the session finds it); a guest given control unused for the administrator\'s minutes watches on, told in its stream (not other links\' guests), its input refused; never with 0',
+    [$tLink, $kept, $ended, array_keys($at), $tSeen, $tCtl, MuDesk\Settings::get('share_control_idle_minutes')],
+    [[true, null, [$tA['id']], 'view'], [[], 2], [$tC['id']], ['f00df00df00df00d'], ["ENDED:{$tC['id']}", ''], ['view', false, false, 404], 15]);
 // at most MAX_VIEWERS guests at once (the next ones are let go at once); all let go with the session
 $many = [];
 for ($i = 0; $i <= MuDesk\Sessions::MAX_VIEWERS; $i++) {
@@ -5195,6 +5514,13 @@ ksort($gotX);
 $shApi = static fn(array $b): array => (static function (array $r): array { return [$r[0], json_decode($r[1], true)]; })($wres($wreq('api.php', json_encode($b))));
 [$mkSt, $mk] = $shApi(['action' => 'session.share', 'sid' => $shSid, 'mode' => 'control']);
 [, $listed]  = $shApi(['action' => 'session.shares', 'sid' => $shSid]);
+[, $mk15]    = $shApi(['action' => 'session.share', 'sid' => $shSid, 'mode' => 'view', 'minutes' => 15]);
+[, $mk7]     = $shApi(['action' => 'session.share', 'sid' => $shSid, 'mode' => 'view', 'minutes' => 7]);
+$untilOf     = static fn(array $j, string $id): ?string => array_column($j['shares'] ?? [], 'expires', 'id')[$id] ?? null;
+$shareTimes  = [abs(strtotime((string)$untilOf($mk15, $mk15['id'] ?? '')) - (time() + 900)) <= 5, $untilOf($mk7, $mk7['id'] ?? '')];
+$shApi(['action' => 'session.unshare', 'sid' => $shSid, 'id' => $mk15['id'] ?? '']);
+$shApi(['action' => 'session.unshare', 'sid' => $shSid, 'id' => $mk7['id'] ?? '']);
+$pump(static fn($got) => count($got) >= 2);
 [$unSt, $un] = $shApi(['action' => 'session.unshare', 'sid' => $shSid, 'id' => $mk['id'] ?? '']);
 $unEv        = $pump(static fn($got) => $got !== []);
 $otherSid    = bin2hex(random_bytes(16));
@@ -5212,13 +5538,13 @@ $appSess->close();
 MuDesk\Sessions::cleanup($fileSid);
 $shSess->close();
 $gone = array_map(static fn($c): bool => fread($c, 1) === '' && feof($c), $many);
-check('sharing: at most 5 guests at once; the owner makes, lists and revokes links (another user\'s, RemoteApp and queue-file sessions refused); all end with the session', [
+check('sharing: at most 5 guests at once; the owner makes, lists and revokes links (for a while too: listed with its end; another time, as long as the session; another user\'s, RemoteApp and queue-file sessions refused); all end with the session', [
     $admittedMax, $gotX, $mkSt, str_starts_with($mk['link'] ?? '', "$shSid."), $mk['mode'] ?? null, array_column($listed['shares'] ?? [], 'mode'), $unSt,
     array_column($un['shares'] ?? [], 'id'), $unEv, $refused, $activeRow['shared'] ?? null, array_key_exists('shares', $activeRow), $gone,
     MuDesk\Sessions::findShare("$shSid.{$shCtl['secret']}"), array_map(static fn($r) => $r['mode'] ?? null, MuDesk\Audit::search(['event' => 'share_create'])['rows']),
-    count(MuDesk\Audit::search(['event' => 'share_revoke'])['rows'])],
+    count(MuDesk\Audit::search(['event' => 'share_revoke'])['rows']), $shareTimes],
     [5, ['' => 1, 'x' => 5], 200, true, 'control', ['control', 'view', 'control'], 200, [$shCtl['id'], $shView2['id']], ["\x20" . ($mk['id'] ?? '')],
-     [[404, 'not_found'], [400, 'share_unavailable'], [400, 'share_unavailable']], 2, false, [true, true, true, true, true, true], null, ['control'], 1]);
+     [[404, 'not_found'], [400, 'share_unavailable'], [400, 'share_unavailable']], 2, false, [true, true, true, true, true, true], null, ['view', 'view', 'control'], 3, [true, null]]);
 
 // a guest joining a session that a connection broker sent to another computer: the session connected again to that computer
 // (its session, user and password from the broker), not to the broker, which would have put it in a new session
@@ -5415,6 +5741,23 @@ $areq = static function (array $who, string $path, string $body) use ($wport): a
     fclose($s);
     return [(int)substr($r, 9, 3), json_decode(substr($r, (int)strpos($r, "\r\n\r\n") + 4), true)];
 };
+// the pages' policy: their own scripts, styles and requests only; images and frames from blob: too (pictures, the print
+// preview), and media (a recording made in the page, played from its video read whole)
+$cspS = fsockopen('127.0.0.1', $wport, $en, $es, 5);
+fwrite($cspS, "POST /api.php HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 18\r\n\r\n{\"action\":\"state\"}");
+$cspR = (string)stream_get_contents($cspS);
+fclose($cspS);
+$csp = preg_match('/^Content-Security-Policy: (.*)$/mi', $cspR, $cspM) ? trim($cspM[1]) : '';
+// ... the browser features they never use denied (not the camera, microphone, clipboard, full screen, screens or passkeys
+// they use), and their answers not taken in by another site
+$perm = preg_match('/^Permissions-Policy: (.*)$/mi', $cspR, $cspM) ? array_map('trim', explode(',', trim($cspM[1]))) : [];
+$corp = preg_match('/^Cross-Origin-Resource-Policy: (.*)$/mi', $cspR, $cspM) ? trim($cspM[1]) : '';
+check('page policy: scripts, styles and requests of its own only; blob: images, frames and media (a recording made in the page played); features never used denied, answers kept to its own site', [
+    str_contains($csp, "default-src 'self'"), str_contains($csp, "script-src 'self';"), str_contains($csp, "media-src 'self' blob:"), str_contains($csp, "frame-ancestors 'none'"),
+    array_values(array_filter($perm, static fn(string $p): bool => !str_ends_with($p, '=()'))),
+    array_values(array_intersect(['geolocation=()', 'usb=()', 'payment=()'], $perm)),
+    array_values(array_filter($perm, static fn(string $p): bool => (bool)preg_match('/^(camera|microphone|clipboard-read|clipboard-write|fullscreen|window-management|publickey-credentials-get|publickey-credentials-create|autoplay)=/', $p))),
+    $corp], [true, true, true, true, [], ['geolocation=()', 'usb=()', 'payment=()'], [], 'same-origin']);
 $seenOf = static fn(array $who): int => preg_match('/seen\|i:(\d+);/', (string)file_get_contents("$tmp/data/sessions/sess_{$who[0]}"), $m) ? (int)$m[1] : -1;
 $alive  = $sessAt(time() - 100, time() - 1000);
 [$lc, $lj] = $areq($alive, 'api.php', '{"action":"session.left"}');
@@ -5504,9 +5847,563 @@ file_put_contents("$tmp/data/sessions/sess_$asid", 'uid|' . $ser($wa['id']) . 'u
 $asAdmin = static fn(array $b): array => $areq([$asid, $acsrf], 'api.php', json_encode($b));
 $asUser  = static fn(array $b): array => $areq([$wsid, $wcsrf], 'api.php', json_encode($b));
 
+// a computer never seen (here one that answers with TLS and a certificate of its own, then lets the connection go): the
+// connection stops before anything is sent, its fingerprints given to the page (SHA-256, SHA-1 as Windows shows it); trusted
+// once the user says so (the next connection carries it), not asked again. An administrator who trusts it for every user
+// (the page's box) fixes it for any connection to that computer, by its name or its address: a user's own connection to it
+// is not asked; another certificate there is refused whatever the user trusts, and only an administrator puts a renewed one in
+// its place. Fixed and forgotten in the editor too (its SHA-1 as Windows writes it), only by an administrator. With
+// confirm_new_certificates off in config.php, trusted at once as before (before, it always was: a man in the middle of that
+// first connection got the password)
+$fxKey  = openssl_pkey_new(['config' => $cnf, 'private_key_bits' => 2048]);
+$fxCert = openssl_csr_sign(openssl_csr_new(['commonName' => 'huella'], $fxKey, ['config' => $cnf]), null, $fxKey, 1, ['config' => $cnf, 'digest_alg' => 'sha256']);
+openssl_x509_export($fxCert, $fxPem);
+openssl_pkey_export($fxKey, $fxKeyPem, null, ['config' => $cnf]);
+file_put_contents("$tmp/huella.pem", $fxPem . $fxKeyPem);
+[$fx256, $fx1] = [openssl_x509_fingerprint($fxCert, 'sha256'), openssl_x509_fingerprint($fxCert, 'sha1')];
+$fxP = proc_open([PHP_BINARY, '-r', '$s = stream_socket_server("tcp://127.0.0.1:0", $e, $m, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, stream_context_create(["ssl" => ["local_cert" => '
+    . var_export("$tmp/huella.pem", true) . ', "verify_peer" => false]])); echo substr(strrchr(stream_socket_get_name($s, false), ":"), 1), "\n";'
+    . ' while ($c = @stream_socket_accept($s, 30)) { fread($c, 4096); fwrite($c, "\x03\x00\x00\x13\x0e\xd0\x00\x00\x12\x34\x00\x02\x00\x08\x00\x01\x00\x00\x00");'
+    . ' stream_set_blocking($c, true); @stream_socket_enable_crypto($c, true, STREAM_CRYPTO_METHOD_TLS_SERVER); @fread($c, 4096); fclose($c); }'],
+    [1 => ['pipe', 'w'], 2 => ['file', $nul, 'w']], $fxPipes);
+$fxPort  = (int)trim((string)fgets($fxPipes[1]));
+$endInfo = static function (string $body): array {                         // the last status with an end
+    $last = [];
+    for ($o = 0; $o + 5 <= strlen($body); $o += 5 + $len) {
+        ['t' => $type, 'n' => $len] = unpack('Ct/Vn', $body, $o);
+        if ($type === MuDesk\Rdp\Client::F_STATUS && isset(($j = json_decode(substr($body, $o + 5, $len), true))['end'])) {
+            $last = $j;
+        }
+    }
+    return $last;
+};
+$fxConn = static fn(string $uid, string $host = '127.0.0.1'): array => MuDesk\Connections::save($uid, ['name' => 'Huella', 'host' => $host, 'port' => $fxPort,
+    'security' => 'tls', 'clipboard' => false, 'drive' => false, 'printer' => false, 'audio' => false], null);
+$fxGo   = static function (array $who, array $c, array $more = []) use ($wport, $endInfo): array {   // a session asked for as $who
+    $body = json_encode(['c' => $c['id'], 'sid' => bin2hex(random_bytes(16)), 'w' => 800, 'h' => 600] + $more);
+    $s = fsockopen('127.0.0.1', $wport, $en, $es, 5);
+    fwrite($s, "POST /rdp.php?a=stream HTTP/1.0\r\nHost: 127.0.0.1\r\nUser-Agent: test\r\nCookie: MUDESKSID={$who[0]}\r\nX-CSRF: {$who[1]}\r\n"
+        . "Content-Type: application/octet-stream\r\nContent-Length: " . strlen($body) . "\r\n\r\n$body");
+    $r = (string)stream_get_contents($s);
+    fclose($s);
+    return $endInfo(substr($r, (int)strpos($r, "\r\n\r\n") + 4));
+};
+$fxEnd  = static fn(array $e): string => in_array($e['end'] ?? '', ['cert_new', 'cert_changed', 'cert_unexpected'], true) ? $e['end'] : 'went on';
+$fxPin  = static fn(string $uid, array $c): string => MuDesk\Connections::pins($uid, $c)[0];
+$fxFix  = static fn(): ?string => MuDesk\Connections::fixedCert('localhost', $fxPort);
+[$fxU, $fxA] = [[$wsid, $wcsrf], [$asid, $acsrf]];
+$askCerts(true);
+$fxSeen = [];
+$fu  = $fxConn($wu['id']);                                                  // a user's own, by the computer's address
+$e1  = $fxGo($fxU, $fu);
+$fxSeen[] = [$e1['end'] ?? null, $e1['detail'] ?? null, $e1['sha1'] ?? null, isset($e1['host']), $fxPin($wu['id'], $fu)];
+$fxSeen[] = [$fxEnd($fxGo($fxU, $fu, ['trust' => $fx256, 'trust_all' => true])), $fxPin($wu['id'], $fu), MuDesk\Connections::fixedCerts()];   // (a user's box: not theirs)
+$fxSeen[] = [$fxEnd($fxGo($fxU, $fu))];
+$fa  = $fxConn($wa['id'], 'localhost');                                     // an administrator's, by its name
+$fxSeen[] = [$fxEnd($fxGo($fxA, $fa)), $fxEnd($fxGo($fxA, $fa, ['trust' => str_repeat('0', 64), 'trust_all' => true])), $fxFix(),   // (not the one shown: nothing)
+    $fxEnd($fxGo($fxA, $fa, ['trust' => $fx256, 'trust_all' => true])), $fxFix()];
+$fxSeen[] = count(array_filter(MuDesk\Audit::search(['event' => 'cert_fixed'])['rows'], static fn($r) => ($r['fingerprint'] ?? '') === $fx256));
+$fxGo($fxA, $fa, ['trust' => $fx256, 'trust_all' => true]);                 // connected again with the same: not fixed again
+$fxSeen[] = count(array_filter(MuDesk\Audit::search(['event' => 'cert_fixed'])['rows'], static fn($r) => ($r['fingerprint'] ?? '') === $fx256));
+$fu2 = $fxConn($wu['id']);                                                  // another of the user's, never seen by them: not asked
+$fxSeen[] = [$fxEnd($fxGo($fxU, $fu2)), $fxPin($wu['id'], $fu2)];
+$asAdmin(['action' => 'admin.cert.fix', 'host' => 'LOCALHOST', 'port' => $fxPort, 'fingerprint' => str_repeat('0', 64)]);   // another one fixed
+$e5  = $fxGo($fxU, $fu, ['trust' => $fx256, 'trust_all' => true]);
+$fxSeen[] = [$e5['end'] ?? null, $e5['detail'] ?? null, $fxFix()];
+$fxSeen[] = [$fxEnd($fxGo($fxA, $fa, ['trust' => $fx256, 'trust_all' => true])), $fxFix()];   // a renewed one, by an administrator
+$fixAs = static fn(callable $as, string $fp): array => $as(['action' => 'admin.cert.fix', 'host' => 'localhost', 'port' => $fxPort, 'fingerprint' => $fp]);
+$fxSeen[] = [$fixAs($asAdmin, strtoupper(implode(':', str_split($fx1, 2))))[0], $fxFix(), $fxEnd($fxGo($fxU, $fu)),
+    $fixAs($asAdmin, 'xyz')[1]['error'] ?? null, $fixAs($asAdmin, str_repeat('a', 50))[1]['error'] ?? null, $fixAs($asUser, '')[0],
+    $asUser(['action' => 'admin.certs'])[0], array_keys($asAdmin(['action' => 'admin.certs'])[1]['certs'] ?? []), $fixAs($asAdmin, '')[0], $fxFix()];
+$askCerts(false);
+$fo  = $fxConn($wu['id'], 'localhost');
+$fxSeen[] = [$fxEnd($fxGo($fxU, $fo)), $fxPin($wu['id'], $fo)];
+foreach ([[$wu['id'], $fu], [$wu['id'], $fu2], [$wu['id'], $fo], [$wa['id'], $fa]] as [$uid, $c]) {
+    MuDesk\Connections::delete($uid, $c['id']);
+}
+proc_terminate($fxP);
+proc_close($fxP);
+@unlink("$tmp/huella.pem");
+check('certificate of a computer never seen: confirmed by the user (its SHA-256 and SHA-1 shown) before anything is sent; fixed for every user by an administrator (by name or address; once), another refused, a renewed one only by an administrator; trusted at once with the option off',
+    $fxSeen, [['cert_new', $fx256, $fx1, false, ''], ['went on', $fx256, []], ['went on'], ['cert_new', 'cert_new', null, 'went on', $fx256], 1, 1, ['went on', $fx256],
+    ['cert_unexpected', $fx256, str_repeat('0', 64)], ['went on', $fx256], [200, $fx1, 'went on', 'cert_fixed', 'cert_fixed', 403, 403, ["rdp:localhost:$fxPort"], 200, null],
+    ['went on', $fx256]]);
+
+// the administration's status: what runs now (sessions, guests, recordings, the PHP processes and memory they take, the disk,
+// yesterday's and today's problems, the server) for administrators and auditors; the use of the last 30 days from the audit
+// (here two days of it written apart: sessions a day, hours, most at once, a session across midnight split between its days,
+// the computers used most; an attempt that never started not counted); what a session says of itself (its memory, its guests; nothing else); health.php for a monitor:
+// working or not, nothing of the installation, its problem said when the data folder or a store cannot be used
+$day20 = date('Y-m-d', strtotime('-20 days'));
+$day19 = date('Y-m-d', strtotime('-19 days'));
+$aLine = static fn(string $at, string $event, array $more): string => json_encode(['t' => date('c', strtotime($at)), 'ip' => '10.0.0.1', 'user' => 'ana', 'event' => $event, 'ok' => true] + $more) . "\n";
+file_put_contents("$tmp/data/audit/$day20.jsonl",
+    $aLine("$day20 09:00:00", 'rdp_start', ['sid' => 's1', 'conn' => 'A', 'host' => 'grafico-a.test'])
+    . $aLine("$day20 10:00:00", 'rdp_start', ['sid' => 's2', 'conn' => 'B', 'host' => 'grafico-b.test'])
+    . $aLine("$day20 11:00:00", 'rdp_end', ['sid' => 's1', 'conn' => 'A', 'seconds' => 7200, 'reason' => 'user'])   // 09:00-11:00
+    . $aLine("$day20 10:30:00", 'rdp_end', ['sid' => 's2', 'conn' => 'B', 'seconds' => 1800, 'reason' => 'user'])   // 10:00-10:30
+    . $aLine("$day20 23:00:00", 'rdp_start', ['sid' => 's3', 'conn' => 'A', 'host' => 'grafico-a.test'])
+    . $aLine("$day20 12:00:00", 'rdp_end', ['sid' => 's4', 'conn' => 'grafico-c', 'seconds' => 3000, 'reason' => 'auth_failed']));   // never started
+file_put_contents("$tmp/data/audit/$day19.jsonl", $aLine("$day19 01:00:00", 'rdp_end', ['sid' => 's3', 'conn' => 'A', 'seconds' => 7200, 'reason' => 'user']));   // 23:00-01:00
+$use   = MuDesk\Status::usage(30);
+$byDay = array_column($use['days'], null, 'day');
+$useH  = array_values(array_filter($use['hosts'], static fn($x) => str_starts_with($x['host'], 'grafico-')));
+@unlink("$tmp/data/audit/$day20.jsonl");
+@unlink("$tmp/data/audit/$day19.jsonl");
+$rsid = bin2hex(random_bytes(16));                                         // a session's own report: memory and guests only
+file_put_contents("$tmp/data/run/$rsid.json", json_encode(['uid' => 'u1', 'token' => 'x', 'conn' => 'C', 'sid' => $rsid]));
+file_put_contents("$tmp/data/run/$rsid.mode", 'file');
+$reported = [MuDesk\Sessions::report($rsid, ['mem' => '5000000', 'mem_peak' => 9000000, 'viewers' => 2, 'uid' => 'otro', 'token' => 'y']),
+    array_intersect_key(MuDesk\Sessions::info($rsid) ?? [], array_flip(['uid', 'token', 'mem', 'mem_peak', 'viewers'])), MuDesk\Sessions::report($rsid, ['uid' => 'otro'])];
+$stNow = MuDesk\Status::now();
+$stMine = array_values(array_filter(MuDesk\Sessions::active(), static fn($s) => ($s['sid'] ?? '') === $rsid))[0] ?? [];
+MuDesk\Sessions::cleanup($rsid);
+[$stA, $stJ] = $asAdmin(['action' => 'admin.status']);
+[$usA, $usJ] = $asAdmin(['action' => 'admin.usage']);
+$healthOf = static function () use ($wport): array {
+    $s = fsockopen('127.0.0.1', $wport, $en, $es, 5);
+    fwrite($s, "GET /health.php HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n");
+    $r = (string)stream_get_contents($s);
+    fclose($s);
+    return [(int)substr($r, 9, 3), substr($r, (int)strpos($r, "\r\n\r\n") + 4), (bool)preg_match('/^Cache-Control: no-store/mi', $r)];
+};
+$health = $healthOf();
+// a problem answered with 503 and said (a monitor reads the code): here its users cannot be read
+$usersKeep = (string)file_get_contents("$tmp/data/users.json");
+file_put_contents("$tmp/data/users.json", '{"roto":');
+$health[] = array_slice($healthOf(), 0, 2);
+file_put_contents("$tmp/data/users.json", $usersKeep);
+// its problems, in a data folder of its own: a store that cannot be read, a folder that is not there
+@mkdir("$tmp/hdata/run", 0700, true);
+file_put_contents("$tmp/hcfg.php", '<?php return ["data_dir" => ' . var_export("$tmp/hdata", true) . '];');
+MuDesk\Config::load("$tmp/hcfg.php");
+$hp = [MuDesk\Status::problem()];
+file_put_contents("$tmp/hdata/settings.json", '{"roto":');
+$hp[] = MuDesk\Status::problem();
+MuDesk\Files::remove("$tmp/hdata");
+$hp[] = MuDesk\Status::problem();
+MuDesk\Config::load("$tmp/config.php");
+@unlink("$tmp/hcfg.php");
+check('status: now (sessions, guests, processes, memory, disk, problems, server) for administrators and auditors, not users; 30 days of use from the audit (a session across midnight split, the computers used most); a session reports its memory and guests only; health.php',
+    [$byDay[$day20] ?? null, $byDay[$day19] ?? null, count($use['days']), $useH, $reported, [$stMine['viewers'] ?? null, $stNow['processes'] - $stNow['sessions'] >= 2,
+     $stNow['memory']['largest'] >= 9000000, $stNow['memory']['sessions'] >= 5000000, is_int($stNow['problems']['login_fail']), $stNow['server']['php'] === PHP_VERSION],
+     [$stA, isset($stJ['status']['disk']['recordings']), $usA, count($usJ['days'] ?? []), $asUser(['action' => 'admin.status'])[0], $asUser(['action' => 'admin.usage'])[0]],
+     $health, $hp, [MuDesk\Status::bytes('128M'), MuDesk\Status::bytes('1G'), MuDesk\Status::bytes('512k'), MuDesk\Status::bytes('-1'), MuDesk\Status::bytes('2048')]],
+    [['day' => $day20, 'sessions' => 3, 'hours' => 3.5, 'peak' => 2], ['day' => $day19, 'sessions' => 0, 'hours' => 1.0, 'peak' => 1], 30,
+     [['hours' => 4.0, 'host' => 'grafico-a.test', 'sessions' => 2], ['hours' => 0.5, 'host' => 'grafico-b.test', 'sessions' => 1]],
+     [true, ['uid' => 'u1', 'token' => 'x', 'mem' => 5000000, 'mem_peak' => 9000000, 'viewers' => 2], false], [2, true, true, true, true, true],
+     [200, true, 200, 30, 403, 403], [200, '{"status":"ok"}', true, [503, '{"status":"error","problem":"store"}']], [null, 'store', 'data'], [134217728, 1073741824, 524288, 0, 2048]]);
+
+// the data folder readable from the web: nothing works (every entry point answers 503 data_exposed, its page saying what to
+// do) until it is protected. The gateway asks itself for data/web-check.txt beside the page and one folder above (here two
+// servers of its own: one that gives the data folder, one that does not, and a port where nothing answers); a browser's word
+// counts only with the file's code now (a false one, or one read before, does nothing); looked at again soon (30 s, 5 minutes
+// after a browser), 10 minutes while protected; health.php says so too
+$expoRoot = "$tmp/expo";
+@mkdir("$expoRoot/open/data", 0700, true);
+@mkdir("$expoRoot/closed/public", 0700, true);
+$expoSrv = [];
+foreach (['open', 'closed'] as $k) {
+    $probe = stream_socket_server('tcp://127.0.0.1:0');
+    $expoPort[$k] = (int)substr((string)strrchr((string)stream_socket_get_name($probe, false), ':'), 1);
+    fclose($probe);
+    $expoSrv[$k] = proc_open([PHP_BINARY, '-S', "127.0.0.1:{$expoPort[$k]}", '-t', "$expoRoot/$k"], [1 => ['file', $nul, 'w'], 2 => ['file', $nul, 'w']], $expoPipes);
+}
+for ($i = 0; $i < 100 && !($ws = @fsockopen('127.0.0.1', $expoPort['closed'])); $i++) {
+    usleep(50000);
+}
+$ws && fclose($ws);
+$st0 = MuDesk\Exposure::save('ok', 'server');
+file_put_contents("$expoRoot/open/data/web-check.txt", (string)file_get_contents("$tmp/data/web-check.txt"));
+$srvOf = static fn(int $port, string $uri = '/public/api.php', ?string $host = null): array => ['SERVER_ADDR' => '127.0.0.1', 'SERVER_PORT' => $port,
+    'HTTP_HOST' => $host ?? "127.0.0.1:$port", 'REQUEST_URI' => $uri, 'SCRIPT_NAME' => (string)preg_replace('~\.php/.*$~', '.php', $uri)];
+$probeNew = static function (array $srv): ?string {                         // (nothing found before)
+    MuDesk\Exposure::save('ok', 'server');
+    return MuDesk\Exposure::probe($srv)['state'] ?? null;
+};
+$dead  = stream_socket_server('tcp://127.0.0.1:0');
+$deadP = (int)substr((string)strrchr((string)stream_socket_get_name($dead, false), ':'), 1);
+fclose($dead);
+$expoSeen = [
+    [MuDesk\Exposure::path('/mudesk/public/../data/web-check.txt'), MuDesk\Exposure::path('/../../data/x'), MuDesk\Exposure::path('/a/./b//c')],
+    [MuDesk\Exposure::fetch($srvOf($expoPort['open']), '/data/web-check.txt'), MuDesk\Exposure::fetch($srvOf($expoPort['closed']), '/data/web-check.txt'),
+     MuDesk\Exposure::fetch($srvOf($deadP), '/data/web-check.txt')],
+    [$probeNew($srvOf($expoPort['open'])), $probeNew($srvOf($expoPort['closed'])), $probeNew($srvOf($deadP)), $probeNew($srvOf($expoPort['open'], '/api.php'))],
+];
+// a request from elsewhere never finds it protected alone: its folder is the script's (not a path the client adds after it),
+// and where it was found readable is asked again with it (another site's Host, another folder, another server); protected
+// there, it works again
+$expoSeen[] = [$probeNew($srvOf($expoPort['open'], '/public/api.php/a/b/c/')), MuDesk\Exposure::probe($srvOf($expoPort['closed']))['state'] ?? null,
+    MuDesk\Exposure::probe($srvOf($expoPort['open'], '/x/y/api.php', 'otro.test'))['state'] ?? null, MuDesk\Exposure::state()['where']['dir'] ?? null,
+    rename("$expoRoot/open/data/web-check.txt", "$expoRoot/open/data/web-check.old") ? MuDesk\Exposure::probe($srvOf($expoPort['closed']))['state'] ?? null : 'not moved'];
+$now = time();
+$expoSeen[] = [MuDesk\Exposure::due(['state' => 'ok', 'at' => $now - 599, 'by' => 'server'], $now), MuDesk\Exposure::due(['state' => 'ok', 'at' => $now - 600, 'by' => 'server'], $now),
+    MuDesk\Exposure::due(['state' => 'exposed', 'at' => $now - 30, 'by' => 'server'], $now), MuDesk\Exposure::due(['state' => 'exposed', 'at' => $now - 100, 'by' => 'browser'], $now),
+    MuDesk\Exposure::due(['state' => 'exposed', 'at' => $now - 300, 'by' => 'browser'], $now)];
+// a browser's word: what it read, sent as the page does (anonymous, with the session's CSRF token)
+$st1  = MuDesk\Exposure::save('ok', 'server');
+$read = (string)file_get_contents("$tmp/data/web-check.txt");
+$expoSeen[] = [str_contains($read, $st1['token']), $asUser(['action' => 'data.exposed', 'proof' => MuDesk\Config::WEB_CHECK . "\n" . str_repeat('0', 32)])[1],
+    $asUser(['action' => 'data.exposed', 'proof' => $read])[1], MuDesk\Exposure::state()['state'], MuDesk\Exposure::state()['by']];
+// stopped: the API, the page and health.php say so; protected again, all of it works
+$apiStopped = $asUser(['action' => 'state']);
+$pageOf = static function (string $path, string $accept) use ($wport): array {
+    $s = fsockopen('127.0.0.1', $wport, $en, $es, 5);
+    fwrite($s, "GET /$path HTTP/1.0\r\nHost: 127.0.0.1\r\nAccept: $accept\r\nAccept-Language: es\r\n\r\n");
+    $r = (string)stream_get_contents($s);
+    fclose($s);
+    return [(int)substr($r, 9, 3), substr($r, (int)strpos($r, "\r\n\r\n") + 4)];
+};
+file_put_contents("$app/public/index.php", (string)file_get_contents(__DIR__ . '/../public/index.php'));
+$pageStopped = $pageOf('index.php', 'text/html');
+$healthStopped = $pageOf('health.php', 'application/json');
+MuDesk\Exposure::save('ok', 'server');
+$expoSeen[] = [$apiStopped, $pageStopped[0], str_contains($pageStopped[1], '<h1>La carpeta de datos se puede descargar</h1>'), $healthStopped,
+    $asUser(['action' => 'state'])[0], $asUser(['action' => 'data.exposed', 'proof' => $read])[1]];   // (the code read before: nothing)
+// PHP's built-in server (the tests' own) never asks itself: a code written for the browsers all the same, new every 10
+// minutes (before, it never had one there, and no browser could stop it); stopped by a browser, it works again after 5
+// minutes (the next page proves it again while it is readable)
+@unlink(MuDesk\Config::dir('run/exposure.json'));
+$cliFirst = $asUser(['action' => 'state'])[0];
+$cliState = MuDesk\Exposure::state();
+$cliProof = $asUser(['action' => 'data.exposed', 'proof' => (string)file_get_contents("$tmp/data/web-check.txt")])[1];
+$cliStop  = $asUser(['action' => 'state'])[0];
+file_put_contents(MuDesk\Config::dir('run/exposure.json'), json_encode(['at' => time() - 301] + MuDesk\Exposure::state()));
+$cliLater = $asUser(['action' => 'state'])[0];
+$expoSeen[] = [$cliFirst, $cliState['state'], strlen($cliState['token']), $cliProof, $cliStop, $cliLater, MuDesk\Exposure::state()['state'],
+    MuDesk\Exposure::state()['token'] !== $cliState['token']];
+// what it knows is no session (before, a fresh one was taken for one: listed without its id or user, and counted against the
+// limits of sessions)
+$expoSeen[] = [array_filter(MuDesk\Sessions::active(), static fn(array $s): bool => !isset($s['sid'])), is_file(MuDesk\Config::dir('run/exposure.json'))];
+@unlink("$app/public/index.php");
+@unlink(MuDesk\Config::dir('run/exposure.json'));
+foreach ($expoSrv as $p) {
+    proc_terminate($p);
+    proc_close($p);
+}
+MuDesk\Files::remove($expoRoot);
+check('data folder readable from the web: found by the gateway itself (beside the page and above it) or proved by a browser with the file\'s code now; never protected by a request from elsewhere alone; nothing works meanwhile (API, page, health.php), all of it again once protected; looked at again soon; a code on PHP\'s built-in server too',
+    $expoSeen, [['/mudesk/data/web-check.txt', '/data/x', '/a/b/c'], [true, false, null], ['exposed', 'ok', 'unknown', 'exposed'],
+    ['exposed', 'exposed', 'exposed', '/public', 'ok'], [false, true, true, false, true],
+    [true, ['stopped' => false], ['stopped' => true], 'exposed', 'browser'],
+    [[503, ['error' => 'data_exposed']], 503, true, [503, '{"error":"data_exposed"}'], 200, ['stopped' => false]],
+    [200, 'unknown', 32, ['stopped' => true], 503, 200, 'unknown', true], [[], true]]);
+
+// a backup: what it carries (the users, settings, connections, certificates, the audit and the data's keys; the users'
+// folders and recordings when asked; never what passes, nor another path); written in chunks of 1 MB, each authenticated with
+// its number and whether it is the last, read back whole (a 3 MB file across chunks); a wrong password, a byte changed,
+// a chunk cut off, bytes after it, not a backup, a newer version, a name out of the data folder: refused, nothing written
+// out of the folder given. Restored: what it carries in place (what it does not, as it was), every web session ended; a move
+// that fails puts back what was moved
+
+/** A disk that fills up: the bytes it still takes (for Backup::extract). */
+final class BkFullDisk
+{
+    public static int $room = 0;
+    public $context;
+    public function stream_open(string $path, string $mode, int $options, ?string &$opened): bool { return true; }
+    public function stream_write(string $data): int { $n = min(strlen($data), self::$room); self::$room -= $n; return $n; }
+    public function stream_close(): void {}
+    public function stream_flush(): bool { return true; }
+    public function mkdir(string $path, int $mode, int $options): bool { return true; }
+    public function url_stat(string $path, int $flags): array|false { return false; }
+    public function stream_metadata(string $path, int $option, mixed $value): bool { return true; }
+}
+
+/** A file of 3 MB that grows shorter while it is read: half of it there (for Backup::write). */
+final class BkShrinking
+{
+    public $context;
+    private int $at = 0;
+    public function stream_open(string $path, string $mode, int $options, ?string &$opened): bool { return true; }
+    public function stream_read(int $n): string { $d = str_repeat('x', max(0, min($n, 1572864 - $this->at))); $this->at += strlen($d); return $d; }
+    public function stream_eof(): bool { return $this->at >= 1572864; }
+    public function stream_stat(): array { return ['size' => 3145728, 'mode' => 0100644]; }
+    public function url_stat(string $path, int $flags): array { return ['size' => 3145728, 'mode' => 0100644]; }
+    public function stream_close(): void {}
+}
+
+stream_wrapper_register('bkfull', BkFullDisk::class);
+stream_wrapper_register('bkshrink', BkShrinking::class);
+$bk = "$tmp/bk";
+@mkdir("$bk/data", 0700, true);
+file_put_contents("$bk/config.php", '<?php return ["data_dir" => ' . var_export("$bk/data", true) . '];');
+MuDesk\Config::load("$bk/config.php");
+MuDesk\Crypto::forgetAppKey();
+MuDesk\Settings::forget();
+MuDesk\Crypto::appKey();                                                    // (its secret.php made)
+file_put_contents("$bk/data/users.json", '{"u1":{"id":"u1","username":"ana"}}');
+file_put_contents("$bk/data/settings.json", '{"max_sessions_total":20}');
+file_put_contents("$bk/data/ratelimit.json", '{}');
+@mkdir("$bk/data/connections", 0700, true);
+file_put_contents("$bk/data/connections/u1.json", '{"c1":{"host":"pc"}}');
+@mkdir("$bk/data/audit", 0700, true);
+file_put_contents("$bk/data/audit/2026-11-01.jsonl", "{\"event\":\"x\"}\n");
+@mkdir("$bk/data/files/u1/docs", 0700, true);
+$bigData = random_bytes(3 * 1048576 + 123);
+file_put_contents("$bk/data/files/u1/docs/grande.bin", $bigData);
+file_put_contents("$bk/data/run/x.json", '{}');
+file_put_contents("$bk/data/users.json.lock", '');
+$names = static fn(array $e): array => (static function (array $n): array { sort($n); return $n; })(array_column($e, 0));
+$bkSalt  = random_bytes(16);
+$bkKey   = MuDesk\Backup::key('Clave-de-copia-1', $bkSalt);
+$bkWrite = static function (string $file, array $entries, array $manifest = ['version' => MuDesk\VERSION]) use ($bkKey, $bkSalt): int {
+    $h = fopen($file, 'wb');
+    $n = MuDesk\Backup::write($h, $bkKey, $bkSalt, $manifest, $entries);
+    fclose($h);
+    return $n;
+};
+$bkSeen = [array_map([MuDesk\Backup::class, 'allowed'], ['users.json', 'secret.php', 'audit-key.php', 'audit/2026-11-01.jsonl', 'files/u1/a b.txt',
+    'ratelimit.json', 'tls.json', 'run/x.json', 'users.json.lock', '../x', 'files/../x', 'files//x', 'C:/x', 'files/a\\b', 'sessions/sess_1', 'tmp/a',
+    'files/u1/yarn.lock', 'files/u1/x.0123abcd.tmp', 'files/u1/' . str_repeat('carpeta/', 200) . 'b.txt', 'files/u1.quota', 'connections/u1.json.lock'])];
+$bkSeen[] = [$names(MuDesk\Backup::entries([])), in_array('files/u1/docs/grande.bin', array_column(MuDesk\Backup::entries(['files']), 0), true)];
+@unlink("$bk/data/run/x.json");                                          // (only to be left out)
+$all = MuDesk\Backup::entries(['files', 'recordings']);
+$size = $bkWrite("$bk/b1", $all);
+@mkdir("$bk/out1");
+$m1 = MuDesk\Backup::extract("$bk/b1", 'Clave-de-copia-1', "$bk/out1");
+$same = array_map(static fn($e) => is_file("$bk/out1/{$e[0]}") && hash_file('sha256', "$bk/out1/{$e[0]}") === hash_file('sha256', $e[1]), $all);
+$raw1 = (string)file_get_contents("$bk/b1");
+$try = static function (string $bytes, string $pw = 'Clave-de-copia-1') use ($bk): array {
+    file_put_contents("$bk/bx", $bytes);
+    MuDesk\Files::remove("$bk/outx");
+    @mkdir("$bk/outx");
+    $r = MuDesk\Backup::extract("$bk/bx", $pw, "$bk/outx");
+    return [is_string($r) ? $r : 'read', count(glob("$bk/outx/*") ?: [])];
+};
+$hdr = strlen(MuDesk\Backup::MAGIC) + 20;
+$c0  = unpack('N', $raw1, $hdr)[1];                                          // the first chunk's length: where the second begins
+$bkSeen[] = [$size === strlen($raw1), str_starts_with($raw1, MuDesk\Backup::MAGIC), ($m1['version'] ?? null), ($m1['files'] ?? null), array_values(array_unique($same)),
+    !str_contains($raw1, 'max_sessions_total'), !str_contains($raw1, substr($bigData, 1000, 64))];
+// what it writes, for the server's account only (before, the process's mask: a restored secret.php readable by the other
+// accounts of a shared server); a disk that fills up: refused, nothing taken as read (before, put in place cut short)
+BkFullDisk::$room = 200000;
+$bkSeen[] = [PHP_OS_FAMILY === 'Windows' || (fileperms("$bk/out1/secret.php") & 0777) === 0600, MuDesk\Backup::extract("$bk/b1", 'Clave-de-copia-1', 'bkfull://out')];
+// a file gone meanwhile left out (as in a backup made a moment later); one that cannot be read, or grows shorter while it is
+// read: the backup ends there, without its last chunk, refused whole (before, zeros in its place, and taken for good)
+$bkWrite("$bk/b5", [['users.json', "$bk/data/users.json"], ['hosts/ido.json', "$bk/data/hosts/ido.json"]]);
+@mkdir("$bk/out9");
+MuDesk\Backup::extract("$bk/b5", 'Clave-de-copia-1', "$bk/out9");
+$bkCut = static function (array $entries) use ($bkKey, $bkSalt, $bk, $try): array {
+    $h = fopen("$bk/b6", 'wb');
+    try {
+        MuDesk\Backup::write($h, $bkKey, $bkSalt, ['version' => MuDesk\VERSION], $entries);
+        return ['written'];
+    } catch (RuntimeException $e) {
+        fflush($h);
+        return [$e->getMessage(), $try((string)file_get_contents("$bk/b6"))[0]];
+    } finally {
+        fclose($h);
+    }
+};
+$bkSeen[] = [is_file("$bk/out9/users.json"), file_exists("$bk/out9/hosts/ido.json"), $bkCut([['users.json', "$bk/data/users.json"], ['hosts/carpeta.json', "$bk/data/audit"]]),
+    $bkCut([['users.json', "$bk/data/users.json"], ['files/u1/grande.bin', 'bkshrink://grande']])];
+$bkSeen[] = [$try($raw1, 'Otra-clave-999'), $try(substr_replace($raw1, chr(ord($raw1[$hdr + 5 + 12 + $c0 + 16 + 5 + 40]) ^ 1), $hdr + 5 + 12 + $c0 + 16 + 5 + 40, 1))[0],
+    $try(substr($raw1, 0, $hdr + 5 + 12 + $c0 + 16))[0], $try($raw1 . 'x')[0], $try('PK' . str_repeat("\0", 100))[0]];
+// cut right after a chunk that ends with a whole record (its last one, empty, gone): only the last chunk's flag says that
+// something is missing
+$exactJson = (string)json_encode(['version' => MuDesk\VERSION, 'files' => 1], MuDesk\Http::JSON);
+file_put_contents("$bk/justo.bin", str_repeat('j', 1048576 - (2 + 9 + 8 + strlen($exactJson)) - (2 + strlen('files/u1/justo.bin') + 8)));
+$bkWrite("$bk/b7", [['files/u1/justo.bin', "$bk/justo.bin"]]);
+$raw7 = (string)file_get_contents("$bk/b7");
+$c7   = unpack('N', $raw7, $hdr)[1];
+$bkSeen[] = [$c7 === 1048576, strlen($raw7) === $hdr + 5 + 12 + $c7 + 16 + 5 + 12 + 16, $try($raw7)[0], $try(substr($raw7, 0, $hdr + 5 + 12 + $c7 + 16))[0]];
+@unlink("$bk/justo.bin");
+$bkWrite("$bk/b2", [['users.json', "$bk/data/users.json"]], ['version' => '99.0.0']);
+$bkWrite("$bk/b3", [['../fuera.txt', "$bk/data/users.json"]]);
+$bkSeen[] = [$try((string)file_get_contents("$bk/b2"))[0], $try((string)file_get_contents("$bk/b3"))[0], is_file("$bk/fuera.txt")];
+// restored: what it carries in place, the users' folders kept when it does not carry them, every web session ended
+$bkWrite("$bk/b4", MuDesk\Backup::entries([]));
+file_put_contents("$bk/data/users.json", '{"u2":{"id":"u2","username":"otro"}}');
+file_put_contents("$bk/data/files/u1/docs/grande.bin", 'cambiado');
+@mkdir("$bk/data/sessions", 0700, true);
+file_put_contents("$bk/data/sessions/sess_abc", 'x');
+file_put_contents("$bk/data/certs.json", '{"rdp:pc:3389":{"fp":"' . str_repeat('ab', 32) . '"}}');   // (fixed after it: it goes)
+@mkdir("$bk/out4");
+MuDesk\Backup::extract("$bk/b4", 'Clave-de-copia-1', "$bk/out4");
+$bkSess = MuDesk\Sessions::register(bin2hex(random_bytes(16)), ['uid' => 'u1', 'user' => 'ana', 'token' => 't']);   // a session running
+$r4 = MuDesk\Backup::restore("$bk/out4");
+$bkKilled = $bkSess->read();                                                // (told to end: it took 5 s to give up waiting)
+$bkSess->close();
+$bkSeen[] = [$r4, (string)file_get_contents("$bk/data/users.json"), (string)file_get_contents("$bk/data/files/u1/docs/grande.bin"), is_file("$bk/data/sessions/sess_abc"),
+    is_file("$bk/data/ratelimit.json"), glob("$bk/data/tmp/restore-old-*") ?: [], is_file("$bk/data/certs.json"), $bkKilled];
+// a move that fails half way: what was moved goes back, nothing of the backup stays
+file_put_contents("$bk/data/users.json", '{"u3":{}}');
+@mkdir("$bk/out5");
+MuDesk\Backup::extract("$bk/b4", 'Clave-de-copia-1', "$bk/out5");
+$moves = 0;
+MuDesk\Backup::$move = static function (string $a, string $b) use (&$moves): bool {
+    return ++$moves !== 4 && @rename($a, $b);          // (the second item's, into place; the moves back work)
+};
+$r5 = MuDesk\Backup::restore("$bk/out5");
+MuDesk\Backup::$move = null;
+$bkSeen[] = [$r5, (string)file_get_contents("$bk/data/users.json"), is_file("$bk/data/settings.json"), is_dir("$bk/data/connections"), glob("$bk/data/tmp/restore-old-*") ?: []];
+// a folder made again meanwhile where one goes (by a request, before Config::load waited for the restore): that move fails,
+// and what was there goes back all the same (before, it was left aside and removed: every connection lost)
+file_put_contents("$bk/data/connections/u1.json", '{"c1":{"host":"antes"}}');
+@mkdir("$bk/out7");
+MuDesk\Backup::extract("$bk/b4", 'Clave-de-copia-1', "$bk/out7");
+MuDesk\Backup::$move = static function (string $a, string $b): bool {
+    if (str_ends_with(str_replace('\\', '/', $a), '/out7/connections')) {
+        @mkdir($b, 0700);
+        return false;
+    }
+    return @rename($a, $b);
+};
+$r7 = MuDesk\Backup::restore("$bk/out7");
+$bkSeen[] = [$r7, (string)@file_get_contents("$bk/data/connections/u1.json"), (string)@file_get_contents("$bk/data/users.json"), glob("$bk/data/restore-kept-*") ?: []];
+// what cannot go back is never removed: kept in the data folder, said so
+@mkdir("$bk/out8");
+MuDesk\Backup::extract("$bk/b4", 'Clave-de-copia-1', "$bk/out8");
+MuDesk\Backup::$move = static function (string $a, string $b): bool {
+    $a = str_replace('\\', '/', $a);
+    return !str_ends_with($a, '/out8/users.json') && !str_contains($a, '/restore-old-') && @rename($a, $b);
+};
+$elog = ini_set('error_log', "$bk/errors.log");
+$r8   = MuDesk\Backup::restore("$bk/out8");
+ini_set('error_log', (string)$elog);
+MuDesk\Backup::$move = null;
+$kept8 = (glob("$bk/data/restore-kept-*") ?: [''])[0];
+$bkSeen[] = [$r8, $kept8 !== '' && is_file("$kept8/users.json") && is_file("$kept8/connections/u1.json"), is_file("$bk/data/users.json"),
+    $kept8 !== '' && str_contains((string)@file_get_contents("$bk/errors.log"), basename($kept8))];
+foreach ($kept8 !== '' ? array_diff(scandir($kept8) ?: [], ['.', '..']) : [] as $item) {   // (back in place by hand)
+    MuDesk\Files::remove("$bk/data/$item");
+    rename("$kept8/$item", "$bk/data/$item");
+}
+$kept8 !== '' && rmdir($kept8);
+// while a restore moves them, the data folder's folders are not made again by a request (they stood in the way)
+file_put_contents("$bk/data/run/restoring", (string)time());
+MuDesk\Files::remove("$bk/data/hosts");
+MuDesk\Config::load("$bk/config.php");
+$hostsMeanwhile = is_dir("$bk/data/hosts");
+unlink("$bk/data/run/restoring");
+MuDesk\Config::load("$bk/config.php");
+$bkSeen[] = [$hostsMeanwhile, is_dir("$bk/data/hosts")];
+// another installation's backup (a move to a new server): its key and settings from then on, in the same request too (the
+// audit's next line is signed with the backup's key)
+$bkKeyThere = MuDesk\Crypto::appKey();
+\mkdir("$bk/data2", 0700, true);
+file_put_contents("$bk/config2.php", '<?php return ["data_dir" => ' . var_export("$bk/data2", true) . '];');
+MuDesk\Config::load("$bk/config2.php");
+MuDesk\Crypto::forgetAppKey();
+MuDesk\Settings::forget();
+$keyHere = MuDesk\Crypto::appKey();
+MuDesk\Settings::save(['max_sessions_total' => 2]);
+\mkdir("$bk/out6");
+MuDesk\Backup::extract("$bk/b4", 'Clave-de-copia-1', "$bk/out6");
+$r6 = MuDesk\Backup::restore("$bk/out6");
+$bkSeen[] = [$r6, $keyHere !== $bkKeyThere, MuDesk\Crypto::appKey() === $bkKeyThere, MuDesk\Settings::get('max_sessions_total')];
+MuDesk\Config::load("$tmp/config.php");
+MuDesk\Crypto::forgetAppKey();
+MuDesk\Settings::forget();
+check('backup: what it carries (not what passes, nor another path; a user\'s files whatever their names); written only from what it read (a file that cannot be read, or grows shorter: never a backup taken for good); encrypted in authenticated chunks, read back whole for the server\'s account only; wrong password, changed, cut, longer, not one, newer, a name out of the folder, a full disk: refused; restored in place (a store it did not have goes, the folders it does not carry kept, web sessions ended), a failed move undone (a folder made again meanwhile too), what cannot go back kept; folders not made again meanwhile; another installation\'s: its key and settings at once',
+    $bkSeen, [[true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, true, true, true, false, false],
+    [['audit/2026-11-01.jsonl', 'connections/u1.json', 'secret.php', 'settings.json', 'users.json'], true],
+    [true, true, MuDesk\VERSION, 6, [true], true, true], [true, 'backup_restore'],
+    [true, false, ['hosts/carpeta.json cannot be read', 'backup_damaged'], ['files/u1/grande.bin grew shorter while it was read', 'backup_damaged']],
+    [['backup_password', 0], 'backup_damaged', 'backup_damaged', 'backup_damaged', 'backup_format'], [true, true, 'read', 'backup_damaged'],
+    ['backup_version', 'backup_damaged', false],
+    [true, '{"u1":{"id":"u1","username":"ana"}}', 'cambiado', false, true, [], false, ["\x09killed"]], ['backup_restore', '{"u3":{}}', true, true, []],
+    ['backup_restore', '{"c1":{"host":"antes"}}', '{"u3":{}}', []], ['backup_kept', true, false, true], [false, true], [true, true, true, 20]]);
+unset($bigData, $raw1, $raw7, $same, $bkSeen);                                     // (megabytes the tests after need: 128 MB in all)
+
+// ... over the web, in an installation of its own (its users and sessions are restored): prepared with its password (10
+// characters at least), downloaded once, by an administrator only; sent in pieces (in order), restored with its password
+// (a wrong one keeps the file for another try); every web session ended; meanwhile the gateway answers "restoring"
+$ba = "$tmp/bkapp";
+@mkdir("$ba/public", 0700, true);
+@mkdir("$ba/src", 0700, true);
+@mkdir("$ba/data", 0700, true);
+foreach (['api.php', 'backup.php'] as $f) {
+    copy(__DIR__ . "/../public/$f", "$ba/public/$f");
+}
+file_put_contents("$ba/src/bootstrap.php", str_replace('SRC', var_export(realpath(__DIR__ . '/../src'), true), $stub));
+file_put_contents("$ba/config.php", '<?php return ["data_dir" => ' . var_export("$ba/data", true) . '];');
+MuDesk\Config::load("$ba/config.php");
+MuDesk\Crypto::forgetAppKey();
+MuDesk\Settings::forget();
+$baAdmin = MuDesk\Users::create('bkadmin', 'Bk-admin-' . bin2hex(random_bytes(6)), 'admin', false);
+$baUser  = MuDesk\Users::create('bkuser', 'Bk-user-' . bin2hex(random_bytes(6)), 'user', false);
+MuDesk\Settings::save(['max_sessions_total' => 9]);
+$baSess = static function (array $u) use ($ba, $ser): array {
+    [$sid, $csrf] = [bin2hex(random_bytes(16)), bin2hex(random_bytes(16))];
+    file_put_contents("$ba/data/sessions/sess_$sid", 'uid|' . $ser($u['id']) . 'username|' . $ser($u['username']) . 'sv|i:1;since|i:' . time()
+        . ';seen|i:' . time() . ';csrf|' . $ser($csrf) . 'bind|' . $ser(hash('sha256', 'test')));
+    return [$sid, $csrf];
+};
+[$baA, $baU] = [$baSess($baAdmin), $baSess($baUser)];
+MuDesk\Config::load("$tmp/config.php");
+MuDesk\Crypto::forgetAppKey();
+MuDesk\Settings::forget();
+$probe = stream_socket_server('tcp://127.0.0.1:0');
+$baPort = (int)substr((string)strrchr((string)stream_socket_get_name($probe, false), ':'), 1);
+fclose($probe);
+$baWeb = proc_open([PHP_BINARY, '-S', "127.0.0.1:$baPort", '-t', "$ba/public"], [1 => ['file', $nul, 'w'], 2 => ['file', $nul, 'w']], $baPipes);
+for ($i = 0; $i < 100 && !($ws = @fsockopen('127.0.0.1', $baPort)); $i++) {
+    usleep(50000);
+}
+$ws && fclose($ws);
+$baReq = static function (array $who, string $method, string $path, string $body = '') use ($baPort): array {
+    $s = fsockopen('127.0.0.1', $baPort, $en, $es, 30);
+    fwrite($s, "$method /$path HTTP/1.0\r\nHost: 127.0.0.1\r\nUser-Agent: test\r\nCookie: MUDESKSID={$who[0]}\r\nX-CSRF: {$who[1]}\r\n"
+        . "Content-Type: application/octet-stream\r\nContent-Length: " . strlen($body) . "\r\n\r\n$body");
+    $r = (string)stream_get_contents($s);
+    fclose($s);
+    return [(int)substr($r, 9, 3), substr($r, (int)strpos($r, "\r\n\r\n") + 4)];
+};
+$baApi = static fn(array $who, array $b): array => (static fn(array $r): array => [$r[0], json_decode($r[1], true)])($baReq($who, 'POST', 'api.php', json_encode($b)));
+$baSeen = [[$baApi($baA, ['action' => 'admin.backup.prepare', 'password' => 'corta'])[1]['error'] ?? null, $baApi($baU, ['action' => 'admin.backup.prepare', 'password' => 'Clave-larga-1'])[0]]];
+// a file the web server cannot read: said when the backup is asked for, not a backup cut short (where a file can be made so:
+// not on Windows, nor for root)
+file_put_contents("$ba/data/hosts/ilegible.json", '{}');
+@chmod("$ba/data/hosts/ilegible.json", 0);
+clearstatcache();
+$baSeen[0][] = is_readable("$ba/data/hosts/ilegible.json") ? 'backup_unreadable'
+    : ($baApi($baA, ['action' => 'admin.backup.prepare', 'password' => 'Clave-de-copia-1'])[1]['error'] ?? null);
+@chmod("$ba/data/hosts/ilegible.json", 0600);
+@unlink("$ba/data/hosts/ilegible.json");
+[, $prep] = $baApi($baA, ['action' => 'admin.backup.prepare', 'password' => 'Clave-de-copia-1', 'with' => ['files', 'nada']]);
+[$dlSt, $dl] = $baReq($baA, 'GET', 'backup.php?a=download&id=' . ($prep['id'] ?? ''));
+$baSeen[] = [$dlSt, str_starts_with($dl, MuDesk\Backup::MAGIC), $baReq($baA, 'GET', 'backup.php?a=download&id=' . ($prep['id'] ?? ''))[0],
+    $baReq($baU, 'GET', 'backup.php?a=download&id=' . ($prep['id'] ?? ''))[0]];
+// after it: another setting and another user (the restore takes them back)
+MuDesk\Config::load("$ba/config.php");
+MuDesk\Settings::save(['max_sessions_total' => 3]);
+MuDesk\Users::create('despues', 'Despues-' . bin2hex(random_bytes(6)), 'user', false);
+MuDesk\Config::load("$tmp/config.php");
+$upId = bin2hex(random_bytes(8));
+$half = intdiv(strlen($dl), 2);
+$up = [$baReq($baA, 'POST', "backup.php?a=upload&id=$upId&o=0", substr($dl, 0, $half))[0], json_decode($baReq($baA, 'POST', "backup.php?a=upload&id=$upId&o=5", 'x')[1], true)['error'] ?? null,
+    $baReq($baA, 'POST', "backup.php?a=upload&id=$upId&o=$half", substr($dl, $half))[0], $baReq($baU, 'POST', "backup.php?a=upload&id=$upId&o=0", 'x')[0]];
+$baSeen[] = $up;
+$wrongPw = $baApi($baA, ['action' => 'admin.backup.restore', 'id' => $upId, 'password' => 'Otra-clave-99']);
+file_put_contents("$ba/data/run/restoring", (string)time());                // a restore under way: the gateway waits
+$busy = $baApi($baU, ['action' => 'state']);
+file_put_contents("$ba/data/run/restoring", (string)(time() - 400));       // (one cut off long ago: no longer)
+$stale = $baApi($baU, ['action' => 'state'])[0];
+@unlink("$ba/data/run/restoring");
+$okRestore = $baApi($baA, ['action' => 'admin.backup.restore', 'id' => $upId, 'password' => 'Clave-de-copia-1']);
+$after = $baApi($baA, ['action' => 'state'])[1];
+MuDesk\Config::load("$ba/config.php");
+MuDesk\Crypto::forgetAppKey();
+MuDesk\Settings::forget();
+$baSeen[] = [$wrongPw[1]['error'] ?? null, $busy, $stale, $okRestore, $after['user'] ?? 'signed out', MuDesk\Settings::get('max_sessions_total'), MuDesk\Users::byName('despues'),
+    glob("$ba/data/tmp/restore-*") ?: [], array_column(MuDesk\Audit::search(['event' => 'backup_'])['rows'], 'event')];
+MuDesk\Config::load("$tmp/config.php");
+MuDesk\Crypto::forgetAppKey();
+MuDesk\Settings::forget();
+proc_terminate($baWeb);
+proc_close($baWeb);
+MuDesk\Files::remove($ba);
+MuDesk\Files::remove($bk);
+check('backup over the web: prepared with a password of 10 characters at least (a file the server cannot read said then), downloaded once, by an administrator only; sent in pieces in order, restored with its password (a wrong one keeps it), every session ended; "restoring" meanwhile',
+    $baSeen, [['backup_weak', 403, 'backup_unreadable'], [200, true, 404, 403], [200, 'offset', 200, 403],
+    ['backup_password', [503, ['error' => 'restoring']], 200, [200, ['ok' => true]], 'signed out', 9, null, [], ['backup_restore']]]);
+
 // users who are not administrators make no connections unless the administrator allows it (off by default): no new one, no
 // .rdp import (the same request), and their own keep their target (options and name may change); administrators always can
 $cc0  = $asUser(['action' => 'state'])[1]['user']['create_conns'] ?? null;
+check('state: the version told to a signed-in user', is_string($asUser(['action' => 'state'])[1]['version'] ?? null), true);   // (this test server's own)
 $ccA  = $asUser(['action' => 'conns.save', 'conn' => ['name' => 'Nueva', 'host' => 'pc.nueva']]);
 $ccOwn = MuDesk\Connections::save($wu['id'], ['name' => 'Mía', 'host' => 'pc.mia', 'audio' => true], null);
 $ccOpt = $asUser(['action' => 'conns.save', 'conn' => ['id' => $ccOwn['id'], 'name' => 'Mía (otra)', 'host' => 'pc.mia', 'audio' => false]]);
@@ -5701,6 +6598,23 @@ check('administrators: the last enabled one kept (under the lock), a disabled on
      $offDel[0], MuDesk\Users::get($off['id']), MuDesk\Users::create('WebAdmin', 'Web-admin-' . bin2hex(random_bytes(6)), 'user', false),
      count(array_filter(MuDesk\Users::all(), static fn($u) => strcasecmp($u['username'], 'webadmin') === 0))],
     [1, 200, 3, 400, 'last_admin', 'admin', 200, null, null, 1]);
+// a user changed through the API with some fields only: the others stay as the user has them (before, a field left out
+// was taken as its default: any hour, the default sessions, enabled again, the role taken away); null hours still clear them
+$keep  = MuDesk\Users::create('conhorario', 'Con-horario-' . bin2hex(random_bytes(6)), 'auditor', false);
+$hrs   = ['days' => [1, 2, 3, 4, 5], 'from' => '08:00', 'to' => '18:00'];
+$asAdmin(['action' => 'admin.user.save', 'id' => $keep['id'], 'role' => 'auditor', 'enabled' => false, 'max_sessions' => 2, 'hours' => $hrs]);
+$fields = static fn(): array => array_intersect_key(MuDesk\Users::get($keep['id']), array_flip(['role', 'enabled', 'max_sessions', 'hours']));
+$asAdmin(['action' => 'admin.user.save', 'id' => $keep['id']]);
+$keepNone = $fields();
+$asAdmin(['action' => 'admin.user.save', 'id' => $keep['id'], 'max_sessions' => 4]);
+$keepMax = $fields();
+$asAdmin(['action' => 'admin.user.save', 'id' => $keep['id'], 'hours' => null]);
+$keepClear = $fields();
+MuDesk\Users::delete($keep['id']);
+check('users: changed through the API with some fields only, the others kept (hours, sessions, enabled, role); null hours clear them',
+    [$keepNone, $keepMax, $keepClear], [
+    ['role' => 'auditor', 'enabled' => false, 'max_sessions' => 2, 'hours' => $hrs], ['role' => 'auditor', 'enabled' => false, 'max_sessions' => 4, 'hours' => $hrs],
+    ['role' => 'auditor', 'enabled' => false, 'max_sessions' => 4, 'hours' => null]]);
 // CSV import over the web: the administrator's (audited with what was added and how many rows were refused), never a user's
 [$icode, $ij] = $asAdmin(['action' => 'admin.conns.import', 'csv' => "name,host,users\nImportada,imp.empresa,webuser\nMala,,\n"]);
 $impEvent = MuDesk\Audit::search(['event' => 'admin_conns_import'])['rows'][0] ?? [];
@@ -5749,24 +6663,79 @@ $recRead = static function (string $sid): array {                             //
 };
 $rsid = bin2hex(random_bytes(16));
 $rec  = MuDesk\Recording::start($rsid, ['uid' => $wu['id'], 'user' => 'webuser', 'conn' => 'Rec PC', 'host' => 'h']);
+$rec->frame(2, pack('vvC', 1280, 720, 32));
 $rec->frame(1, "\x01PICTURE-ONE");
 $rec->frame(4, 'CLIPBOARD-SECRET');
 $rec->frame(7, 'SOUND');
+$rec->frame(2, pack('vvC', 1024, 900, 32));
 $rec->frame(3, '{"connected":true}');
 for ($w0 = microtime(true); microtime(true) - $w0 < 0.03;) {             // (usleep() on Windows may wake early)
     usleep(2000);
 }
 $rec->frame(15, pack('vv', 5, 6));
+$rec->frame(13, pack('CVC', 1, 44100, 2));
+$rec->frame(MuDesk\Recording::MIC, 'MIC-PCM');
 $rec->close(['reason' => 'user']);
+$micOnly = MuDesk\Recording::newId();
+$micRec  = MuDesk\Recording::start($micOnly, ['user' => 'webuser']);
+$micRec->frame(MuDesk\Recording::MIC, 'MIC-PCM');
+$micRec->close();
+$micSound = MuDesk\Recording::info($micOnly)['sound'] ?? null;
+$pgId  = MuDesk\Recording::newId();
+$pgRec = MuDesk\Recording::start($pgId, ['user' => 'webuser', 'kind' => 'video']);
+$pgRec->frame(1, "\x01PICTURE");                               // (the stream's: not kept)
+$pgRec->frame(MuDesk\Recording::MIC, 'MIC');
+$pgRec->describe(['mime' => 'video/webm;codecs=vp8,opus', 'w' => 1280, 'h' => 720, 'sound' => true]);
+$pgRec->frame(MuDesk\Recording::VIDEO, 'WEBM-1');
+$pgRec->frame(MuDesk\Recording::VIDEO, 'WEBM-2');
+$pgRec->close(['stopped_by' => 'webuser']);
+$pgRead = '';
+MuDesk\Recording::read($pgId, static function (string $p) use (&$pgRead): void { $pgRead .= $p; });
+$pgInfo = MuDesk\Recording::info($pgId);
+$pgOdd  = MuDesk\Recording::newId();                            // what a page says it records, out of bounds or of another kind
+$pgOddR = MuDesk\Recording::start($pgOdd, ['kind' => 'video']);
+$pgOddR->describe(['mime' => 'text/html', 'w' => 99999, 'h' => 720, 'sound' => 0]);   // (wider than RDP allows)
+$pgOddR->close();
+$pgOddI = MuDesk\Recording::info($pgOdd);
+$pgOddR2 = MuDesk\Recording::start($pgOdd2 = MuDesk\Recording::newId(), ['kind' => 'video']);
+$pgWarned = false;
+set_error_handler(static function () use (&$pgWarned): bool { $pgWarned = true; return true; });
+$pgOddR2->describe(['mime' => [], 'w' => [], 'h' => null, 'sound' => []]);   // (a page's JSON of another shape: no warning)
+restore_error_handler();
+$pgOddR2->close();
+$pgRate = MuDesk\Recording::start($pgRateId = MuDesk\Recording::newId(), ['kind' => 'video']);
+$pgRate->frame(MuDesk\Recording::VIDEO, str_repeat('v', 5 << 20));
+$pgSlow = $pgRate->overRate();
+$pgRate->frame(MuDesk\Recording::VIDEO, str_repeat('v', 6 << 20));        // (11 MB in its first second: no video makes it)
+$pgFast = $pgRate->overRate();
+$pgRate->close();
+$stRec  = MuDesk\Recording::newId();                            // one of the stream's frames does not take a video's
+$stRecR = MuDesk\Recording::start($stRec, ['user' => 'webuser']);
+$stRecR->frame(MuDesk\Recording::VIDEO, 'WEBM');
+$stRecR->close();
+$stSize = MuDesk\Recording::info($stRec)['bytes'] ?? null;
+foreach ([$pgId, $pgOdd, $stRec, $pgOdd2, $pgRateId] as $pgX) {
+    @unlink("$tmp/data/recordings/$pgX.rec");
+    @unlink("$tmp/data/recordings/$pgX.json");
+}
+check('recording made in the page: only its video kept (nothing of the stream\'s frames), in order; what the page records in its details, within bounds (no warning for another shape); one of the stream takes no video; one growing faster than a video can is told', [
+    array_map(static fn(array $f): string => $f[0] . ':' . $f[1], $recFrames($pgRead)),
+    [$pgInfo['kind'] ?? null, $pgInfo['mime'] ?? null, $pgInfo['width'] ?? null, $pgInfo['height'] ?? null, $pgInfo['sound'] ?? null, $pgInfo['stopped_by'] ?? null],
+    [$pgOddI['mime'] ?? null, $pgOddI['width'] ?? null, $pgOddI['height'] ?? null, $pgOddI['sound'] ?? null], $stSize, $pgWarned, [$pgSlow, $pgFast]],
+    [['33:WEBM-1', '33:WEBM-2'], ['video', 'video/webm', 1280, 720, true, 'webuser'], ['video/webm', null, null, null], 7, false, [false, true]]);
+@unlink("$tmp/data/recordings/$micOnly.rec");
+@unlink("$tmp/data/recordings/$micOnly.json");
 $rraw = (string)file_get_contents("$tmp/data/recordings/$rsid.rec");
 [$rok, $rback] = $recRead($rsid);
 $rfr  = $recFrames($rback);
 $rinf = MuDesk\Recording::info($rsid);
-check('recording: the picture\'s frames with their times, encrypted, read back as written; clipboard and sound left out; its details', [
-    $rok, array_map(static fn($f) => [$f[0], $f[1]], $rfr), ($rfr[2][2] ?? 0) - ($rfr[0][2] ?? 0) >= 25, str_contains($rraw, 'PICTURE'), str_contains($rraw, 'CLIPBOARD'),
+check('recording: the picture\'s, the sound\'s and the microphone\'s frames with their times, encrypted, read back as written; the clipboard left out; its details, the largest desktop', [
+    $rok, array_map(static fn($f) => [$f[0], $f[1]], $rfr), ($rfr[5][2] ?? 0) - ($rfr[0][2] ?? 0) >= 25, str_contains($rraw, 'PICTURE'), str_contains($rraw, 'CLIPBOARD'),
     substr($rraw, 0, 7), [$rinf['user'] ?? null, $rinf['conn'] ?? null, $rinf['reason'] ?? null, ($rinf['bytes'] ?? 0) === strlen($rraw), isset($rinf['ended'])],
+    [$rinf['id'] ?? null, $rinf['sid'] ?? null, $rinf['width'] ?? null, $rinf['height'] ?? null, $micSound],
     MuDesk\Recording::info(str_repeat('0', 32)), MuDesk\Recording::info('../x')],
-    [true, [[1, "\x01PICTURE-ONE"], [3, '{"connected":true}'], [15, pack('vv', 5, 6)]], true, false, false, "MDREC1\n", ['webuser', 'Rec PC', 'user', true, true], null, null]);
+    [true, [[2, pack('vvC', 1280, 720, 32)], [1, "\x01PICTURE-ONE"], [7, 'SOUND'], [2, pack('vvC', 1024, 900, 32)], [3, '{"connected":true}'], [15, pack('vv', 5, 6)], [13, pack('CVC', 1, 44100, 2)], [MuDesk\Recording::MIC, 'MIC-PCM']],
+     true, false, false, "MDREC1\n", ['webuser', 'Rec PC', 'user', true, true], [$rsid, $rsid, 1280, 900, true], null, null]);
 // two pieces (each over 1 MB of picture): changed, moved and swapped into another recording, refused
 $r2sid = bin2hex(random_bytes(16));
 $r2 = MuDesk\Recording::start($r2sid, ['user' => 'webuser']);
@@ -5796,6 +6765,20 @@ $swapped = $recRead($rsid);
 check('recording: a changed, moved or swapped piece is refused (what came before it is given); a cut one gives what it has', [
     $whole[0], strlen($whole[1]), $moved, $changed, [$cut[0], strlen($cut[1])], $swapped, [$r4read[0], $recFrames($r4read[1])[0][1] ?? null] === [true, $big4]],
     [true, 2 * (9 + (1 << 20)), [false, ''], [false, ''], [true, 1 << 20], [false, ''], true]);   // (pieces of 1 MB: a frame may span two)
+unset($whole, $cut, $r4read, $big4, $r2raw, $pieces, $bad, $moved, $changed, $swapped);   // (megabytes the tests after need: 128 MB in all)
+// a frame whose header comes up to a piece's end (5 bytes short of it), then one of 1.5 MB: read back whole (before, the
+// room left was negative and the frame went whole into a piece the reader refuses)
+$edgeId = MuDesk\Recording::newId();
+$edge   = MuDesk\Recording::start($edgeId, ['user' => 'webuser']);
+$edge->frame(9, str_repeat('a', (1 << 20) - 14));
+$edge->frame(9, $edgeBig = str_repeat('b', 1536 * 1024));
+$edge->close();
+$edgeRead = $recRead($edgeId);
+$edgeOk   = [$edgeRead[0], array_map(static fn(array $f): int => strlen($f[1]), $recFrames($edgeRead[1])), ($recFrames($edgeRead[1])[1][1] ?? '') === $edgeBig];
+@unlink("$tmp/data/recordings/$edgeId.rec");
+@unlink("$tmp/data/recordings/$edgeId.json");
+check('recording: a frame\'s header up to a piece\'s end, then a large frame: read back whole', $edgeOk, [true, [(1 << 20) - 14, 1536 * 1024], true]);
+unset($edgeRead, $edgeBig, $edge);
 // full: at the largest size (config.php record_max_mb) nothing more is kept, and its details say so; old ones removed
 $cfg = new ReflectionProperty(MuDesk\Config::class, 'c');
 $cfg0 = $cfg->getValue();
@@ -5809,13 +6792,19 @@ $r3->close();
 $cfg->setValue(null, $cfg0);
 $r3inf = MuDesk\Recording::info($r3sid);
 $r3read = $recRead($r3sid);
-touch("$tmp/data/recordings/$r3sid.rec", time() - 31 * 86400);
+touch("$tmp/data/recordings/$r3sid.rec", time() - 4000 * 86400);
 touch("$tmp/data/recordings/$r2sid.rec", time() - 29 * 86400);
+$recDays0 = MuDesk\Settings::get('record_days');
+MuDesk\Recording::cleanup();                                                   // (by default: kept until deleted by hand)
+$keptOld  = MuDesk\Recording::info($r3sid) !== null;
+MuDesk\Settings::save(['record_days' => 30]);
 MuDesk\Recording::cleanup();
-check('recording: full at the largest size (said in its details); removed after the days of the settings (30 by default)', [
-    $r3inf['truncated'] ?? null, ($r3inf['bytes'] ?? 0) < (1 << 20), $r3read, MuDesk\Recording::info($r3sid), is_file("$tmp/data/recordings/$r3sid.json"),
-    MuDesk\Recording::info($r2sid) !== null, MuDesk\Settings::get('record_days')],
-    [true, true, [true, ''], null, false, true, 30]);
+$recDays30 = MuDesk\Settings::get('record_days');
+MuDesk\Settings::save(['record_days' => 0]);
+check('recording: full at the largest size (said in its details); kept until deleted by hand (0, by default), else removed after the days of the settings', [
+    $r3inf['truncated'] ?? null, ($r3inf['bytes'] ?? 0) < (1 << 20), $r3read, $recDays0, $keptOld, MuDesk\Recording::info($r3sid), is_file("$tmp/data/recordings/$r3sid.json"),
+    MuDesk\Recording::info($r2sid) !== null, $recDays30, MuDesk\Settings::get('record_days')],
+    [true, true, [true, ''], 0, true, null, false, true, 30, 0]);
 
 // over the web: the administrator records a connection (a user cannot stop it, nor record one); the page is told before
 // anything is shown and it is audited; no recording, no session; played only by administrators and auditors, audited
@@ -5862,14 +6851,302 @@ $asUserReplay  = $replay([$wsid, $wcsrf], $recSid);
 $asAdminReplay = $replay([$asid, $acsrf], $recSid);
 $viewLog = MuDesk\Audit::search(['event' => 'recording_view'])['rows'][0] ?? [];
 [$infoSt, $infoJ] = $asAdmin(['action' => 'admin.recording', 'sid' => $recSid]);
-check('recording over the web: set by the administrator only; the page told first; audited; no recording, no session; played by administrators only, audited', [
+check('recording over the web: set by the administrator only; the page told first; audited; no recording, no session; played by administrators only (not by its user: not found), audited', [
     $userSet, $recConn['record'] ?? null, $kept, $frameStatus($recBody)[1] ?? null, ($recInfo['user'] ?? null) === 'webuser', $recFrames($recPlain)[0][0] ?? null,
     str_contains($recPlain, '"token"'), $recConnect['recording'] ?? null, $frameStatus($noRecBody), $denied['reason'] ?? null,
     $asUserReplay[0], $asAdminReplay[0], $asAdminReplay[1] === $recPlain . pack('VCV', 0, 0, 3) . 'end', [$viewLog['user'] ?? null, $viewLog['owner'] ?? null, $viewLog['sid'] ?? null],
     [$infoSt, $infoJ['recording']['conn'] ?? null], $asUser(['action' => 'admin.recording', 'sid' => $recSid])[0]],
-    [false, true, true, ['recording'], true, MuDesk\Rdp\Client::F_STATUS, false, true, [['token', 'trace'], ['end']], 'record_failed',
-     403, 200, true, ['webadmin', 'webuser', $recSid], [200, $recConn['name']], 403]);
+    [false, true, true, ['recording', 'record_by'], true, MuDesk\Rdp\Client::F_STATUS, false, true, [['token', 'trace'], ['end']], 'record_failed',
+     404, 200, true, ['webadmin', 'webuser', $recSid], [200, $recConn['name']], 404]);
 MuDesk\Connections::delete($wu['id'], $recConn['id']);
+// an administrator's own connection, from their own editor: "Record the sessions" set and cleared there; a save without it
+// (several .rdp files imported at once) keeps it; a user's own one, never (the same request)
+$recOwn = static fn(callable $as, array $c) => $as(['action' => 'conns.save', 'conn' => $c + ['host' => '127.0.0.1', 'port' => 9, 'name' => 'Grabada']]);
+[$roSt, $roJ] = $recOwn($asAdmin, ['record' => true]);
+$roId   = $roJ['conn']['id'] ?? '';
+$roKept = $recOwn($asAdmin, ['id' => $roId, 'name' => 'Grabada 2'])[1]['conn']['record'] ?? null;
+$roOff  = $recOwn($asAdmin, ['id' => $roId, 'record' => false])[1]['conn']['record'] ?? null;
+$ruId   = MuDesk\Connections::save($wu['id'], ['host' => '127.0.0.1', 'port' => 9, 'name' => 'De un usuario'], null)['id'];   // (users may not make them here)
+[$ruSt, $ruJ] = $recOwn($asUser, ['id' => $ruId, 'name' => 'De un usuario', 'record' => true]);
+check('recording: an administrator sets it in their own editor too (kept by a save without it, cleared there); a user cannot',
+    [$roSt, $roJ['conn']['record'] ?? null, $roKept, $roOff, $ruSt, $ruJ['conn']['record'] ?? null], [200, true, true, false, 200, false]);
+$asAdmin(['action' => 'conns.delete', 'id' => $roId]);
+MuDesk\Connections::delete($wu['id'], $ruId);
+// the recorded computer reached by another name or by its address: recorded too (before, only by the same name)
+$recA = MuDesk\Connections::save($wu['id'], ['host' => '127.0.0.1', 'port' => 3389, 'name' => 'Por IP'], null);
+MuDesk\Connections::adminUpdate($wu['id'], ['id' => $recA['id'], 'host' => '127.0.0.1', 'port' => 3389, 'name' => 'Por IP', 'record' => true], false);
+check('recording: the recorded computer by another name or its address is recorded too; another port, not',
+    [MuDesk\Connections::recordedTarget($wu['id'], ['host' => 'localhost', 'port' => 3389]), MuDesk\Connections::recordedTarget($wu['id'], ['host' => '::ffff:127.0.0.1', 'port' => 3389]),
+     MuDesk\Connections::recordedTarget($wu['id'], ['host' => 'localhost', 'port' => 3390]), MuDesk\Connections::recordedTarget($wu['id'], ['host' => '127.0.0.2', 'port' => 3389])],
+    [true, true, false, false]);
+MuDesk\Connections::delete($wu['id'], $recA['id']);
+
+// a recording started and stopped in a running session: by an administrator, any session; by its user, their own when the
+// settings allow it (record_users) and an administrator's or the connection's never stopped by them; RemoteApp, no; another
+// user's session, not found. The session is told (Sessions::record), as the page's own input never can
+$rsSid  = bin2hex(random_bytes(16));
+$rsSess = MuDesk\Sessions::register($rsSid, ['uid' => $wu['id'], 'user' => 'webuser', 'conn' => 'Rec on demand', 'host' => '127.0.0.1', 'token' => hash('sha256', 'rs-token')]);
+$rsApp  = bin2hex(random_bytes(16));
+$rsAppS = MuDesk\Sessions::register($rsApp, ['uid' => $wu['id'], 'user' => 'webuser', 'conn' => 'App', 'host' => '127.0.0.1', 'app' => true, 'token' => hash('sha256', 'x')]);
+$rsOther = bin2hex(random_bytes(16));
+$rsOtherS = MuDesk\Sessions::register($rsOther, ['uid' => 'someone-else', 'user' => 'otro', 'conn' => 'X', 'host' => '127.0.0.1', 'token' => hash('sha256', 'y')]);
+$rsMsgs = static function () use ($rsSess): array {
+    $got = [];
+    for ($end = microtime(true) + 3; microtime(true) < $end && $got === []; usleep(20000)) {
+        array_push($got, ...$rsSess->read());
+    }
+    return array_map(static fn(string $m) => [ord($m[0]), json_decode(substr($m, 1), true)], $got);
+};
+$rsOff    = $asUser(['action' => 'session.record', 'sid' => $rsSid, 'on' => true])[0];
+MuDesk\Settings::save(['record_users' => true]);
+$rsState  = $asUser(['action' => 'state'])[1]['user']['record_own'] ?? null;
+$rsOn     = [$asUser(['action' => 'session.record', 'sid' => $rsSid, 'on' => true])[0], $rsMsgs()];
+MuDesk\Sessions::recording($rsSid, 'policy');
+$rsListed = array_values(array_filter(MuDesk\Sessions::active(), static fn($s) => $s['sid'] === $rsSid))[0] ?? [];
+$rsLocked = $asUser(['action' => 'session.record', 'sid' => $rsSid, 'on' => false]);
+$rsAdmin  = [$asAdmin(['action' => 'admin.sessions.record', 'sid' => $rsSid, 'on' => false])[0], $rsMsgs()];
+MuDesk\Sessions::recording($rsSid, 'owner');
+$rsOwnStop = [$asUser(['action' => 'session.record', 'sid' => $rsSid, 'on' => false])[0], $rsMsgs()];
+$rsAppSt  = $asUser(['action' => 'session.record', 'sid' => $rsApp, 'on' => true]);
+$rsOthSt  = $asUser(['action' => 'session.record', 'sid' => $rsOther, 'on' => true])[0];
+$rsUserAdm = $asUser(['action' => 'admin.sessions.record', 'sid' => $rsSid, 'on' => true])[0];
+MuDesk\Settings::save(['record_users' => false]);
+$rsSess->close();
+$rsAppS->close();
+$rsOtherS->close();
+check('recording in a session: an administrator any session, its user when allowed (never an administrator\'s or the connection\'s stopped); RemoteApp and others\' sessions refused', [
+    $rsOff, $rsState, $rsOn, [$rsListed['record'] ?? null, $rsListed['record_by'] ?? null], [$rsLocked[0], $rsLocked[1]['error'] ?? null], $rsAdmin, $rsOwnStop,
+    [$rsAppSt[0], $rsAppSt[1]['error'] ?? null], $rsOthSt, $rsUserAdm],
+    [403, true, [200, [[0x23, ['on' => true, 'by' => 'webuser', 'as' => 'owner']]]], [true, 'policy'], [403, 'record_locked'],
+     [200, [[0x23, ['on' => false, 'by' => 'webadmin', 'as' => 'admin']]]], [200, [[0x23, ['on' => false, 'by' => 'webuser', 'as' => 'owner']]]],
+     [400, 'record_unavailable'], 404, 403]);
+// a user's own recordings (those they started in their own sessions): listed for them, watched, deleted (audited; not while
+// it is being recorded); an administrator's or a connection's recording of their session, or another user's, never theirs
+$myRec = static function (string $uid, string $as, bool $close = true, ?string $sid = null): string {
+    $id = MuDesk\Recording::newId();
+    $r  = MuDesk\Recording::start($id, ['sid' => $sid ?? bin2hex(random_bytes(16)), 'uid' => $uid, 'user' => 'u', 'conn' => "Rec $as", 'host' => 'h', 'started_as' => $as]);
+    $r->frame(3, '{"connected":true}');
+    $close && $r->close(['stopped_by' => 'u']);
+    return $id;
+};
+$mrLiveSid = bin2hex(random_bytes(16));                                  // (its session runs: its file in data/run, fresh)
+file_put_contents("$tmp/data/run/$mrLiveSid.json", json_encode(['sid' => $mrLiveSid, 'uid' => $wu['id'], 'user' => 'webuser']));
+[$mrOwn, $mrAdmin, $mrPolicy, $mrOther, $mrLive] = [$myRec($wu['id'], 'owner'), $myRec($wu['id'], 'admin'), $myRec($wu['id'], 'policy'),
+    $myRec('someone-else', 'owner'), $myRec($wu['id'], 'owner', false, $mrLiveSid)];
+// an administrator's own: one they started in their own session (as an administrator); not one another administrator
+// started in it, nor their connection's
+$mrAdmOwn = MuDesk\Recording::newId();
+MuDesk\Recording::start($mrAdmOwn, ['sid' => bin2hex(random_bytes(16)), 'uid' => $wa['id'], 'user' => 'webadmin', 'by' => 'webadmin', 'started_as' => 'admin'])->close();
+$mrAdmBy  = MuDesk\Recording::newId();
+MuDesk\Recording::start($mrAdmBy, ['sid' => bin2hex(random_bytes(16)), 'uid' => $wa['id'], 'user' => 'webadmin', 'by' => 'otra-jefa', 'started_as' => 'admin'])->close();
+$mrAdmPol = MuDesk\Recording::newId();
+MuDesk\Recording::start($mrAdmPol, ['sid' => bin2hex(random_bytes(16)), 'uid' => $wa['id'], 'user' => 'webadmin', 'started_as' => 'policy'])->close();
+$mrAdmList = array_values(array_intersect([$mrAdmOwn, $mrAdmBy, $mrAdmPol], array_column($asAdmin(['action' => 'recordings.mine'])[1]['recordings'] ?? [], 'id')));
+$mrAdmUser = array_values(array_intersect([$mrAdmOwn, $mrAdmBy, $mrAdmPol], array_column($asUser(['action' => 'recordings.mine'])[1]['recordings'] ?? [], 'id')));
+foreach ([$mrAdmOwn, $mrAdmBy, $mrAdmPol] as $mrId) {
+    @unlink("$tmp/data/recordings/$mrId.rec");
+    @unlink("$tmp/data/recordings/$mrId.json");
+}
+check('recordings: an administrator\'s own are those they started in their own session (not another administrator\'s in it, nor their connection\'s); none of them a user\'s',
+    [$mrAdmList, $mrAdmUser], [[$mrAdmOwn], []]);
+$mrLeft  = $myRec($wu['id'], 'owner', false);                          // never closed: its process killed (no session runs)
+$mrStale = $myRec($wu['id'], 'owner', false, $mrStaleSid = bin2hex(random_bytes(16)));   // its session's file left, not touched for long
+file_put_contents("$tmp/data/run/$mrStaleSid.json", '{}');
+touch("$tmp/data/run/$mrStaleSid.json", time() - 600);
+$mrUnclosed = [MuDesk\Recording::running(MuDesk\Recording::info($mrLive)), MuDesk\Recording::running(MuDesk\Recording::info($mrLeft)),
+    MuDesk\Recording::running(MuDesk\Recording::info($mrStale)), array_column($asUser(['action' => 'recordings.mine'])[1]['recordings'] ?? [], 'running', 'id')[$mrLeft] ?? null,
+    $asUser(['action' => 'recordings.delete', 'id' => $mrLeft])[0], $asUser(['action' => 'recordings.delete', 'id' => $mrStale])[0]];
+@unlink("$tmp/data/run/$mrStaleSid.json");
+check('recordings: one not closed is being recorded while its session runs; one left by a process killed (no session, or its file stale) is not, and can be deleted',
+    $mrUnclosed, [true, false, false, false, 200, 200]);
+$mrList   = array_column($asUser(['action' => 'recordings.mine'])[1]['recordings'] ?? [], 'id');
+$mrAll    = array_column($asAdmin(['action' => 'admin.recordings'])[1]['recordings'] ?? [], 'started_as', 'id');   // every one, for an administrator
+$mrAllAs  = [$mrAll[$mrOwn] ?? null, $mrAll[$mrAdmin] ?? null, $mrAll[$mrPolicy] ?? null, $mrAll[$mrOther] ?? null, $mrAll[$mrLive] ?? null,
+    $asUser(['action' => 'admin.recordings'])[0]];
+$mrInfo   = [$asUser(['action' => 'recording.info', 'sid' => $mrOwn])[0], $asUser(['action' => 'recording.info', 'sid' => $mrAdmin])[0],
+    $asUser(['action' => 'recording.info', 'sid' => $mrOther])[0], $asAdmin(['action' => 'recording.info', 'sid' => $mrAdmin])[0]];
+$mrPlay   = [$replay([$wsid, $wcsrf], $mrOwn)[0], $replay([$wsid, $wcsrf], $mrPolicy)[0]];
+$mrDelete = [$asUser(['action' => 'recordings.delete', 'id' => $mrAdmin]), $asUser(['action' => 'recordings.delete', 'id' => $mrOther])[0],
+    $asUser(['action' => 'recordings.delete', 'id' => $mrLive]), $asUser(['action' => 'recordings.delete', 'id' => $mrOwn])[0]];
+$mrGone   = [is_file("$tmp/data/recordings/$mrOwn.rec"), is_file("$tmp/data/recordings/$mrOwn.json"), is_file("$tmp/data/recordings/$mrAdmin.rec"), is_file("$tmp/data/recordings/$mrLive.rec")];
+$mrAudit  = MuDesk\Audit::search(['event' => 'recording_delete', 'user' => 'webuser'])['rows'][0] ?? [];
+check('recordings: a user\'s own listed for them, watched and deleted (asked of them, audited; not while being recorded); an administrator\'s or a connection\'s of their session, or another user\'s, never; every one for an administrator',
+    [array_values(array_intersect([$mrOwn, $mrAdmin, $mrPolicy, $mrOther, $mrLive], $mrList)), $mrAllAs, $mrInfo, $mrPlay,
+     [$mrDelete[0][0], $mrDelete[1], $mrDelete[2][0], $mrDelete[2][1]['error'] ?? null, $mrDelete[3]], $mrGone, [$mrAudit['rec'] ?? null, $mrAudit['conn'] ?? null]],
+    [[$mrOwn, $mrLive], ['owner', 'admin', 'policy', 'owner', 'owner', 403], [200, 404, 404, 200], [200, 404], [404, 404, 400, 'recording_running', 200], [false, false, true, true], [$mrOwn, 'Rec owner']]);
+// an administrator deletes any recording (asked of them in the page; not one being recorded; audited, whose it was); an
+// auditor only reads, a user only theirs
+$adDel   = [$asAuditor(['action' => 'admin.recordings.delete', 'id' => $mrAdmin])[0], $asUser(['action' => 'admin.recordings.delete', 'id' => $mrAdmin])[0],
+    $asAdmin(['action' => 'admin.recordings.delete', 'id' => $mrLive]), $asAdmin(['action' => 'admin.recordings.delete', 'id' => $mrOther])[0],
+    $asAdmin(['action' => 'admin.recordings.delete', 'id' => str_repeat('0', 32)])[0]];
+$adGone  = [is_file("$tmp/data/recordings/$mrOther.rec"), is_file("$tmp/data/recordings/$mrOther.json"), is_file("$tmp/data/recordings/$mrAdmin.rec"),
+    is_file("$tmp/data/recordings/$mrLive.rec")];
+$adAudit = MuDesk\Audit::search(['event' => 'recording_delete', 'user' => 'webadmin'])['rows'][0] ?? [];
+check('recordings: an administrator deletes any one (not one being recorded; audited, whose it was), an auditor or a user cannot', [
+    [$adDel[0], $adDel[1], $adDel[2][0], $adDel[2][1]['error'] ?? null, $adDel[3], $adDel[4]], $adGone,
+    [$adAudit['rec'] ?? null, $adAudit['owner'] ?? null, $adAudit['as'] ?? null]],
+    [[403, 403, 400, 'recording_running', 200, 404], [false, false, true, true], [$mrOther, 'u', 'admin']]);
+foreach ([$mrAdmin, $mrPolicy, $mrOther, $mrLive] as $mrId) {
+    @unlink("$tmp/data/recordings/$mrId.rec");
+    @unlink("$tmp/data/recordings/$mrId.json");
+}
+@unlink("$tmp/data/run/$mrLiveSid.json");
+
+// ... and in whole sessions (Standard RDP Security, as Windows XP), the test server opening the microphone as Windows does
+// when a program records. A connection always recorded: its stream's frames, with what the remote computer heard of the
+// microphone (a whole packet of 882 bytes; the rest waits for the next)
+$rsSrv  = proc_open([PHP_BINARY, __DIR__ . '/fixtures/legacy_server.php', 'twicemic', '2', '2', 'proprietary', $cnf], [1 => ['pipe', 'w'], 2 => ['file', $nul, 'w']], $rsPipes);
+$rsPort = (int)trim((string)fgets($rsPipes[1]));
+$rsConn = MuDesk\Connections::save($wu['id'], ['host' => '127.0.0.1', 'port' => $rsPort, 'security' => 'auto', 'user' => 'ana',
+    'clipboard' => false, 'drive' => false, 'printer' => false, 'audio' => false, 'mic' => true, 'record' => true], null, true, true);
+is_array($rsConn) || print("recording test connection: $rsConn\n");
+$rsLine = static function (string $want) use ($rsPipes): array {          // the server's lines up to $want (30 s at most)
+    $seen = [];
+    stream_set_blocking($rsPipes[1], false);
+    for ($end = microtime(true) + 30; microtime(true) < $end; usleep(20000)) {
+        while (($l = fgets($rsPipes[1])) !== false) {
+            $seen[] = trim($l);
+            if (trim($l) === $want) {
+                return $seen;
+            }
+        }
+    }
+    return $seen;
+};
+$rsWait = static function (callable $until): bool {                       // (the session's own loop acts within a second; 30 s on a busy computer)
+    for ($end = microtime(true) + 30; microtime(true) < $end; usleep(50000)) {
+        if ($until()) {
+            return true;
+        }
+    }
+    return false;
+};
+$rsFrames   = static fn(string $id): array => $recFrames($recRead($id)[1]);
+$rsSidP     = bin2hex(random_bytes(16));
+$rsReqP     = $stream($rsConn['id'], $rsSidP);
+$rsFirst    = $rsLine('confirm ok');
+$rsMicOpen  = $rsWait(static fn() => in_array(MuDesk\Rdp\Client::F_MIC, array_column($rsFrames($rsSidP), 0), true));
+MuDesk\Sessions::send($rsSidP, pack('V', 0) . "\x0f" . str_repeat(pack('v', 4000), 800));
+$rsHeard    = $rsLine('mic 882');
+$rsMic      = $rsWait(static fn() => in_array(MuDesk\Recording::MIC, array_column($rsFrames($rsSidP), 0), true));
+$rsMicBytes = array_map(static fn(array $f): string => $f[1], array_values(array_filter($rsFrames($rsSidP), static fn(array $f): bool => $f[0] === MuDesk\Recording::MIC)));
+MuDesk\Sessions::kill($rsSidP);
+$wres($rsReqP);
+$rsPInfo    = MuDesk\Recording::info($rsSidP);
+check('recording of a connection always recorded: its frames, with what the remote computer heard of the microphone (the test server opening it as Windows does)', [
+    end($rsFirst), $rsMicOpen, end($rsHeard), $rsMic, $rsMicBytes === [str_repeat(pack('v', 4000), 441)], $rsPInfo['sound'] ?? null, $rsPInfo['started_as'] ?? null, $rsPInfo['kind'] ?? null],
+    ['confirm ok', true, 'mic 882', true, true, true, 'policy', null]);
+@unlink("$tmp/data/recordings/$rsSidP.rec");
+@unlink("$tmp/data/recordings/$rsSidP.json");
+
+// ... one started in a session (the connection no longer always recorded): made at once in the user's page, the page told
+// its number (record_video), no new connection; the pieces of its video the page sends on its out-of-order lane kept in
+// order (one sent twice, or of another recording, left out), nothing of the stream's frames; what the page records said
+// in its details; stopped, the page told, the recording closed once the page sent the rest; one the page cannot make
+// stopped, said why; audited with the recording's own id
+$rsConn = MuDesk\Connections::save($wu['id'], ['id' => $rsConn['id'], 'host' => '127.0.0.1', 'port' => $rsPort, 'security' => 'auto', 'user' => 'ana',
+    'clipboard' => false, 'drive' => false, 'printer' => false, 'audio' => false, 'mic' => true, 'record' => false], null, true, true);
+$rsSid2  = bin2hex(random_bytes(16));
+$rsReq   = $stream($rsConn['id'], $rsSid2);
+$rsSecond = $rsLine('confirm ok');
+$rsPiece = static fn(int $gen, int $n, int $flags, string $bytes, ?array $head = null): string => pack('V', MuDesk\Sessions::OUT_OF_BAND) . "\x16"
+    . pack('vVC', $gen, $n, $flags) . ($head !== null ? pack('v', strlen((string)json_encode($head))) . json_encode($head) : '') . $bytes;
+$rsNewRec = static function (string $before) use ($rsWait): string {      // the id of the recording that started after $before
+    $id = '';
+    $rsWait(static function () use ($before, &$id): bool {
+        $id = (string)(MuDesk\Audit::search(['event' => 'recording_start', 'user' => 'webuser'])['rows'][0]['rec'] ?? '');
+        return $id !== '' && $id !== $before;
+    });
+    return $id;
+};
+$rsLastRec = (string)(MuDesk\Audit::search(['event' => 'recording_start', 'user' => 'webuser'])['rows'][0]['rec'] ?? '');
+$rsStarted = MuDesk\Sessions::record($rsSid2, true, 'webadmin', true);
+$rsRecOn   = $rsWait(static fn() => (MuDesk\Sessions::info($rsSid2)['record_by'] ?? null) === 'admin');
+$rsRec     = $rsNewRec($rsLastRec);
+$rsVideo   = static fn(): array => array_map(static fn(array $f): string => $f[0] . ':' . $f[1], $rsFrames($rsRec));
+MuDesk\Sessions::send($rsSid2, $rsPiece(1, 0, 1, 'AAAA', ['mime' => 'video/webm;codecs=vp9,opus', 'w' => 800, 'h' => 600, 'sound' => true]));
+MuDesk\Sessions::send($rsSid2, $rsPiece(1, 1, 0, 'BBBB'));
+MuDesk\Sessions::send($rsSid2, $rsPiece(1, 1, 0, 'XXXX'));                // (sent twice)
+MuDesk\Sessions::send($rsSid2, $rsPiece(9, 2, 0, 'ZZZZ'));                // (of another recording)
+$rsKept    = $rsWait(static fn() => $rsVideo() === ['33:AAAA', '33:BBBB']);
+$rsStopped = MuDesk\Sessions::record($rsSid2, false, 'webadmin', true);
+$rsRecOff  = $rsWait(static fn() => array_key_exists('record', MuDesk\Sessions::info($rsSid2) ?? []) && empty(MuDesk\Sessions::info($rsSid2)['record']));
+$rsOpen    = !isset(MuDesk\Recording::info($rsRec)['ended']);            // (until the page sent the rest)
+MuDesk\Sessions::send($rsSid2, $rsPiece(1, 2, 2, 'CCCC'));
+$rsClosed  = $rsWait(static fn() => isset(MuDesk\Recording::info($rsRec)['ended']));
+$rsInfo    = MuDesk\Recording::info($rsRec);
+[$rsWhole] = $recRead($rsRec);
+$rsAll     = $rsVideo();
+$rsStart   = MuDesk\Audit::search(['event' => 'recording_start', 'user' => 'webuser'])['rows'][0] ?? [];
+$rsStop    = MuDesk\Audit::search(['event' => 'recording_stop', 'user' => 'webuser'])['rows'][0] ?? [];
+// ... started by its user, in a page that cannot record: stopped, the page told why
+MuDesk\Sessions::record($rsSid2, true, 'webuser', false);
+$rsOwnOn   = $rsWait(static fn() => (MuDesk\Sessions::info($rsSid2)['record_by'] ?? null) === 'owner');
+$rsRec2    = $rsNewRec($rsRec);
+MuDesk\Sessions::send($rsSid2, $rsPiece(2, 0, 1 | 4, '', ['mime' => '', 'w' => 0, 'h' => 0, 'sound' => false]));
+$rsFailed  = $rsWait(static fn() => isset(MuDesk\Recording::info($rsRec2)['ended']));
+$rsInfo2   = MuDesk\Recording::info($rsRec2);
+$rsStop2   = MuDesk\Audit::search(['event' => 'recording_stop', 'user' => 'webuser'])['rows'][0] ?? [];
+// ... stopped, and the page answers that it cannot finish it (4): closed at once, failed (before, it stayed open)
+MuDesk\Sessions::record($rsSid2, true, 'webadmin', true);
+$rsWait(static fn() => (MuDesk\Sessions::info($rsSid2)['record_by'] ?? null) === 'admin');
+$rsRec3    = $rsNewRec($rsRec2);
+MuDesk\Sessions::send($rsSid2, $rsPiece(3, 0, 1, 'Q0', ['mime' => 'video/webm', 'w' => 800, 'h' => 600, 'sound' => false]));
+$rsWait(static fn() => $rsFrames($rsRec3) !== []);
+MuDesk\Sessions::record($rsSid2, false, 'webadmin', true);
+$rsWait(static fn() => empty(MuDesk\Sessions::info($rsSid2)['record']));
+MuDesk\Sessions::send($rsSid2, $rsPiece(3, 1, 4, ''));
+$rsClosed3 = $rsWait(static fn() => isset(MuDesk\Recording::info($rsRec3)['ended']));
+$rsInfo3   = MuDesk\Recording::info($rsRec3);
+// ... a piece missing (lost on the way): what came after it cannot be read, so it ends there, whole up to it, said why
+MuDesk\Sessions::record($rsSid2, true, 'webadmin', true);
+$rsWait(static fn() => (MuDesk\Sessions::info($rsSid2)['record_by'] ?? null) === 'admin');
+$rsRec4    = $rsNewRec($rsRec3);
+MuDesk\Sessions::send($rsSid2, $rsPiece(4, 0, 1, 'P0', ['mime' => 'video/webm', 'w' => 800, 'h' => 600, 'sound' => false]));
+MuDesk\Sessions::send($rsSid2, $rsPiece(4, 2, 0, 'P2'));
+$rsGap     = $rsWait(static fn() => isset(MuDesk\Recording::info($rsRec4)['ended']));
+$rsInfo4   = MuDesk\Recording::info($rsRec4);
+$rsVideo4  = array_map(static fn(array $f): string => $f[1], $rsFrames($rsRec4));
+// ... a page sending more than a video makes (24 MB in its first seconds: filling the disk): stopped, said why
+MuDesk\Sessions::record($rsSid2, true, 'webadmin', true);
+$rsWait(static fn() => (MuDesk\Sessions::info($rsSid2)['record_by'] ?? null) === 'admin');
+$rsRec5    = $rsNewRec($rsRec4);
+$rsBig = str_repeat('F', (4 << 20) - 200);
+for ($i = 0; $i < 6; $i++) {                                              // (24 MB at once: past 1 MB a second and 10 s more)
+    MuDesk\Sessions::send($rsSid2, $rsPiece(5, $i, $i === 0 ? 1 : 0, $rsBig, $i === 0 ? ['mime' => 'video/webm', 'w' => 8, 'h' => 8, 'sound' => false] : null));
+}
+unset($rsBig);
+$rsFast    = $rsWait(static fn() => isset(MuDesk\Recording::info($rsRec5)['ended']));
+$rsInfo5   = MuDesk\Recording::info($rsRec5);
+@unlink("$tmp/data/recordings/$rsRec5.rec");
+@unlink("$tmp/data/recordings/$rsRec5.json");
+MuDesk\Sessions::kill($rsSid2);
+[, $rsBody] = $wres($rsReq);
+stream_set_blocking($rsPipes[1], false);
+$rsLater = (string)stream_get_contents($rsPipes[1]);                      // (what the server said since: no new connection)
+proc_terminate($rsSrv);
+proc_close($rsSrv);
+$rsStatus = [];
+for ($o = 0; $o + 5 <= strlen($rsBody); $o += 5 + $len) {
+    ['t' => $type, 'n' => $len] = unpack('Ct/Vn', $rsBody, $o);
+    $j = $type === MuDesk\Rdp\Client::F_STATUS ? (array)json_decode(substr($rsBody, $o + 5, $len), true) : [];
+    array_key_exists('recording', $j) && $rsStatus[] = [$j['recording'], $j['record_by'] ?? null, $j['record_video'] ?? null, $j['record_error'] ?? null];
+}
+check('recording in a session, made in the page: started at once (no new connection), the page told its number; its pieces kept in order (one sent twice, or of another recording, left out), nothing of the stream; stopped, closed once the page sent the rest (or said it cannot); one the page cannot make, with a piece missing, or growing faster than a video can, stopped, said why, whole up to there; audited with its id', [
+    end($rsSecond), $rsStarted, $rsRecOn, $rsKept, $rsStopped, $rsRecOff, $rsOpen, $rsClosed, $rsWhole, $rsAll, $rsStatus,
+    [$rsInfo['kind'] ?? null, $rsInfo['mime'] ?? null, $rsInfo['width'] ?? null, $rsInfo['height'] ?? null, $rsInfo['sound'] ?? null, $rsInfo['sid'] ?? null,
+     $rsInfo['started_as'] ?? null, $rsInfo['stopped_by'] ?? null, isset($rsInfo['failed'])],
+    [$rsStart['rec'] ?? null, $rsStart['by'] ?? null, $rsStart['as'] ?? null, $rsStop['rec'] ?? null, $rsStop['by'] ?? null, $rsRec !== $rsSid2, strlen($rsRec)],
+    [$rsOwnOn, $rsFailed, $rsInfo2['failed'] ?? null, $rsInfo2['started_as'] ?? null, $rsStop2['rec'] ?? null, $rsStop2['reason'] ?? null],
+    [$rsClosed3, $rsInfo3['failed'] ?? null, $rsInfo3['stopped_by'] ?? null, $rsGap, $rsInfo4['failed'] ?? null, $rsVideo4, $rsFast, $rsInfo5['failed'] ?? null],
+    str_contains($rsLater, 'confirm ok') || str_contains($rsLater, 'x224')],
+    ['confirm ok', true, true, true, true, true, true, true, true, ['33:AAAA', '33:BBBB', '33:CCCC'],
+     [[true, 'admin', 1, null], [false, null, null, null], [true, 'owner', 2, null], [false, null, null, 'record_page'], [true, 'admin', 3, null],
+      [false, null, null, null], [true, 'admin', 4, null], [false, null, null, 'record_page'], [true, 'admin', 5, null], [false, null, null, 'record_page']],
+     ['video', 'video/webm', 800, 600, true, $rsSid2, 'admin', 'webadmin', false],
+     [$rsRec, 'webadmin', 'admin', $rsRec, 'webadmin', true, 32],
+     [true, true, true, 'owner', $rsRec2, 'record_page'], [true, true, 'webadmin', true, true, ['P0'], true, true], false]);
+MuDesk\Connections::delete($wu['id'], $rsConn['id']);
 
 proc_terminate($web);
 proc_close($web);
@@ -5883,8 +7160,9 @@ $papp = "$tmp/papp";
 foreach (['bad' => "$papp/bad/blocker/data", 'ok' => "$papp/ok/data"] as $copy => $data) {
     mkdir("$papp/$copy/public", 0700, true);
     mkdir("$papp/$copy/src");
-    foreach (glob(__DIR__ . '/../src/*.php') as $f) {
-        copy($f, "$papp/$copy/src/" . basename($f));
+    mkdir("$papp/$copy/src/Rdp");
+    foreach (array_merge(glob(__DIR__ . '/../src/*.php'), glob(__DIR__ . '/../src/Rdp/*.php')) as $f) {   // (the housekeeping uses Rdp\Trace)
+        copy($f, "$papp/$copy/src/" . (str_contains(str_replace('\\', '/', $f), '/Rdp/') ? 'Rdp/' : '') . basename($f));
     }
     copy(__DIR__ . '/../public/index.php', "$papp/$copy/public/index.php");
     copy(__DIR__ . '/../public/api.php', "$papp/$copy/public/api.php");
@@ -5940,6 +7218,8 @@ $fp = static fn(string $h): string => preg_match('~data-build="([0-9a-f]{10})"~'
 check('page: scripts and styles addressed with the fingerprint of their files, the same in the state; it changes with them only', [
     $fp($h1) !== '', str_contains($h1, 'src="assets/app.js?v=' . MuDesk\VERSION . '-' . $fp($h1) . '"'), str_contains($h1, 'href="assets/app.css?v=' . MuDesk\VERSION . '-' . $fp($h1) . '"'),
     (json_decode($j1, true)['build'] ?? null) === $fp($h1), $fp($h2) !== $fp($h1), $fp($h3) === $fp($h2)], [true, true, true, true, true, true]);
+check('housekeeping: started by the interface\'s requests (its hourly mark made by the first one)', is_file("$papp/ok/data/run/maintenance"), true);
+check('state: which version runs not told before signing in', array_key_exists('version', (array)json_decode($j1, true)) && json_decode($j1, true)['version'] === null, true);
 // out of memory last: on PHP 8.1 at GitHub the built-in server stopped there, and the checks after it failed with it
 [$s5, $b5] = $page('GET', 'ok/public/oom.php', 'text/html', 'en');
 proc_terminate($pweb);
@@ -5957,7 +7237,7 @@ check('error page: an exception or a fatal error (out of memory) gives our page,
     $s6, $b6, str_contains($log, 'secret detail'), str_contains($log, 'Allowed memory size')],
     [500, true, false, 500, true, false, 500, '{"error":"internal"}', true, true]);
 $texts = [];
-foreach (['data_dir', 'tmp_dir', 'php', 'https', 'client_ip', 'internal', 'other'] as $k) {
+foreach (['data_dir', 'tmp_dir', 'php', 'https', 'client_ip', 'config_proxies', 'internal', 'other'] as $k) {
     foreach (['es', 'en'] as $l) {
         $h         = MuDesk\ErrorPage::html(403, $k, $l);
         $texts[]   = preg_match('#^<!doctype html><html lang="' . $l . '">.*<h1>[^<]+</h1><p>[^<]+</p><p class="muted">[^<]+</p>#', $h) === 1;
@@ -5965,7 +7245,7 @@ foreach (['data_dir', 'tmp_dir', 'php', 'https', 'client_ip', 'internal', 'other
     }
 }
 check('error page: every error in both languages; "try again" only where reloading can help', [array_unique($texts), $retries],
-    [[true], [true, true, false, false, true, true, false, false, false, false, true, true, true, true]]);
+    [[true], [true, true, false, false, true, true, false, false, false, false, false, false, true, true, true, true]]);
 
 // PHP cannot write to its temporary folder (upload_tmp_dir and sys_temp_dir point nowhere): it drops a request body over
 // 16 KB, with a warning, before the script starts. The answer says so (and the log), instead of going on with an empty
@@ -6040,6 +7320,123 @@ check('transport: a reset connection ends send()', [$spinning, stream_get_conten
 fclose($pipes[1]);
 proc_close($proc);
 fclose($srv);
+
+// the hosting diagnostics (tools/check.php copied to public/): closed while its token is the one it comes with, nothing of
+// it shown; with the token changed, its checks answer that token only; a day after it was put there it does nothing (a
+// copy forgotten on the server)
+$cdir = "$tmp/check";
+mkdir($cdir);
+$csrc = (string)file_get_contents(__DIR__ . '/../tools/check.php');
+file_put_contents("$cdir/as-is.php", $csrc);
+file_put_contents("$cdir/mine.php", str_replace("const TOKEN = 'CAMBIAR';", "const TOKEN = 'clave-de-prueba';", $csrc));
+file_put_contents("$cdir/old.php", str_replace(["const TOKEN = 'CAMBIAR';", 'const CADUCA = 86400;'], ["const TOKEN = 'clave-de-prueba';", 'const CADUCA = -1;'], $csrc));
+$cprobe = stream_socket_server('tcp://127.0.0.1:0');
+$cport  = (int)substr((string)strrchr((string)stream_socket_get_name($cprobe, false), ':'), 1);
+fclose($cprobe);
+$cweb = proc_open([PHP_BINARY, '-S', "127.0.0.1:$cport", '-t', $cdir], [1 => ['file', $nul, 'w'], 2 => ['file', $nul, 'w']], $cpipes);
+for ($i = 0; $i < 100 && !($cs = @fsockopen('127.0.0.1', $cport)); $i++) {
+    usleep(50000);
+}
+fclose($cs);
+$cget = static function (string $path, string $token = '') use ($cport): array {
+    $s = fsockopen('127.0.0.1', $cport, $en, $es, 5);
+    fwrite($s, "GET /$path HTTP/1.0\r\nHost: 127.0.0.1\r\n" . ($token !== '' ? "X-Token: $token\r\n" : '') . "\r\n");
+    $r = (string)stream_get_contents($s);
+    fclose($s);
+    return [(int)substr($r, 9, 3), substr($r, (int)strpos($r, "\r\n\r\n") + 4)];
+};
+[$c1, $b1c] = $cget('as-is.php');
+$checks = [$c1, str_contains($b1c, 'Cambia TOKEN'), str_contains($b1c, '<fieldset'), $cget('as-is.php?a=env', 'CAMBIAR')[0],
+    $cget('mine.php?a=ping', 'clave-de-prueba'), $cget('mine.php?a=ping', 'otra')[0], $cget('old.php')[0], $cget('old.php?a=ping', 'clave-de-prueba')[0]];
+proc_terminate($cweb);
+proc_close($cweb);
+check('hosting diagnostics: closed with the token it comes with; its checks with the right token only; nothing a day after it was put there',
+    $checks, [403, true, false, 403, [200, 'ok'], 403, 410, 410]);
+
+// a session given up as stale (its process killed by the hosting): what its clipboard files and print jobs took of its user's
+// quota goes back with them, as its own end would have given it back (before, until the file manager counted it again)
+$qs0   = MuDesk\Settings::get('files_quota_mb');
+MuDesk\Settings::save(['files_quota_mb' => 1]);
+$qsSid = bin2hex(random_bytes(16));
+$qsUid = 'quotastale';
+$qsReg = MuDesk\Sessions::register($qsSid, ['uid' => $qsUid, 'user' => 'q', 'conn' => 'c', 'host' => 'h', 'token' => hash('sha256', 'x')]);
+@mkdir("$tmp/data/tmp/$qsSid", 0700, true);
+file_put_contents("$tmp/data/tmp/$qsSid/0", str_repeat('a', 1000));
+file_put_contents("$tmp/data/tmp/$qsSid/print-1", str_repeat('b', 500));
+MuDesk\Files::charge($qsUid, 1500);
+$qsBefore = MuDesk\Files::quotaLeft($qsUid);
+touch("$tmp/data/run/$qsSid.json", time() - 120);
+MuDesk\Sessions::active();
+check('sessions: one given up as stale gives its clipboard files\' and print jobs\' quota back', [MuDesk\Files::quotaLeft($qsUid) - $qsBefore, is_dir("$tmp/data/tmp/$qsSid")], [1500, false]);
+$qsReg->close();
+MuDesk\Settings::save(['files_quota_mb' => $qs0]);
+MuDesk\Files::removeAll($qsUid);
+
+// housekeeping (no scheduled task on a shared hosting): what a killed process leaves, and web sessions past their life
+// where the hosting turned PHP's cleanup off, removed once an hour; never a user's file, a recent write or a running session
+$ago    = time() - 2 * MuDesk\Maintenance::OLD;
+$mk     = static function (string $f, bool $old) use ($ago): string {
+    @mkdir(dirname($f), 0700, true);
+    file_put_contents($f, 'x');
+    $old && touch($f, $ago);
+    return $f;
+};
+$deadS  = str_repeat('d', 32);
+$liveS  = str_repeat('e', 32);
+$keepU  = MuDesk\Users::create('limpieza', 'Limpieza-' . bin2hex(random_bytes(6)), 'user', false)['id'];
+$left   = [
+    $mk(MuDesk\Config::dir('users.json.0a1b2c3d.tmp'), true), $mk(MuDesk\Config::dir('connections/x.json.0a1b2c3d.tmp'), true),
+    $mk(MuDesk\Config::dir('run/' . $liveS . '.json.0a1b2c3d.tmp'), true), $mk(MuDesk\Config::dir('tmp/cnf9F2A.tmp'), true),
+    $mk(MuDesk\Config::dir("run/$deadS.mode"), true), $mk(MuDesk\Config::dir("run/$deadS.q"), true), $mk(MuDesk\Config::dir("tmp/$deadS/clip.bin"), true),
+    $mk(MuDesk\Config::dir('sessions/sess_viejo'), true), $mk(MuDesk\Config::dir('tmp/upload-noexiste.lock'), true),
+    $mk(MuDesk\Config::dir('connections/noexiste.json.lock'), true), $mk(MuDesk\Sessions::tmpSock($deadS), true),
+    $mk(sys_get_temp_dir() . "/mudesk-$deadS.sock", true),                       // named as before: nobody listens on it
+    $mk(MuDesk\Config::dir('tmp/restore-0123456789abcdef.mudeskbackup'), true),  // a backup sent and never restored
+    $mk(MuDesk\Config::dir('tmp/restore-done-0123456789ab/users.json'), true),     // what a restore that worked could not remove
+];
+touch(MuDesk\Config::dir('tmp/restore-done-0123456789ab'), $ago);
+touch(MuDesk\Config::dir("tmp/$deadS"), $ago);
+$kept   = [
+    $mk(MuDesk\Config::dir('settings.json.4e5f6a7b.tmp'), false),                       // being written now
+    $mk(MuDesk\Config::dir("files/$keepU/informe.0a1b2c3d.tmp"), true),                  // a user's own file
+    $mk(MuDesk\Config::dir("run/$liveS.json"), false), $mk(MuDesk\Config::dir("run/$liveS.mode"), true),   // running
+    $mk(MuDesk\Config::dir('sessions/sess_reciente'), false), $mk(MuDesk\Config::dir("tmp/upload-$keepU.lock"), true),
+    // another installation's on this server (a long data folder too): its own business, never taken for this one's
+    $mk(sys_get_temp_dir() . '/mudesk-0123456789ab-' . $deadS . '.sock', true),
+    // the data a restore set aside and could not put back, or one cut off half way: never removed by itself
+    $mk(MuDesk\Config::dir('tmp/restore-old-0123456789ab/users.json'), true),
+];
+touch(MuDesk\Config::dir('tmp/restore-old-0123456789ab'), $ago);
+// ... and one named as before on which a session still listens (another installation's, not upgraded yet): kept (only
+// where PHP has Unix sockets: Linux, macOS)
+$legacyAt   = sys_get_temp_dir() . '/mudesk-' . str_repeat('f', 32) . '.sock';
+$legacyLive = in_array('unix', stream_get_transports(), true) ? @stream_socket_server('unix://' . $legacyAt, $en, $es) : false;
+$legacyLive !== false && touch($legacyAt, $ago);
+$legacyLive === false && print("NOTE no Unix sockets in this PHP: a live socket named as before not checked here\n");
+@unlink(MuDesk\Config::dir('run/maintenance'));
+MuDesk\Maintenance::maybe();                     // due: runs
+$legacyKept = $legacyLive === false || file_exists($legacyAt);
+if ($legacyLive !== false) {
+    fclose($legacyLive);
+    @unlink($legacyAt);
+}
+$swept  = array_map('file_exists', $left);
+$stayed = array_map('file_exists', $kept);
+$mk(MuDesk\Config::dir('hosts/x.json.0a1b2c3d.tmp'), true);
+MuDesk\Maintenance::maybe();                     // an hour not gone by: nothing
+$notYet = is_file(MuDesk\Config::dir('hosts/x.json.0a1b2c3d.tmp'));
+// (the temporary folder's names of this installation start with its own: another installation's differ)
+$tmpOwn = [str_starts_with(basename(MuDesk\Sessions::tmpSock($deadS)), MuDesk\Sessions::tmpPrefix()), MuDesk\Sessions::tmpPrefix() !== 'mudesk-0123456789ab-',
+    (bool)preg_match('/^mudesk-[0-9a-f]{12}-$/', MuDesk\Sessions::tmpPrefix())];
+@unlink(sys_get_temp_dir() . '/mudesk-0123456789ab-' . $deadS . '.sock');
+check('housekeeping: unfinished writes, dead sessions (their files, folder and socket), expired web sessions and deleted users\' locks removed; a recent write, a user\'s file, a running session, another installation\'s socket kept; once an hour',
+    [array_keys(array_filter($swept)), array_values($stayed), is_dir(MuDesk\Config::dir("tmp/$deadS")), $notYet, $tmpOwn, $legacyKept],
+    [[], array_fill(0, count($kept), true), false, true, [true, true, true], true]);
+@unlink(MuDesk\Config::dir('hosts/x.json.0a1b2c3d.tmp'));
+MuDesk\Files::remove(MuDesk\Config::dir('tmp/restore-old-0123456789ab'));
+@unlink(MuDesk\Config::dir("run/$liveS.json"));
+@unlink(MuDesk\Config::dir("run/$liveS.mode"));
+MuDesk\Users::delete($keepU);
 unlink($cnf);
 MuDesk\Files::remove($tmp);
 

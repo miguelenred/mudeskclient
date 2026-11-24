@@ -5,7 +5,9 @@
 # start it with `docker compose up -d --build`. See "Option D: Docker" in docs/INSTALL.md.
 services:
   mudesk:
-    image: ghcr.io/miguelenred/mudeskclient:latest
+    # the image of this version: it does not change by itself ("latest" would bring each new version without asking); to
+    # update, put the new version's number here, then `docker compose pull` and `docker compose up -d`
+    image: ghcr.io/miguelenred/mudeskclient:1.2.0
     # build: .
     container_name: mudesk
     restart: unless-stopped

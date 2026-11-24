@@ -93,6 +93,7 @@ final class Gateway
     private bool $closed = false;               // the tunnel ended (closed by the gateway, its channel closed)
     private bool $eof = false;                  // the gateway's connection is gone
     private bool $closeSent = false;            // a WebSocket close frame sent
+    private bool $ending = false;               // closing: the gateway's answer waited for (no channel made again meanwhile)
     private bool $shut = false;                 // the client told the end (what came before it given first)
     private float $waited = 0.0;
 
@@ -112,8 +113,9 @@ final class Gateway
         [$this->sock, $cert] = self::connect($gwHost, $ip, $port);
         $this->certFingerprint = (string)openssl_x509_fingerprint($cert, 'sha256');
         if ($verifyCert !== null) {
-            $verifyCert($this->certFingerprint);
+            $verifyCert($this->certFingerprint, (string)openssl_x509_fingerprint($cert, 'sha1'));
         }
+        Transport::tlsWorked(self::tlsKey($gwHost, $port), Transport::tlsProtocol($this->sock));   // (once its certificate is the one pinned)
         // the Host header: an IPv6 address in brackets, and the port when it is not HTTPS's own
         $hostHeader   = (str_contains($gwHost, ':') ? "[$gwHost]" : $gwHost) . ($port !== 443 ? ":$port" : '');
         $this->connId = vsprintf('{%s-%s-%s-%s-%s}', self::guidParts());
@@ -154,27 +156,49 @@ final class Gateway
         $this->pair();
     }
 
-    /** A TLS connection to the gateway (SNI with its name): [socket, its certificate]. */
+    /**
+     * A TLS connection to the gateway (SNI with its name): [socket, its certificate]. TLS 1.2 or
+     * later first; TLS 1.0 and triple DES on a new connection only to a gateway never seen with it (see Transport::tlsSeen()).
+     */
     private static function connect(string $gwHost, string $ip, int $port): array
     {
         $byName = @inet_pton($gwHost) === false;
-        // (its certificate pinned, as a computer's: OpenSSL's security level 0, as Transport's, for a Windows Server 2008 R2 or
-        // 2012 gateway with a SHA-1 or 1024-bit certificate, or only TLS 1.0, which a level 2 system refused)
-        $ctx  = stream_context_create(['socket' => ['tcp_nodelay' => true], 'ssl' => ['verify_peer' => false, 'verify_peer_name' => false,
-            'allow_self_signed' => true, 'capture_peer_cert' => true, 'SNI_enabled' => $byName, 'security_level' => 0, 'ciphers' => 'DEFAULT:DES-CBC3-SHA',
-            'crypto_method' => STREAM_CRYPTO_METHOD_TLSv1_0_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_1_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT
-                | (defined('STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT') ? STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT : 0)] + ($byName ? ['peer_name' => $gwHost] : [])]);
-        $addr = str_contains($ip, ':') ? "[$ip]" : $ip;
-        $s    = @stream_socket_client("tls://$addr:$port", $errno, $err, self::WAIT, STREAM_CLIENT_CONNECT, $ctx);
-        if ($s === false) {
-            throw new ProtocolException("Gateway: $err ($errno)", 'gateway_unreachable');
+        $key    = self::tlsKey($gwHost, $port);
+        $seen   = Transport::tlsSeen($key);
+        for ($legacy = $seen === 'legacy'; ; $legacy = true) {
+            // (its certificate pinned, as a computer's: OpenSSL's security level 0, as Transport's, for a Windows Server 2008 R2
+            // or 2012 gateway with a SHA-1 or 1024-bit certificate, or only TLS 1.0, which a level 2 system refused)
+            $ctx  = stream_context_create(['socket' => ['tcp_nodelay' => true], 'ssl' => ['verify_peer' => false, 'verify_peer_name' => false,
+                'allow_self_signed' => true, 'capture_peer_cert' => true, 'SNI_enabled' => $byName, 'security_level' => 0,
+                'ciphers' => Transport::tlsCiphers($legacy)] + ($byName ? ['peer_name' => $gwHost] : [])]);
+            $addr = str_contains($ip, ':') ? "[$ip]" : $ip;
+            // the TCP connection, then the handshake (both within the wait: PHP applies a client's connection timeout to it)
+            $s    = @stream_socket_client("tcp://$addr:$port", $errno, $err, self::WAIT, STREAM_CLIENT_CONNECT, $ctx);
+            if ($s === false) {
+                throw new ProtocolException("Gateway: $err ($errno)", 'gateway_unreachable');
+            }
+            stream_set_blocking($s, true);
+            if (!@stream_socket_enable_crypto($s, true, Transport::tlsMethods($legacy))) {
+                $why = error_get_last()['message'] ?? '';
+                fclose($s);
+                if (!$legacy && $seen === null) {
+                    continue;
+                }
+                throw new ProtocolException('Gateway: TLS handshake failed: ' . $why, 'gateway_unreachable');
+            }
+            stream_set_blocking($s, false);           // (every wait is a select with a limit: a stalled gateway holds nothing)
+            $cert = stream_context_get_params($s)['options']['ssl']['peer_certificate'] ?? null;
+            if (!$cert instanceof \OpenSSLCertificate) {
+                throw new ProtocolException('Gateway: no certificate', 'gateway');
+            }
+            return [$s, $cert];
         }
-        stream_set_blocking($s, false);           // (every wait is a select with a limit: a stalled gateway holds nothing)
-        $cert = stream_context_get_params($s)['options']['ssl']['peer_certificate'] ?? null;
-        if (!$cert instanceof \OpenSSLCertificate) {
-            throw new ProtocolException('Gateway: no certificate', 'gateway');
-        }
-        return [$s, $cert];
+    }
+
+    /** The gateway's key in Transport's memory of how TLS went. */
+    private static function tlsKey(string $gwHost, int $port): string
+    {
+        return 'gw:' . strtolower($gwHost) . ':' . $port;
     }
 
     /** The socket the RDP client reads and writes as if it were the remote computer's. */
@@ -194,7 +218,7 @@ final class Gateway
                 stream_context_create(['socket' => ['tcp_nodelay' => true]])) ?: null;
         }
         $ctx = stream_context_create(['socket' => ['tcp_nodelay' => true], 'ssl' => ['verify_peer' => false, 'verify_peer_name' => false,
-            'allow_self_signed' => true, 'capture_peer_cert' => true, 'security_level' => 0, 'SNI_enabled' => false, 'ciphers' => 'DEFAULT:DES-CBC3-SHA']]);   // (as Transport's)
+            'allow_self_signed' => true, 'capture_peer_cert' => true, 'security_level' => 0, 'SNI_enabled' => false]]);   // (as Transport's)
         $in = self::$listener !== null ? @stream_socket_client('tcp://' . stream_socket_get_name(self::$listener, false), $en, $es, 2, STREAM_CLIENT_CONNECT, $ctx) : false;
         $out = false;
         for ($i = 0; $in !== false && $i < 4; $i++) {
@@ -870,7 +894,8 @@ final class Gateway
 
     /**
      * The end: what the client still wrote (its Disconnect Provider Ultimatum) goes into the tunnel first, then the channel
-     * closed and the WebSocket's close frame (each only if the gateway did not end them already), within a second.
+     * closed and the WebSocket's close frame (each only if the gateway did not end them already), and the gateway's answer
+     * waited for, all within a second.
      */
     public function close(): void
     {
@@ -884,15 +909,34 @@ final class Gateway
                         $this->out .= $this->wrap(self::packet(self::DATA, pack('v', strlen($c)) . $c));
                     }
                 }
-                if (!$this->closed) {
-                    $this->out .= $this->wrap(self::packet(self::CLOSE_CHANNEL, pack('V', 0)));
-                }
+                $asked = !$this->closed && ($bye = $this->wrap(self::packet(self::CLOSE_CHANNEL, pack('V', 0)))) !== '';
+                $asked && $this->out .= $bye;
                 if (!$this->legacy && !$this->rpc && !$this->closeSent) {
                     $this->out      .= self::frame(pack('n', 1000), 0x8);
                     $this->closeSent = true;
                 }
                 for ($end = microtime(true) + 1.0; $this->out !== '' && microtime(true) < $end && $this->flush();) {
                     $this->out !== '' && $this->wait(0.05);
+                }
+                // its answer waited for (the channel's close answered, its pipe's end, its close frame, or its connection's
+                // end), in that second, what comes meanwhile read and left: closed at once, a gateway could take the end of one
+                // connection before the close the other one carries (the RPC transport's two channels, the older transport's
+                // two connections), or a connection closed with something unread (reset) before what came last on it; the
+                // channel's close then lost (before, it was, at times). No channel made again meanwhile.
+                for ($this->ending = true; $asked && !$this->closed && !$this->eof && microtime(true) < $end;) {
+                    $this->wait(min(0.05, max(0.0, $end - microtime(true))));
+                    $d = @fread($this->sock, 65536);
+                    if ($d !== false && $d !== '') {
+                        $this->in .= $d;
+                    } elseif (feof($this->sock)) {
+                        $this->eof = true;
+                    }
+                    $this->incoming();
+                    foreach ($this->queue as [$t]) {
+                        $t === self::CLOSE_CHANNEL_RESPONSE && $this->closed = true;
+                    }
+                    $this->queue = [];
+                    $this->flush();                      // (what it brought answered: the RPC transport's acknowledgements)
                 }
             }
         } catch (\Throwable) {                         // (an end: nothing of it may fail the session's own)

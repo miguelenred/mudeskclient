@@ -49,6 +49,10 @@ wait.until(lambda x: x.find_elements(By.CSS_SELECTOR, '.overlay form'))
 d.execute_script(ERRORS)
 log('connect dialog options:', d.execute_script("return [...document.querySelectorAll('.overlay form input[type=checkbox]')].map(i => i.name + '=' + i.checked).join(' ')"))
 d.find_element(By.CSS_SELECTOR, '.overlay form button.primary').click()
+# a computer never seen: its certificate's fingerprints shown first, trusted here (the test's own computer)
+wait.until(lambda x: x.execute_script("const o = document.querySelector('.overlay'); return o.classList.contains('hidden') || !!o.querySelector('.cert-prints')"))
+if d.execute_script("return !!document.querySelector('.overlay:not(.hidden) .cert-prints')"):
+    d.find_element(By.CSS_SELECTOR, '.overlay button.primary').click()
 wait.until(lambda x: x.execute_script("return document.querySelector('.overlay').classList.contains('hidden')"))
 time.sleep(3)
 results['connected'] = True

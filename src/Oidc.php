@@ -52,6 +52,9 @@ final class Oidc
     /** Where the provider sends the browser back: oidc.php next to the page (to be registered with the provider). */
     public static function redirectUri(): string
     {
+        if (($pub = Config::publicUrl()) !== null) {        // fixed in config.php: never taken from the request
+            return $pub['origin'] . $pub['path'] . '/oidc.php';
+        }
         $dir = rtrim(str_replace('\\', '/', dirname((string)($_SERVER['SCRIPT_NAME'] ?? '/'))), '/');
         return (Http::isHttps() ? 'https' : 'http') . '://' . ($_SERVER['HTTP_HOST'] ?? 'localhost') . $dir . '/oidc.php';
     }

@@ -13,9 +13,13 @@ declare(strict_types=1);
 // encrypted with a salted MAC, without SEC_ENCRYPT). none: encryption method and level 0 (noblock: no security data at
 // all): nothing encrypted. plain, plainfast: the Demand Active, or the fast-path update, in the clear at a level that
 // encrypts what the server sends. nocert: TLS refused as SSL_CERT_NOT_ON_SERVER (no certificate), then as xp. licnocert: a License Request without the server's certificate (its blob empty).
+// twice: as xp, then up to two more whole connections (the session's connection made again: a guest came, a recording starts).
+// twicemic: as twice, the client's static channels given their ids and, on its dynamic channel, the microphone opened as
+// Windows does when a program records (MS-RDPEAI: 44.1 kHz mono, 441 frames a packet); then what the client sends is read
+// until it closes, and the microphone's audio counted.
 //   php legacy_server.php <mode> <method 1|2|8|16> <level 1|2|3> <cert proprietary|x509> <openssl.cnf>
 // Prints its port, then: "x224 <requested protocols|none>", "methods 0x..", "info <user> <password>", "license reply
-// <encrypted|plain>", "confirm ok", "input <hex>", or "error <what>".
+// <encrypted|plain>", "confirm ok", "input <hex>", "mic <bytes of a packet of audio>" or "error <what>".
 use MuDesk\Rdp\{Der, RdpSecurity, Reader};
 use MuDesk\Text;
 
@@ -23,6 +27,7 @@ require __DIR__ . '/../../src/bootstrap.php';
 
 [, $mode, $method, $level, $certType, $cnf] = $argv;
 [$method, $level] = [(int)$method, (int)$level];
+$twice = $mode === 'twice' || $mode === 'twicemic';
 ini_set('display_errors', 'stderr');
 $o   = ['config' => $cnf, 'private_key_bits' => 1024, 'digest_alg' => 'sha256'];
 $key = openssl_pkey_new($o);
@@ -80,8 +85,8 @@ $sdrq = static function (string $p): array {
 };
 $sdin = static fn(int $ch, string $d): string => $tpkt("\x02\xf0\x80\x68\x00\x01" . pack('n', $ch) . "\x70" . $perLen(strlen($d)) . $d);
 
-for ($conn = 0; $conn < 2 && ($c = @stream_socket_accept($srv, 30)); $conn++) {
-    stream_set_timeout($c, 10);
+for ($conn = 0; $conn < 3 && ($c = @stream_socket_accept($srv, 30)); $conn++) {   // (tlsfail: TLS 1.2, TLS 1.0, then without TLS)
+    stream_set_timeout($c, $twice ? 60 : 10);              // (twice: the test acts in the session meanwhile, on a busy computer too)
     try {
         // X.224 Connection Request: its RDP_NEG_REQ, if any
         $cr  = $pdu($c);
@@ -107,12 +112,26 @@ for ($conn = 0; $conn < 2 && ($c = @stream_socket_accept($srv, 30)); $conn++) {
         $serverRandom = random_bytes(32);
         $secData = ['none' => pack('vvVV', 0x0C02, 12, 0, 0), 'noblock' => ''][$mode]
             ?? pack('vvVVVV', 0x0C02, 20 + 32 + strlen($cert), $method, $level, 32, strlen($cert)) . $serverRandom . $cert;
-        $blocks  = pack('vvV', 0x0C01, 8, 0x00080004) . pack('vvvv', 0x0C03, 8, 1003, 0) . $secData;
+        // twicemic: the client's static channels (its Client Network Data: u32 count, then 8-byte names and u32 options) given
+        // ids from 1004 on, in its order; otherwise none
+        $names = [];
+        for ($q = 0; $mode === 'twicemic' && ($q = strpos($ci, "\x03\xc0", $q)) !== false; $q++) {
+            $nc = strlen($ci) >= $q + 8 ? unpack('V', $ci, $q + 4)[1] : -1;
+            if ($nc >= 0 && $nc <= 31 && unpack('v', $ci, $q + 2)[1] === 8 + 12 * $nc && strlen($ci) >= $q + 8 + 12 * $nc) {
+                for ($i = 0; $i < $nc; $i++) {
+                    $names[] = rtrim(substr($ci, $q + 8 + 12 * $i, 8), "\0");
+                }
+                break;
+            }
+        }
+        $ids     = array_map(static fn(int $i): int => 1004 + $i, array_keys($names));
+        $netIds  = pack('v*', ...$ids) . (count($ids) % 2 ? "\0\0" : '');
+        $blocks  = pack('vvV', 0x0C01, 8, 0x00080004) . pack('vvvv', 0x0C03, 8 + strlen($netIds), 1003, count($ids)) . $netIds . $secData;
         fwrite($c, $tpkt("\x02\xf0\x80\x7f\x66\x00McDn" . $perLen(strlen($blocks)) . $blocks));
         $pdu($c);                                            // Erect Domain
         $pdu($c);                                            // Attach User
         fwrite($c, $tpkt("\x02\xf0\x80\x2e\x00\x00\x06"));  // its confirm: user 1007
-        for ($i = 0; $i < 2; $i++) {                         // the user's and the I/O channel's joins
+        for ($i = 0; $i < 2 + count($ids); $i++) {           // the user's, the I/O channel's and the static channels' joins
             $j  = $pdu($c);
             $ch = unpack('n', $j, 10)[1];
             fwrite($c, $tpkt("\x02\xf0\x80\x3e\x00\x00\x06" . pack('nn', $ch, $ch)));
@@ -183,6 +202,41 @@ for ($conn = 0; $conn < 2 && ($c = @stream_socket_accept($srv, 30)); $conn++) {
             [$s, $enc] = $sec->fastSeal($upd);
             fwrite($c, "\x80" . chr(2 + strlen($s) + strlen($enc)) . $s . $enc);
         }
+        $dvcId = array_search('drdynvc', $names, true);
+        if ($dvcId !== false) {
+            // the microphone, as Windows opens it when a program records: the AUDIO_INPUT dynamic channel (id 7), the version,
+            // the formats (16-bit PCM, 44.1 kHz mono) and the open (441 frames a packet: 882 bytes)
+            $dvcId = $ids[$dvcId];
+            $wave  = pack('vvVVvvv', 1, 1, 44100, 88200, 2, 16, 0);
+            foreach (["\x10\x07AUDIO_INPUT\0", "\x30\x07" . pack('CV', 1, 1), "\x30\x07" . pack('CVV', 2, 1, 0) . $wave,
+                "\x30\x07" . pack('CVV', 3, 441, 0) . $wave] as $dvc) {
+                $chData = pack('VV', strlen($dvc), 3) . $dvc;    // (CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST)
+                fwrite($c, $sdin($dvcId, $level === 1 ? pack('vv', 0, 0) . $chData : $sec->seal(0, $chData)));
+            }
+            // what the client sends, decrypted in order until it closes: each packet of the microphone's audio (an Audin
+            // Data PDU, 0x06, in a dynamic channel Data PDU) counted
+            for (;;) {
+                try {
+                    $in = $pdu($c);
+                } catch (RuntimeException) {
+                    break;
+                }
+                if ($in[0] === "\x03") {
+                    [$ch, $d] = $sdrq($in);
+                    [, $d]    = $sec->open($d);
+                    if ($ch === $dvcId && strlen($d) > 11 && substr($d, 8, 3) === "\x30\x07\x06") {
+                        echo 'mic ', strlen($d) - 11, "\n";
+                    }
+                } elseif (ord($in[0]) & 0x80) {
+                    $sec->fastOpen(substr($in, ord($in[1]) & 0x80 ? 3 : 2), false);
+                }
+            }
+            @fclose($c);
+            if ($conn > 1) {
+                break;
+            }
+            continue;
+        }
         // the client's fast-path input, decrypted
         $in = $pdu($c);
         $hl = ord($in[1]) & 0x80 ? 3 : 2;
@@ -192,7 +246,7 @@ for ($conn = 0; $conn < 2 && ($c = @stream_socket_accept($srv, 30)); $conn++) {
         echo 'error ', $t->getMessage(), "\n";
     }
     @fclose($c);
-    if ($mode !== 'refuse' && $mode !== 'tlsfail' && $mode !== 'nocert') {
-        break;
+    if (!$twice || $conn > 1) {
+        break;                                          // (a connection refused or failed TLS above went on to the next one)
     }
 }

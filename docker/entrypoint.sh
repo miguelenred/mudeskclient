@@ -6,6 +6,7 @@
 set -e
 if [ ! -f /etc/mudesk/tls/cert.pem ] || [ ! -f /etc/mudesk/tls/key.pem ]; then
     # (the name also as subjectAltName: browsers check that one; the folder is a volume, so the certificate stays with updates)
+    trap 'rm -f /tmp/mudesk-openssl.cnf' EXIT          # (also when making it fails: set -e ends the script before the rm)
     printf '[req]\ndistinguished_name = dn\n[dn]\n[san]\nsubjectAltName = DNS:%s\n' "$(printf '%s' "${MUDESK_HOSTNAME:-localhost}" | tr -cd 'A-Za-z0-9.-')" > /tmp/mudesk-openssl.cnf
     php -r '$o = ["config" => "/tmp/mudesk-openssl.cnf", "private_key_bits" => 2048, "private_key_type" => OPENSSL_KEYTYPE_RSA, "digest_alg" => "sha256"];
         $k = openssl_pkey_new($o);
@@ -16,6 +17,7 @@ if [ ! -f /etc/mudesk/tls/cert.pem ] || [ ! -f /etc/mudesk/tls/key.pem ]; then
             fwrite(STDERR, "MuDeskClient: the certificate could not be made\n"); exit(1);
         }'
     rm -f /tmp/mudesk-openssl.cnf
+    trap - EXIT
     chmod 600 /etc/mudesk/tls/key.pem
     echo "MuDeskClient: self-signed certificate made for ${MUDESK_HOSTNAME:-localhost}"
 fi

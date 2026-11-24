@@ -3,12 +3,17 @@
 // XCLIP="prefix to run commands on the remote X display" node tests/e2e_clip.mjs <baseUrl> <admin> <pass> <connName> <outDir>
 import { createRequire } from 'node:module';
 import { execSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { rmSync, writeFileSync } from 'node:fs';
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT || 'playwright-core');
 const [base, admin, pass, name, out] = process.argv.slice(2);
 const X = process.env.XCLIP;
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
+// the files this test makes, here and on the remote computer: removed when it ends, also when a step fails
+process.on('exit', () => {
+  for (const f of ['/tmp/remote.bmp', '/tmp/f1.txt', '/tmp/f2.bin', '/tmp/got.bmp', '/tmp/remote-files.zip', '/tmp/rz']) rmSync(f, { recursive: true, force: true });
+  try { execSync(`${X} rm -f /tmp/ra.txt /tmp/rb.bin /tmp/got.bmp /tmp/remote.bmp`); } catch { /* the remote computer is gone */ }
+});
 
 const browser = await chromium.launch({ executablePath: '/usr/bin/google-chrome', args: ['--no-sandbox'] });
 const ctx = await browser.newContext({ viewport: { width: 1100, height: 750 }, acceptDownloads: true });
@@ -24,6 +29,9 @@ await page.waitForSelector('.conn');
 await page.goto(base + '/index.php' + await page.getAttribute(`.conn:has-text("${name}") a.btn.primary >> nth=0`, 'href'));
 await page.waitForSelector('.overlay form');
 await page.click('.overlay form button.primary');
+// a computer never seen: its certificate's fingerprints shown first, trusted here (the test's own computer)
+await page.waitForSelector('.overlay.hidden, .overlay .cert-prints', { state: 'attached', timeout: 30000 }).catch(() => {});
+if (await page.$('.overlay:not(.hidden) .cert-prints')) await page.click('.overlay button.primary');
 await page.waitForSelector('.overlay.hidden', { state: 'attached', timeout: 30000 });
 await page.waitForTimeout(1500);
 log('connected');

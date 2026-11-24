@@ -8,8 +8,18 @@ return [
     // Reject plain HTTP (localhost is always allowed).
     // 'force_https' => true,
 
-    // Reverse proxies whose X-Forwarded-For / X-Forwarded-Proto headers are trusted.
+    // The first connection to a computer (or gateway) never seen shows its certificate's fingerprints for the user to
+    // confirm before anything is sent; false trusts it at once, as before 1.2.
+    // 'confirm_new_certificates' => true,
+
+    // Reverse proxies whose X-Forwarded-For / X-Forwarded-Proto headers are trusted: only the exact addresses of your own
+    // proxies, never a public range (anyone there could then pass any address and get past the allowed clients and the
+    // sign-in locks).
     // 'trusted_proxies' => ['127.0.0.1'],
+
+    // The site's public address (where index.php is): signing in with OpenID Connect and passkeys use it instead of each
+    // request's Host header (behind a proxy that does not pass the public name on).
+    // 'public_url' => 'https://mudesk.example.com',
 
     // How short requests reach the running session: 'auto' (Unix socket) or 'file' (restricted hostings).
     // 'ipc' => 'auto',

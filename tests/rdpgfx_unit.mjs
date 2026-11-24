@@ -436,6 +436,24 @@ attempt(() => gp.onData(msg(create(1), avc(1, key(1000)), end(1))));
 attempt(() => gp.onData(msg(pdu(10, [1, 0]), create(2), end(2))));                 // deleted while its frame is decoding
 await new Promise((res) => setTimeout(res, 50));
 check('H.264: surface deleted while its frame decodes', acks.join() === '1,2', acks.join());
+// a recording made into a video: idle() once every frame given was decoded and went out (its picture is taken then), at once
+// with nothing waiting; decoded in software there (every picture out at once)
+{
+  const Dec0 = globalThis.VideoDecoder;
+  let configured = null;
+  globalThis.VideoDecoder = class extends Dec0 { configure(c) { configured = c; } };
+  gp = pipeline();
+  gp.software = true;
+  attempt(() => gp.onData(msg(create(1), avc(1, key(1000)), end(1))));
+  attempt(() => gp.onData(msg(avc(1, delta), end(2))));
+  const before = shown;
+  const idled = await Promise.race([gp.idle().then(() => true), new Promise((r) => setTimeout(() => r(false), 2000))]);   // (never: said, not waited for)
+  const after = shown;
+  const empty = await Promise.race([gp.idle().then(() => 'at once'), new Promise((r) => setTimeout(() => r('waited'), 50))]);
+  globalThis.VideoDecoder = Dec0;
+  check('H.264: idle once every frame given went out, at once with none; decoded in software for a video', idled && before === 0 && after === 2 && empty === 'at once'
+    && configured?.hardwareAcceleration === 'prefer-software', JSON.stringify({ idled, before, after, empty, configured }));
+}
 // an SPS in the last bytes of an access unit gives no codec string (it read past the end: TypeError)
 const avcLogs = [];
 new GfxPipeline((o) => { if (o.op === 'log') avcLogs.push(o.msg); }).onData(msg(create(1), avc(1, hex('0000000167 42'))));

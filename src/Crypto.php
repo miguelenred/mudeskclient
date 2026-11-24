@@ -18,10 +18,12 @@ final class Crypto
 
     private const KEY_HEAD = "<?php exit; ?>\n";
 
+    private static ?string $appKey = null;
+
     /** Server key for secrets that must be readable without the user's password (TOTP seeds). */
     public static function appKey(): string
     {
-        static $key = null;
+        $key = &self::$appKey;
         if ($key === null) {
             // a PHP file that exits at once: even if the data folder were served, PHP would show nothing
             $file = Config::dir('secret.php');
@@ -47,6 +49,12 @@ final class Crypto
             }
         }
         return $key;
+    }
+
+    /** The server key read again next time (a backup restored put its own in place). */
+    public static function forgetAppKey(): void
+    {
+        self::$appKey = null;
     }
 
     public static function encrypt(string $key, string $plain, string $aad = ''): string

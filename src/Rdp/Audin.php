@@ -128,11 +128,14 @@ final class Audin
         $this->c->emit(Client::F_MIC, pack('CVC', 1, $this->format['rate'], $this->format['ch']));
     }
 
-    /** Audio from the browser, 16-bit PCM in the format in use, sent in packets of the size the server asked for. */
-    public function fromBrowser(string $pcm): void
+    /**
+     * Audio from the browser, 16-bit PCM in the format in use, sent in packets of the size the server asked for. Returns
+     * what the remote computer was sent of it now (whole packets; what waits goes with the next), as a recording keeps it.
+     */
+    public function fromBrowser(string $pcm): string
     {
         if ($this->format === null) {
-            return;                                   // closed meanwhile: audio recorded before the browser knew
+            return '';                                // closed meanwhile: audio recorded before the browser knew
         }
         $frame = $this->format['ch'] * 2;
         $max   = $this->format['rate'] * $frame * self::BACKLOG;
@@ -147,8 +150,10 @@ final class Audin
             ($this->send)(chr(self::DATA) . substr($this->pending, $sent, $size));
             $sent += $size;
         }
+        $heard         = substr($this->pending, 0, $sent);
         $this->pending = (string)substr($this->pending, $sent);
         $this->c->trace?->count('mic:sent', $sent);
+        return $heard;
     }
 
     /** The channel closed (or the formats start over): the browser stops recording. */

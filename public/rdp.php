@@ -8,7 +8,7 @@ declare(strict_types=1);
  *  POST ?a=send&sid=...  binary message for the running session (input, resize, clipboard...), header X-MuDesk-Token
  *                        (a guest given control: its keyboard, mouse and touch, header X-MuDesk-Share)
  *  POST ?a=watch  JSON {link}  -> a guest's view of a shared session, the same frames (see Sessions::GUEST_FRAMES)
- *  POST ?a=replay JSON {sid}   -> a session's recording, for an administrator or an auditor (see Recording)
+ *  POST ?a=replay JSON {sid}   -> a session's recording, for an administrator or an auditor, or for its user one they started (see Recording)
  */
 
 use MuDesk\{Access, Audit, Auth, Config, Connections, Files, Http, Recording, Sessions, Settings, Users, WakeOnLan};
@@ -59,7 +59,7 @@ if ($a === 'send') { // hot path for input: no PHP session, authorised by the pe
             http_response_code(404);
             exit;
         }
-        http_response_code(Sessions::send($sid, pack('V', Sessions::GUEST_INPUT) . substr($body, 4)) ? 204 : 410);
+        http_response_code(Sessions::send($sid, pack('V', Sessions::GUEST_INPUT) . $share[1] . substr($body, 4)) ? 204 : 410);   // (whose: its share)
         exit;
     }
     $info = Sessions::info($sid);
@@ -69,8 +69,9 @@ if ($a === 'send') { // hot path for input: no PHP session, authorised by the pe
     $want = (string)($info['token'] ?? '');
     $body = $info !== null && $have !== '' && hash_equals($want, strlen($want) === 64 ? hash('sha256', $have) : $have) ? $read(4 * 1048576) : '';
     if (strlen($body) < 5 || ord($body[4]) === 9 || ord($body[4]) >= 0x20   // (9 and up: not the browser's)
-        // out of order (Sessions::OUT_OF_BAND): only its camera's pictures and its folder's answers, which no key waits behind
-        || (unpack('V', $body)[1] >= Sessions::GUEST_INPUT && (unpack('V', $body)[1] !== Sessions::OUT_OF_BAND || !in_array(ord($body[4]), [18, 20, 21], true)))) {
+        // out of order (Sessions::OUT_OF_BAND): only its camera's pictures, its folder's answers and its recording's video,
+        // which no key waits behind
+        || (unpack('V', $body)[1] >= Sessions::GUEST_INPUT && (unpack('V', $body)[1] !== Sessions::OUT_OF_BAND || !in_array(ord($body[4]), [18, 20, 21, 22], true)))) {
         http_response_code(404);
         exit;
     }
@@ -121,9 +122,8 @@ Auth::start();
 Auth::checkCsrf();
 $user = Auth::require();
 
-// clipboard files of a session: kept until it ends and counted in the user's shared folder quota (print jobs are not)
-$clipBytes = static fn(string $sid): int => (int)array_sum(array_map(static fn($f) => (int)@filesize($f),
-    preg_grep('~/(\d{1,4}|image\.dib)$~', glob(Cliprdr::tmpDir($sid) . '/*') ?: [])));
+// clipboard files and print jobs of a session: kept until it ends and counted in the user's shared folder quota
+$clipBytes = static fn(string $sid): int => Sessions::quotaBytes($sid);
 
 if ($a === 'clipfile') { // chunked upload of clipboard files/images: ?sid=&n=<index|image.dib>&o=<offset>
     Auth::release();
@@ -194,11 +194,14 @@ if ($a === 'print') { // a document printed on the MuDeskPDF virtual printer
     exit;
 }
 
-if ($a === 'replay') { // a recorded session, for an administrator or an auditor: its frames with their times, as recorded
-    Auth::requireAuditor();
+if ($a === 'replay') { // a recorded session, for an administrator or an auditor (or its user, one they started): its frames with their times
+    $ru   = Auth::require();
     Auth::release();
     $rsid = is_string(Http::input()['sid'] ?? null) ? Http::input()['sid'] : '';
-    $info = Recording::info($rsid) ?? Http::fail('not_found', 404);
+    $info = Recording::info($rsid);
+    if ($info === null || (!in_array($ru['role'], ['admin', 'auditor'], true) && !Recording::ownedBy($info, $ru))) {
+        Http::fail('not_found', 404);
+    }
     Audit::log('recording_view', ['sid' => $rsid, 'conn' => $info['conn'] ?? '', 'owner' => $info['user'] ?? ''], null, true);
     stream_start();
     $whole = Recording::read($rsid, static function (string $p): bool {
@@ -246,7 +249,8 @@ $total = Settings::get('max_sessions_total');
 $token = bin2hex(random_bytes(16));
 $sess  = !Sessions::validSid($sid) || Sessions::info($sid) !== null || $conn === null ? 'invalid_request'
        : Sessions::register($sid, ['uid' => $user['id'], 'user' => $user['username'], 'conn' => $conn['name'], 'host' => $conn['host'],
-                                   'ip' => Http::clientIp(), 'token' => hash('sha256', $token), 'wid' => Auth::wid(), 'app' => ($conn['app'] ?? '') !== '', 'record' => !empty($conn['record'])], $limit, $total);
+                                   'ip' => Http::clientIp(), 'token' => hash('sha256', $token), 'wid' => Auth::wid(), 'app' => ($conn['app'] ?? '') !== '', 'record' => !empty($conn['record']),
+                                   'record_by' => empty($conn['record']) ? null : 'policy'], $limit, $total);
 if ($sess === 'busy') {
     Audit::log('rdp_denied', ['conn' => $conn['name'], 'reason' => 'busy', 'limit' => $total] + $occasional, null, false);
     Http::$auditFailures = false;             // logged just above
@@ -260,6 +264,7 @@ stream_start();
 $out     = $outV = '';
 $watched = false;
 $rec     = null;                            // the session's recording, when the administrator records the connection
+$recBy   = null;                            // ... who started it: 'policy' (the connection's), 'admin' or 'owner' (in the session)
 $emit    = static function (int $type, string $payload) use (&$out, &$outV, &$watched, &$rec): void {
     $h    = pack('CV', $type, strlen($payload));
     $out .= $h;                               // (two appends: header . payload copied a large message once more)
@@ -298,19 +303,20 @@ if (is_string($sess)) {
 // registered: every way out removes the session
 $started = time();
 $reason  = 'closed';
-$detail  = $certHost = null;
+$detail  = $certHost = $certSha1 = null;
 $audit   = ['sid' => $sid, 'conn' => $conn['name']] + $occasional;   // context of every event of this RDP session
 $drive   = null;
 $localDir = null;   // [name, read only]: a folder of this computer shared from the browser (see Rdpdr::addLocal)
 $cleaned = false;
 $bytesIn = $bytesOut = 0;                  // of the connections before this one (made again for guests)
-$cleanup = static function () use (&$cleaned, &$drive, &$rec, $sess, $sid, $user, $clipBytes): void {
+$recEnd  = null;                            // a recording made in the browser being stopped: how it ends, once its page sent the rest
+$cleanup = static function () use (&$cleaned, &$drive, &$rec, &$recEnd, $sess, $sid, $user, $clipBytes): void {
     if (!$cleaned) {
         $cleaned = true;
-        $rec?->close();                                        // what waits is written, its details completed
+        $rec?->close($recEnd ?? []);                           // what waits is written, its details completed
         $drive?->removeLocal(false);                           // this computer's folder: its files still open audited
         $drive?->release();                                    // drive quota taken in advance and not used
-        Files::charge($user['id'], -$clipBytes($sid));         // the clipboard files go with the session
+        Files::charge($user['id'], -$clipBytes($sid));         // the clipboard files and print jobs go with the session
         $sess->close();
         Files::remove(Cliprdr::tmpDir($sid));
     }
@@ -401,19 +407,29 @@ $size  = [Http::int($in['w'] ?? 1024), Http::int($in['h'] ?? 768), $monitors];
 $client = $dvc = $rail = $clip = null;
 // the certificate of another computer than the connection's (a broker's redirection target, its gateway): pinned on its first
 // use, as the connection's own; one the broker vouched for ($vouched: the target's certificate in its redirection) is the one
-// to find there, at once (another is a changed certificate, even on a first use)
-$pinFor = static function (string $host, string $fp, ?string $vouched = null, bool $gateway = false) use ($conn, $user, $in, $audit): void {
+// to find there, at once (another is a changed certificate, even on a first use). The broker's word never replaces a
+// certificate pinned before: a broker taken over could send the user to an impostor it vouched for (the user decides)
+//
+// A computer (or gateway) never seen is not trusted by itself: the connection stops before anything of the user is sent, and
+// the page shows its fingerprints (SHA-256, and SHA-1 as Windows shows it) for the user to confirm (`trust`, the next time).
+// Before, it was trusted at once: a man in the middle of that first connection got the password (or the NLA exchange)
+$certEnd = static function (string $key, string $fp, string $sha1, ?string $host = null): never {
+    throw new ProtocolException($fp . ' ' . ($sha1 !== '' ? $sha1 : '-') . ($host !== null ? ' ' . $host : ''), $key);
+};
+$pinFor = static function (string $host, string $fp, ?string $vouched = null, bool $gateway = false, string $sha1 = '') use ($conn, $user, $in, $audit, $certEnd): void {
     $pinned = (string)(Connections::pins($user['id'], $conn)[1][Connections::certKey($host, $gateway)] ?? '');   // (read again: pinned
     if ($pinned === $fp && ($vouched === null || hash_equals($vouched, $fp))) {                       // meanwhile, too)
         return;
     }
-    if (($in['trust'] ?? '') === $fp || ($vouched !== null ? hash_equals($vouched, $fp) : $pinned === '')) {
+    if (($in['trust'] ?? '') === $fp || ($pinned === '' && ($vouched !== null ? hash_equals($vouched, $fp) : Config::get('confirm_new_certificates') === false))) {
         Connections::trust($user['id'], $conn, $fp, $host, $gateway);
         Audit::log('cert_trusted', $audit + ['host' => $host, 'fingerprint' => $fp, 'first_use' => $pinned === '']
             + ($vouched !== null ? ['vouched_by_broker' => hash_equals($vouched, $fp)] : []), null, true);
+    } elseif ($pinned === '' && $vouched === null) {
+        $certEnd('cert_new', $fp, $sha1, $host);   // (the page says which computer: not the connection's)
     } else {
         Audit::log('cert_mismatch', $audit + ['host' => $host, 'expected' => $vouched ?? $pinned, 'received' => $fp], null, false);
-        throw new ProtocolException($fp . ' ' . $host, 'cert_changed');   // (the page says which computer: not the connection's)
+        $certEnd('cert_changed', $fp, $sha1, $host);
     }
 };
 // a gateway's consent message (its terms of use): shown on the page, the session going on only if the user accepts it there
@@ -455,7 +471,8 @@ $consent  = static function (string $text) use ($status, $sess, $audit, &$held, 
 };
 // the gateway opened for the computer the client connects to (also one a broker sent it to)
 $gwOpen = $gw === null ? null : static function (string $target, int $port) use ($gw, $ip, $login, $domain, $password, $pinFor, $consent): Gateway {
-    return new Gateway($gw[0], $ip, $gw[1], $login, $domain, $password, $target, $port, Rdpdr::CLIENT_NAME, static fn(string $fp) => $pinFor($gw[0], $fp, null, true), $consent);
+    return new Gateway($gw[0], $ip, $gw[1], $login, $domain, $password, $target, $port, Rdpdr::CLIENT_NAME,
+        static fn(string $fp, string $sha1 = '') => $pinFor($gw[0], $fp, null, true, $sha1), $consent);
 };
 $redirect = null;                             // a connection broker's redirection being followed: [info, host, ip]
 $build = static function () use (&$client, &$dvc, &$rail, &$clip, &$drive, &$size, &$redirect, &$localDir, $tr, $conn, $ip, $gw, $gwOpen, $login, $domain, $password, $perf, $channels, $app, $in, $emit, $sid, $user): void {
@@ -508,14 +525,15 @@ $status(['token' => $token, 'trace' => $trace]);
 // recorded connection: the page is told (and says so) before anything is shown; no recording, no session
 if (!empty($conn['record'])) {
     Recording::cleanup();
-    $rec = Recording::start($sid, ['uid' => $user['id'], 'user' => $user['username'], 'conn' => $conn['name'], 'host' => $conn['host']]);
+    $rec = Recording::start($sid, ['uid' => $user['id'], 'user' => $user['username'], 'conn' => $conn['name'], 'host' => $conn['host'], 'started_as' => 'policy']);
     if ($rec === null) {
         $cleanup();
         Audit::log('rdp_denied', ['conn' => $conn['name'], 'reason' => 'record_failed'] + $occasional, null, false);
         $status(['end' => 'record_failed']);
         exit;
     }
-    $status(['recording' => true]);
+    $status(['recording' => true, 'record_by' => 'policy']);
+    $recBy = 'policy';
 }
 Audit::log('rdp_connect', $audit + ['host' => $conn['host'], 'target_ip' => $ip, 'port' => $conn['port'], 'rdp_user' => ($domain !== '' ? "$domain\\" : '') . $login,
     'password' => $saved !== null ? 'saved' : 'typed', 'security' => $conn['security'], 'gateway' => $gw[0] ?? null, 'routing_token' => $conn['lb'] !== '',
@@ -636,24 +654,53 @@ try {
     };
     // each computer's certificate checked against the one pinned for it, read again each time (a guest's join, a broker's
     // redirection back to a computer already seen)
-    $verify = static function (string $fp) use ($conn, $user, $in, $audit, $sess, &$redirect, $pinFor): void {
+    $verify = static function (string $fp, string $sha1 = '') use ($conn, $user, $in, $audit, $sess, &$redirect, $pinFor, $certEnd, $ip, $gw): void {
         $sess->heartbeat();                   // mid-connection: the loop's first one comes 15 s after it
         $vouched = $redirect[0]['cert'] ?? null;   // the certificate the broker gave for the computer it sent the client to
         if ($redirect !== null && strcasecmp($redirect[1], $conn['host']) !== 0) {
-            $pinFor($redirect[1], $fp, $vouched);   // another computer of the broker's: its own certificate
+            // another computer of the broker's: the certificate an administrator fixed for it only (before, the user was asked,
+            // and could take another), else its own, pinned for the user
+            $fixed = Connections::fixedCert((string)$redirect[1], (int)$conn['port'], $gw === null ? (string)$redirect[2] : '');
+            if ($fixed === null) {
+                $pinFor($redirect[1], $fp, $vouched, false, $sha1);
+            } elseif (!hash_equals($fixed, strlen($fixed) === 40 ? $sha1 : $fp)) {
+                Audit::log('cert_mismatch', $audit + ['host' => $redirect[1], 'expected' => $fixed, 'received' => $fp, 'fixed_by_admin' => true], null, false);
+                $certEnd('cert_unexpected', $fp, $sha1, $redirect[1]);
+            }
             return;
         }
         $pinned = Connections::pins($user['id'], $conn)[0];   // (an occasional connection's: the user's for its computer)
+        // the certificate an administrator fixed for this computer (by its name or its address, in any connection to it): that
+        // one only, whatever was pinned or the user would trust; never asked
+        $fixed   = Connections::fixedCert((string)$conn['host'], (int)$conn['port'], $gw === null ? (string)$ip : '');   // (through a
+        $isFixed = $fixed !== null && hash_equals($fixed, strlen($fixed) === 40 ? $sha1 : $fp);   // gateway, $ip is the gateway's)
+        // an administrator who trusts it for every user (the page's box): fixed for any connection to this computer, also in
+        // place of one fixed before (a certificate renewed); once (the page sends it again when it connects again)
+        if (!$isFixed && ($user['role'] ?? '') === 'admin' && !empty($in['trust_all']) && ($in['trust'] ?? '') === $fp) {
+            Connections::fixCert((string)$conn['host'], (int)$conn['port'], $fp, (string)$user['username']);
+            Audit::log('cert_fixed', $audit + ['host' => $conn['host'], 'port' => (int)$conn['port'], 'fingerprint' => $fp], null, true);
+            [$fixed, $isFixed] = [$fp, true];
+        }
+        if ($fixed !== null) {
+            if ($isFixed) {
+                $pinned !== $fp && Connections::trust($user['id'], $conn, $fp);
+                return;
+            }
+            Audit::log('cert_mismatch', $audit + ['expected' => $fixed, 'received' => $fp, 'fixed_by_admin' => true], null, false);
+            $certEnd('cert_unexpected', $fp, $sha1);
+        }
         if ($pinned === $fp && ($vouched === null || hash_equals($vouched, $fp))) {
             return;
         }
-        if (($in['trust'] ?? '') === $fp || ($vouched !== null ? hash_equals($vouched, $fp) : $pinned === '')) {
+        if (($in['trust'] ?? '') === $fp || ($pinned === '' && ($vouched !== null ? hash_equals($vouched, $fp) : Config::get('confirm_new_certificates') === false))) {   // (as $pinFor)
             Connections::trust($user['id'], $conn, $fp);
             Audit::log('cert_trusted', $audit + ['fingerprint' => $fp, 'first_use' => $pinned === '']
                 + ($vouched !== null ? ['vouched_by_broker' => hash_equals($vouched, $fp)] : []), null, true);
+        } elseif ($pinned === '' && $vouched === null) {
+            $certEnd('cert_new', $fp, $sha1);
         } else {
             Audit::log('cert_mismatch', $audit + ['expected' => $vouched ?? $pinned, 'received' => $fp], null, false);
-            throw new ProtocolException($fp, 'cert_changed');
+            $certEnd('cert_changed', $fp, $sha1);
         }
     };
     $connectTo($verify);
@@ -665,8 +712,50 @@ try {
         + (($g = $client->t->gw) !== null ? ['gateway_transport' => $g->transport, 'gateway_sign_in' => $g->auth] : []), null, true);
     $status(['connected' => true, 'cert' => $client->certFingerprint]);
 
+    // a recording started in the session (an administrator from the active sessions, or its user when allowed: see
+    // api.php): made at once in the user's browser, of what its page shows and plays (no new connection: the stream's
+    // frames cannot start halfway), the page told by its number ($recGen) and sending its video in numbered pieces on its
+    // out-of-order lane (message 22); stopped, the page sends what it has left, then it is closed. One the connection's or
+    // an administrator's is stopped only by an administrator.
+    $recGen   = 0;                           // the page's recordings in this session, the current one's number
+    $recNext  = 0;                           // the number of the piece of its video expected next
+    $closeRec = static function (bool $failed = false) use (&$rec, &$recBy, &$recEnd): void {
+        $rec?->close(($recEnd ?? []) + ($failed ? ['failed' => true] : []));
+        $rec = $recBy = $recEnd = null;
+    };
+    $startRec = static function (array $w) use (&$rec, &$recBy, &$recGen, &$recNext, &$recEnd, $closeRec, $sid, $user, $conn, $audit, $status): void {
+        $recEnd !== null && $closeRec();     // one stopped whose page has not sent the rest yet: closed as it is
+        Recording::cleanup();
+        $id  = Recording::newId();
+        $rec = Recording::start($id, ['sid' => $sid, 'uid' => $user['id'], 'user' => $user['username'], 'conn' => $conn['name'], 'host' => $conn['host'],
+            'by' => $w['by'], 'started_as' => $w['as'], 'kind' => 'video']);
+        if ($rec === null) {
+            Audit::log('recording_start', $audit + ['by' => $w['by'], 'as' => $w['as'], 'reason' => 'record_failed'], null, false);
+            $status(['recording' => false, 'record_error' => 'record_failed']);
+            return;
+        }
+        [$recBy, $recGen, $recNext] = [$w['as'], $recGen % 65535 + 1, 0];
+        Audit::log('recording_start', $audit + ['rec' => $id, 'by' => $w['by'], 'as' => $w['as'], 'recording' => true], null, true);
+        Sessions::recording($sid, $recBy);                 // (after its audit line: whoever sees it recorded finds that line)
+        $status(['recording' => true, 'record_by' => $recBy, 'record_video' => $recGen]);
+    };
+    $stopRec = static function (string $by, bool $asAdmin, ?string $failed = null) use (&$rec, &$recBy, &$recEnd, $closeRec, $sid, $audit, $status): void {
+        if ($rec === null || $recEnd !== null || ($recBy !== 'owner' && !$asAdmin && $failed === null)) {
+            return;
+        }
+        Audit::log('recording_stop', $audit + ['rec' => $rec->sid, 'by' => $by, 'recording' => true] + ($failed !== null ? ['reason' => $failed] : []),
+            null, $failed === null);
+        Sessions::recording($sid, null);
+        $status(['recording' => false] + ($failed !== null ? ['record_error' => $failed] : []));
+        $recEnd = ['stopped_by' => $by] + ($failed !== null ? ['failed' => true] : []);
+        if (!$rec->video || $failed !== null) {
+            $closeRec();                     // (the stream's frames: all of it is here already)
+        }
+    };
     $idle     = Settings::get('rdp_idle_minutes') * 60;
     $lastIn   = $lastPing = $lastBeat = time();
+    $lastMem  = 0;                           // (its memory noted at the first heartbeat, then once a minute)
+    $controlAt = [];                         // the shares with control: when their guests last used it (or came)
     $visible  = true;                        // the owner's page is seen (else the server stops drawing, unless guests watch)
     $watchers = 0;
     $joinWanted = $guestUsed = false;          // a guest waiting to be shown the session; a guest's input taken
@@ -719,8 +808,9 @@ try {
         foreach ([...array_splice($held, 0), ...$sess->read($r)] as $m) {   // (those kept during a consent first)
             $type = ord($m[0] ?? "\0");
             if ($type >= 0x20) {                    // not from the owner's page (see Sessions::read)
-                if ($type === 0x22 && in_array(ord($m[1] ?? "\0"), Sessions::GUEST_TYPES, true)) {
-                    $m    = substr($m, 1);           // a guest given control: its keyboard, mouse and touch, as the owner's
+                if ($type === 0x22 && in_array(ord($m[17] ?? "\0"), Sessions::GUEST_TYPES, true)) {
+                    $controlAt[substr($m, 1, 16)] = time();   // (its control used now)
+                    $m    = substr($m, 17);          // a guest given control: its keyboard, mouse and touch, as the owner's
                     $type = ord($m[0]);
                     $guestUsed = true;
                     if (($type === 7 || $type === 8) && $client->queued() > 64) {
@@ -729,14 +819,28 @@ try {
                 } else {
                     if ($type === 0x21) {            // a guest came: shown the session once connected again (below)
                         $id = substr($m, 1);
-                        if ($rail === null && isset((Sessions::info($sid)['shares'] ?? [])[$id])) {
+                        $sh = (Sessions::info($sid)['shares'] ?? [])[$id] ?? null;
+                        if ($rail === null && $sh !== null) {
                             $joinWanted = true;
+                            ($sh['mode'] ?? '') === 'control' && $controlAt[$id] ??= time();   // (unused from now on: its control lost
+                                                                                                // after the administrator's minutes)
                         } else {                     // (revoked meanwhile; RemoteApp is not shared)
                             $sess->dropViewers($id);
                         }
                     } elseif ($type === 0x20) {      // a link revoked: its guests let go
                         $sess->dropViewers(substr($m, 1));
                         $guestUsed && $client->releaseModifiers();   // (a key it held stays pressed otherwise)
+                    } elseif ($type === 0x23) {      // the recording started or stopped (api.php: who, and as what)
+                        $rw = json_decode(substr($m, 1), true);
+                        if (!is_array($rw)) {
+                            continue;
+                        }
+                        $as = ($rw['as'] ?? '') === 'admin' ? 'admin' : 'owner';
+                        if (empty($rw['on'])) {
+                            $stopRec((string)($rw['by'] ?? ''), $as === 'admin');
+                        } elseif (($rec === null || $recEnd !== null) && $rail === null) {   // (RemoteApp: its windows are no one picture)
+                            $startRec(['by' => (string)($rw['by'] ?? ''), 'as' => $as]);
+                        }
                     }
                     continue;
                 }
@@ -790,9 +894,34 @@ try {
                 $lastIn = time();                            // (in use: a session used only with the fingers ended as idle)
                 $dvc->touchData(substr($m, 1));
             } elseif ($type === 15) {               // microphone: 16-bit PCM in the format the browser was told (F_MIC)
-                $dvc->micData(substr($m, 1));
+                $heard = $dvc->micData(substr($m, 1));
+                if ($heard !== '') {
+                    $rec?->frame(Recording::MIC, $heard);   // what the remote computer heard, recorded with the session's sound
+                }
             } elseif ($type === 18) {               // camera: u8 its start (F_CAM), a JPEG picture at the size it was told; nothing, it could not open it
                 $dvc->camData(substr($m, 1));
+            } elseif ($type === 22 && strlen($m) >= 8) {   // the page's recording: u16 its number, u32 the piece's, u8 flags, the video's next bytes
+                ['g' => $g, 'n' => $n, 'f' => $f] = unpack('vg/Vn/Cf', $m, 1);
+                if ($rec !== null && $rec->video && $g === $recGen && $n >= $recNext) {   // (one sent twice, or of a recording before: left out)
+                    // a piece missing (lost on the way, or left out by a page that gave up): what comes after it cannot be
+                    // read, so the recording ends there, whole up to it
+                    $gap = $n > $recNext;
+                    if (!$gap) {
+                        $o = 8;
+                        if ($n === 0 && $f & 1 && strlen($m) >= 10) {   // the first: u16 length + JSON, what the page records
+                            $o += 2 + unpack('v', $m, 8)[1];
+                            $rec->describe((array)json_decode(substr($m, 10, $o - 10), true));
+                        }
+                        $recNext = $n + 1;
+                        strlen($m) > $o && $rec->frame(Recording::VIDEO, substr($m, $o));
+                    }
+                    // ended: the rest after it was stopped (2); else the page cannot record or gave up (4), a piece missing,
+                    // more than a video makes (a page filling the disk), or the page stopped on its own: stopped, said why
+                    $failed = $gap || $f & 4 || $rec->overRate();
+                    if ($failed || $f & 2) {
+                        $recEnd !== null ? $closeRec($failed) : $stopRec('', true, 'record_page');
+                    }
+                }
             } elseif ($type === 19 && strlen($m) >= 2 && strlen($m) <= 300) {   // this computer's folder: 1 shared (u8 read only + name), 0 no longer
                 if ($m[1] === "\1" && strlen($m) >= 3) {
                     if ($drive?->addLocal(substr($m, 3), $m[2] !== "\0")) {
@@ -826,12 +955,12 @@ try {
         if ($joined) {
             $joinWanted = false;
             $lastJoin   = microtime(true);
-            $joined     = $sess->joiningCount() > 0;   // (gone meanwhile: nothing to show)
+            $joined     = $sess->joiningCount() > 0;   // (a guest gone meanwhile: nothing to show)
         }
         if ($joined) {
             // a guest came: the connection is made again so that every page starts from the same picture (the graphics
-            // pipeline's surfaces, caches and video cannot be joined halfway); Windows keeps the session meanwhile, as
-            // after a dropped connection. The owner's page sees the desktop stop for a moment.
+            // pipeline's surfaces, caches and video cannot be joined halfway); Windows keeps the session meanwhile, as after
+            // a dropped connection. The owner's page sees the desktop stop for a moment.
             $flush();                            // the old connection's last frames, to whoever saw it
             $outV    = '';                       // (nothing left over for the guests from before)
             $watched = $sess->admitViewers() > 0;
@@ -843,6 +972,7 @@ try {
             $build();
             $emit(Client::F_RESET, '');
             $status(['viewers' => $watchers = $sess->viewerCount()]);
+            Sessions::report($sid, ['viewers' => $watchers]);   // (for the administration's status)
             $connectTo($verify);                 // (each computer's pinned certificate: the same as when it started)
             $sess->heartbeat();
         }
@@ -851,15 +981,19 @@ try {
             $watched  = $watchers > 0;
             $watched || $outV = '';
             $status(['viewers' => $watchers]);
+            Sessions::report($sid, ['viewers' => $watchers]);
             $watched || $visible || $client->suppressOutput(false);
             $guestUsed && $client->releaseModifiers();
         }
         $client->catchUp();                      // the history of what was forwarded, now that frames and input went out
         $clip?->tick();
         $rec?->tick();
-        if ($rec?->failed) {                     // the recording cannot be written: no recording, no session
+        if ($rec?->failed && $recBy === 'policy') {   // the connection's recording cannot be written: no recording, no session
             $reason = 'record_failed';
             break;
+        }
+        if ($rec?->failed) {                     // one started in the session: it stops, the session goes on
+            $stopRec('', true, 'record_failed');
         }
         $now = time();
         $rail?->tick();                          // RemoteApp: the program asked for if the browser did not report the desktop
@@ -873,6 +1007,29 @@ try {
                 break;
             }
             $lastBeat = $now;
+            // a link past its time: its guests let go (as revoked); a guest given control that has not used it for the
+            // administrator's minutes: it watches on, told why
+            foreach (Sessions::expiredShares($sid) as $id) {
+                if (Sessions::unshare($sid, $id)) {
+                    unset($controlAt[$id]);
+                    Audit::log('share_expire', $audit + ['share' => $id], null, true);
+                }
+            }
+            $ctlIdle = (int)Settings::get('share_control_idle_minutes') * 60;
+            $ended   = $sess->endIdleControls($sid, $controlAt, $now, $ctlIdle, static function () use ($sid): string {
+                $i  = Sessions::info($sid) ?? [];
+                $st = (string)json_encode(['watch' => 'view', 'owner' => $i['user'] ?? '', 'conn' => $i['conn'] ?? '', 'sid' => $sid,
+                    'recording' => !empty($i['record']), 'control_ended' => 'idle']);
+                return pack('CV', Client::F_STATUS, strlen($st)) . $st;
+            });
+            foreach ($ended as $id) {
+                $guestUsed && $client->releaseModifiers();   // (a key it held stays pressed otherwise)
+                Audit::log('share_control_end', $audit + ['share' => $id, 'reason' => 'idle', 'minutes' => intdiv($ctlIdle, 60)], null, true);
+            }
+            if ($now - $lastMem >= 60) {         // its memory, for the administration's status
+                Sessions::report($sid, ['mem' => memory_get_usage(), 'mem_peak' => memory_get_peak_usage()]);
+                $lastMem = $now;
+            }
             // the account removed or disabled (also if the message that ends it was lost): the session ends. Not a new
             // password: every change ends the remote sessions that must end (Sessions::killUser), while an own change keeps
             // those of the web session that made it; comparing the session version here ended those too.
@@ -896,8 +1053,8 @@ try {
 } catch (ProtocolException $e) {
     $reason = $e->key;
     $client->trace?->log('error', ['key' => $e->key, 'message' => $e->getMessage()]);
-    if ($e->key === 'cert_changed') {        // the fingerprint, and which computer when it is not the connection's own
-        [$detail, $certHost] = explode(' ', $e->getMessage(), 2) + [1 => null];
+    if (in_array($e->key, ['cert_changed', 'cert_new', 'cert_unexpected'], true)) {   // its fingerprints, and which computer when
+        [$detail, $certSha1, $certHost] = explode(' ', $e->getMessage(), 3) + [1 => '-', 2 => null];   // it is not the connection's own
     }
 } catch (Throwable $e) {
     $reason = 'internal';
@@ -916,6 +1073,7 @@ try {
                null, in_array($reason, ['user', 'browser_closed', 'disconnected', 'idle', 'closed'], true));
 }
 if ($reason !== 'browser_closed') {
-    $emit(Client::F_STATUS, json_encode(['end' => $reason, 'detail' => $detail, 'errorInfo' => $client->errorInfo] + ($certHost !== null ? ['host' => $certHost] : [])));
+    $emit(Client::F_STATUS, json_encode(['end' => $reason, 'detail' => $detail, 'errorInfo' => $client->errorInfo] + ($certHost !== null ? ['host' => $certHost] : [])
+        + ($certSha1 !== null && $certSha1 !== '-' ? ['sha1' => $certSha1] : [])));
     $flush();
 }

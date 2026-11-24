@@ -69,6 +69,9 @@ const conn = list.conns.find((c) => c.name === 'pk');
 const s = await ctx.newPage();
 await s.goto(base + '/index.php#/s/' + conn.id);
 const t0 = Date.now();
+// a computer never seen: its certificate's fingerprints shown first, trusted here (the test's own computer)
+await s.waitForSelector('.overlay.hidden, .overlay .cert-prints', { state: 'attached', timeout: 30000 }).catch(() => {});
+if (await s.$('.overlay:not(.hidden) .cert-prints')) await s.click('.overlay button.primary');
 await s.waitForSelector('.overlay.hidden', { state: 'attached', timeout: 30000 }).catch(() => {});
 await s.waitForTimeout(4000);
 const colours = await s.evaluate(() => {                 // the remote desktop is drawn: many different colours

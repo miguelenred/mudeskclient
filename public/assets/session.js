@@ -6,9 +6,10 @@ import { isTextCursor, pointerDecode } from './gfx.js';
 import { SCANCODES, ev, typedText } from './keymap.js';
 import { GfxSurfaces } from './gfxsurfaces.js';
 import { drawPattern, drawRop, drawText, glyphPath } from './orders.js';
+import { PageRecorder, REC } from './pagerec.js';
 
 const FATAL = new Set(['app_not_opened', 'auth_failed', 'password_expired', 'account_locked', 'account_disabled', 'account_restricted',
-  'account_expired', 'logon_not_granted', 'target_denied', 'too_many_sessions', 'cert_changed', 'nla_required',
+  'account_expired', 'logon_not_granted', 'target_denied', 'too_many_sessions', 'cert_changed', 'cert_new', 'cert_unexpected', 'nla_required',
   'nla_unavailable', 'rdp_security', 'rdp_unencrypted', 'tls_required', 'license', 'license_rds', 'user', 'killed', 'idle', 'invalid_request',
   'redirect', 'routing_token', 'gateway_auth', 'gateway_denied', 'gateway_not_allowed', 'gateway_unsupported', 'gateway_consent', 'gateway_unreachable', 'mitm', 'unreachable', 'auth', 'csrf', 'pending', 'signed_out', 'app_not_allowed', 'app_not_found', 'app_failed', 'app_locked',
   'app_unsupported', 'record_failed', 'outside_hours']);
@@ -59,17 +60,20 @@ function contain(c, w, h) {
   c.style.height = Math.floor(c.height * scale) + 'px';
 }
 const MSG = { INPUT: 1, RESIZE: 2, VISIBLE: 3, CLIP: 4, QUIT: 5, REFRESH: 6, TEXT: 7, PASTE: 8, GFX_ACK: 10, DIAG: 11, CLIP_PASTE: 12, MONITORS: 13, RAIL: 14, MIC: 15, TOUCH: 16, GW_CONSENT: 17,
-  CAM: 18, FOLDER: 19, FOLDER_IO: 20, FOLDER_LIST: 21 };
-const LANE = 0xFFFFFFFF;                                 // out of order (Sessions::OUT_OF_BAND): camera pictures, the folder's answers
+  CAM: 18, FOLDER: 19, FOLDER_IO: 20, FOLDER_LIST: 21, REC };
+const LANE = 0xFFFFFFFF;                                 // out of order (Sessions::OUT_OF_BAND): camera pictures, the folder's answers, the recording's video
 const GUEST_MSG = new Set([MSG.INPUT, MSG.TEXT, MSG.PASTE, MSG.TOUCH]);   // what a guest given control sends (Sessions::GUEST_TYPES)
 const SC = { minimize: 0xF020, maximize: 0xF030, restore: 0xF120, close: 0xF060 };   // RemoteApp window commands (SC_*)
 const DIAG_MAX = 300;                                    // browser notes per session in diagnostic mode
+const REC_BACKLOG = 32 << 20;                            // bytes of a recording made in the page waiting to go, at most
+const REC_TRIES = 10;                                    // times a piece of it is sent (again with each next piece, about a second apart)
 
 export class RdpSession {
   /**
    * @param {object} o {container, canvas, keyboard (textarea), conn, csrf, retries (automatic reconnections), onState(state, info)};
    *   guest: {link} to watch a session shared with a link (view only, or with control when the owner gave it);
-   *   replay: {sid, from (ms), speed} to play a session's recording (administrators and auditors)
+   *   replay: {sid, from (ms), speed} to play a session's recording (administrators and auditors); with video: true, read as
+   *   fast as it goes to make a video of it (see recvideo.js: onCapture(ms) takes each picture, the sound comes with its time)
    */
   constructor(o) {
     Object.assign(this, o);
@@ -118,7 +122,8 @@ export class RdpSession {
     this.mic = null;                                     // MicCapture when the microphone is offered
     this.cam = null;                                     // CamCapture when the camera is offered (with the microphone)
     this.folder = null;                                  // LocalFolder: a folder of this computer shared in the session
-    this.lane = { busy: 0, cam: null, folder: [] };      // the out-of-order lane: what waits to go, how many requests are out
+    this.lane = { busy: 0, cam: null, folder: [], rec: [], recOut: false, recWait: false };   // the out-of-order lane: what waits to go, how many requests are out
+    this.recorder = null;                                // a recording started in the session, made in this page (pagerec.js)
     this.#bindPointer(this.canvas, this.views[0]);
     this.#bindKeyboard(this.keyboard);
     this.#bindWindow();
@@ -137,6 +142,8 @@ export class RdpSession {
 
   stop() {
     this.stopped = true;
+    this.recorder?.dispose();                            // (the gateway closes its recording with the session)
+    this.recorder = null;
     this.mic?.stop();
     this.cam?.stop();
     if (this.sid) this.#post([MSG.QUIT]);
@@ -146,8 +153,11 @@ export class RdpSession {
 
   /** The page is done with this session: its window listeners go, and its worker (no more memory held by the tab). */
   dispose() {
+    this.recorder?.dispose();                            // (the page left the session: nothing more drawn, recorded or sent)
+    this.recorder = null;
     this.leaveWindow?.abort();
     this.resizeObs?.disconnect();
+    this.audio?.close?.();
     if (this.stopped) { this.worker?.terminate(); this.worker = null; }
   }
 
@@ -165,7 +175,7 @@ export class RdpSession {
     const { w, h } = one ? { w: one.w, h: one.h } : this.viewSize();
     // (gen: requests of the connection before still in flight no longer count; locks: synced again on the next key)
     Object.assign(this, { sid: null, token: null, seq: 0, inflight: 0, gen: (this.gen || 0) + 1, outbox: [], events: [], move: null, ack: null, ackOwed: false,
-      locks: -1, inView: true, disp: false, ended: null, bcache: new Map(), gcache: new Map(), lane: { busy: 0, cam: null, folder: [] } });
+      locks: -1, inView: true, disp: false, ended: null, bcache: new Map(), gcache: new Map(), lane: { busy: 0, cam: null, folder: [], rec: [], recOut: false, recWait: false } });
     if (this.rail) {                                     // the server sends its windows again
       clearTimeout(this.rail.closing);
       Object.assign(this.rail, { active: 0, ready: false, seen: false, closing: 0, asked: 0 });
@@ -189,7 +199,10 @@ export class RdpSession {
       }
       else if (m.t === 'op') this.#order(m.cmd);
       else if (m.t === 'gfx') this.gfx.apply(m.op);
-      else if (m.t === 'frame') this.#frame(m.type, m.d);
+      else if (m.t === 'frame') this.#frame(m.type, m.d, m.ms);
+      else if (m.t === 'cap') {                          // a recording made into a video: its picture now, then the next frames
+        Promise.resolve(this.onCapture?.(m.ms)).then(() => { if (wk === this.worker) wk.postMessage({ cmd: 'ack' }); }, () => this.stop());
+      }
       else if (m.t === 'log') this.#log(m.msg);
       else if (m.t === 'diag') this.diag(m.d);
       else if (m.t === 'bytes') Object.assign(this.counts, { bytes: m.n, bytesAt: m.at });
@@ -204,7 +217,7 @@ export class RdpSession {
     };
     if (this.replay) {                                   // a recording: its frames at their pace, nothing sent
       wk.postMessage({ url: new URL('rdp.php?a=replay', location.href).href, headers: { 'Content-Type': 'application/json', 'X-CSRF': this.csrf },
-        body: JSON.stringify({ sid: this.replay.sid }), timed: true, from: this.replay.from || 0, speed: this.replay.speed || 1 });
+        body: JSON.stringify({ sid: this.replay.sid }), timed: true, from: this.replay.from || 0, speed: this.replay.speed || 1, exp: !!this.replay.video });
       return;
     }
     if (this.guest) {                                    // a shared session: its stream from the owner's, through the link
@@ -244,6 +257,12 @@ export class RdpSession {
   }
 
   #finish() {
+    if (this.recorder) {                                 // the gateway closed its recording with the session (a new one, connected
+      this.recorder.dispose();                           // again, is not recorded unless started again): no longer said
+      this.recorder = null;
+      this.onRecording?.(false, null, null);
+    }
+    this.lane.rec = [];
     this.mic?.stop();                                    // a new connection opens it again if a program there records
     this.cam?.stop();                                    // ... or uses the camera
     this.folder?.reset();                                // its open files went with the connection (the folder stays chosen)
@@ -282,15 +301,26 @@ export class RdpSession {
     this.onState('ended', e);
   }
 
-  #frame(type, d) {
+  /** A frame of the stream (ms: its time in a recording). */
+  #frame(type, d, ms) {
     switch (type) {
       case 1: this.#update(d[0], d.subarray(1)); break;
       case 2: this.#resize(d[0] | (d[1] << 8), d[2] | (d[3] << 8)); break;
       case 3: this.#status(JSON.parse(new TextDecoder().decode(d))); break;
       case 4: this.clipboard?.onMessage(d); break;
       case 5: this.disp = true; this.#checkSize(); break;
-      case 7: this.audio?.onMessage(d); break;
-      case 13: this.mic?.onMessage(d); break;
+      case 7:
+        if (d[0] === 70) this.soundFormats = d;          // (its formats: a recording made in this page later needs them)
+        this.audio?.onMessage(d, ms);
+        this.recorder?.onSound(d);
+        break;
+      case 13:
+        this.micFormatMsg = d;
+        this.mic?.onMessage(d);
+        if (this.replay) this.audio?.micFormat?.(d);
+        this.recorder?.micFormat(d);
+        break;
+      case 32: this.audio?.micData?.(d, ms); break;    // a recording: what the user's microphone sent (Recording::MIC)
       case 16: this.cam?.onMessage(d); break;
       case 17: this.folder?.onRequest(d); break;
       case 14:                                           // connected again for a guest: everything is drawn anew
@@ -333,7 +363,21 @@ export class RdpSession {
     }
     if ('viewers' in s) this.onViewers?.(s.viewers);   // the owner: how many guests watch
     if (s.local_folder === 'refused') this.folder?.refused();   // no shared folder in this session (or the gateway's policy)
-    if ('recording' in s && !this.replay) this.onRecording?.(!!s.recording);   // the administrator records this connection: said
+    // recorded (by the connection, an administrator, or its user): said; who started it ('policy', 'admin', 'owner'); a
+    // recording started in the session that could not be written
+    if ('recording' in s && !this.replay) this.onRecording?.(!!s.recording, s.record_by || null, s.record_error || null);
+    // one started in the session: made in this page, the gateway's number for it in record_video; stopped, the rest sent
+    if ('recording' in s && !this.replay && !this.guest) {
+      if (s.recording && s.record_video && this.recorder?.gen !== s.record_video) {
+        this.recorder?.stop();
+        this.lane.rec = [];                              // (the gateway closed the one before: its pieces no longer taken)
+        this.recorder = new PageRecorder({ session: this, gen: s.record_video, send: (m) => this.#sendRec(m), sound: !!(this.audio || this.mic) });
+        this.recorder.start();
+      } else if (!s.recording) {
+        this.recorder?.stop();
+        this.recorder = null;
+      }
+    }
     if ('touch' in s) {                                // multitouch ready (or suspended, or gone): the fingers go as touch
       this.touchOn = !!s.touch && navigator.maxTouchPoints > 0 && !this.replay && !(this.guest && this.guest.mode !== 'control');
       if (!this.touchOn) this.contacts.clear();
@@ -606,7 +650,7 @@ export class RdpSession {
         if (p.w && p.h) c.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(p.rgba.buffer), p.w, p.h), 0, 0);
         const url = p.w && p.h ? c.toDataURL() : null;
         const css = url ? `url(${url}) ${Math.min(p.x, p.w - 1)} ${Math.min(p.y, p.h - 1)}, default` : 'none';
-        const ptr = { css, text: isTextCursor(p), url, hx: p.x, hy: p.y };
+        const ptr = { css, text: isTextCursor(p), url, hx: p.x, hy: p.y, img: url ? c : null };   // (img: drawn into a recording's video)
         this.pointers.set(p.index, ptr);
         this.#cursor(ptr);
         break;
@@ -893,6 +937,7 @@ export class RdpSession {
    */
   sendMic(pcm, max, frame) {
     if (!this.token) return;
+    this.recorder?.micData(pcm);                         // (what the remote computer hears: in a recording made in this page too)
     const i = this.outbox.findIndex((m) => m[0] === MSG.MIC);
     if (i < 0) {
       const m = new Uint8Array(pcm.length + 1);
@@ -921,6 +966,23 @@ export class RdpSession {
    * A picture of the camera (JPEG; empty: it could not be opened) of the start numbered `no` (F_CAM): the newest waits, in
    * place of an older one not sent yet.
    */
+  /**
+   * A piece of the recording made in this page, on the out-of-order lane: one at a time, in order. More than REC_BACKLOG
+   * bytes waiting (an upload slower than the video, the network gone): given up, the recording ends whole up to there.
+   */
+  #sendRec(m) {
+    if (!this.token || this.guest) return;
+    this.lane.rec.push(m);
+    this.lane.recWait = false;                           // (one that did not get there goes again now, ahead of this one)
+    if (this.lane.rec.reduce((n, x) => n + x.length, 0) > REC_BACKLOG) this.#recGiveUp();
+    this.#lanePump();
+  }
+
+  #recGiveUp() {
+    this.lane.rec = [];
+    this.recorder?.abandon();                            // (its REC_FAILED, the next piece: the gateway finds the gap and ends it)
+  }
+
   sendCam(jpeg, no) {
     if (!this.token || this.guest) return;
     const m = new Uint8Array(jpeg.length + 2);
@@ -965,26 +1027,49 @@ export class RdpSession {
   /**
    * The out-of-order lane: the gateway takes each one as it arrives, so no key or click waits behind a picture of the camera
    * (some 40 KB) or a piece of a file read (up to 1 MB). Two requests out at most; the folder's answers first (Windows waits
-   * for them), then the newest picture. A folder's answer lost on the way (the network, the gateway busy) is sent again, up
-   * to 3 times: else the program there waited for it for ever (the gateway takes only the first of two).
+   * for them), then the recording's next piece (one at a time: they go in order), then the newest picture. A folder's
+   * answer lost on the way (the network, the gateway busy) is sent again, up to 3 times: else the program there waited for
+   * it for ever (the gateway takes only the first of two). A piece of the recording that did not get there (the network,
+   * the gateway busy: not refused) waits ahead of the next ones and goes again with the next piece the recorder makes,
+   * about a second later, REC_TRIES times at most (a network gone for a few seconds loses nothing); then, or refused, the
+   * recording is given up: one missing would make the rest unreadable.
    */
   #lanePump() {
     const gen = this.gen;
-    while (this.token && this.lane.busy < 2 && (this.lane.folder.length || this.lane.cam)) {
-      const payload = this.lane.folder.length ? this.lane.folder.shift() : this.lane.cam;
+    const recNext = () => !this.lane.recOut && !this.lane.recWait && this.lane.rec.length;
+    while (this.token && this.lane.busy < 2 && (this.lane.folder.length || recNext() || this.lane.cam)) {
+      const payload = this.lane.folder.length ? this.lane.folder.shift() : recNext() ? this.lane.rec.shift() : this.lane.cam;
       if (payload === this.lane.cam) this.lane.cam = null;
+      const rec = payload[0] === MSG.REC;
+      if (rec) this.lane.recOut = true;
       const body = new Uint8Array(payload.length + 4);
       new DataView(body.buffer).setUint32(0, LANE, true);
       body.set(payload, 4);
       this.lane.busy++;
       let again = 0;
+      let refused = false;
       fetch(`rdp.php?a=send&sid=${this.sid}`, { method: 'POST', body, cache: 'no-store', headers: { 'X-MuDesk-Token': this.token } })
-        .then((r) => { if (r?.status >= 500) throw new Error('busy'); })
+        .then((r) => {
+          if (r?.status >= 500 || (rec && (r?.status === 410 || r?.status === 429))) throw new Error('busy');
+          refused = rec && !r?.ok;                        // (404: not a piece the gateway takes)
+        })
         .catch(() => {
-          if (payload[0] !== MSG.CAM && (payload.tries = (payload.tries ?? 0) + 1) <= 3) again = 500 * payload.tries;
+          if (rec) again = (payload.tries = (payload.tries ?? 0) + 1) < REC_TRIES ? -1 : 0;
+          else if (payload[0] !== MSG.CAM && (payload.tries = (payload.tries ?? 0) + 1) <= 3) again = 500 * payload.tries;
+          refused = rec && !again;
         }).finally(() => {
           if (gen !== this.gen) return;
           this.lane.busy--;
+          if (rec) {
+            this.lane.recOut = false;
+            if (refused) this.#recGiveUp();
+            else if (again) {                            // (it waits ahead of the next ones: sent again with the next piece)
+              this.lane.rec.unshift(payload);
+              this.lane.recWait = true;
+            }
+            this.#lanePump();
+            return;
+          }
           if (!again) { this.#lanePump(); return; }
           setTimeout(() => {
             if (gen !== this.gen) return;
@@ -1112,6 +1197,7 @@ export class RdpSession {
   #mouse(flags, e) {
     const p = this.#pos(e);
     if (!p) return;
+    this.mouseAt = p;                                    // (where the pointer is drawn in a recording made in this page)
     this.#input(ev.mouse(flags, p[0], p[1]), flags === 0x0800);
   }
 

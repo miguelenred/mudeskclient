@@ -549,6 +549,45 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   check('worker: a recording stopped while paused ends at once (its worker went on for ever)', stopped.frames === 1 && stoppedIn < 500, JSON.stringify({ stopped, stoppedIn }));
   check('worker: a recording at its pace (times the speed), from a point at once, paused and played again; its end told',
     onPace(pacing), JSON.stringify(pacing));
+
+  // made into a video: as fast as it goes; a picture asked for (at the time of the last thing drawn, 1/15 s after the one
+  // before at least, the first at 0) before a frame when something was drawn since, the next frames only once the page took
+  // it; each frame with its time; the last picture at the end. Played from a point: its sound left out up to there, not its
+  // formats
+  const recStream = (list) => {
+    const parts = list.map(([ms, type, d]) => {
+      const u = new Uint8Array(9 + d.length), dv = new DataView(u.buffer);
+      dv.setUint32(0, ms, true); u[4] = type; dv.setUint32(5, d.length, true); u.set(d, 9);
+      return u;
+    });
+    parts.push(Uint8Array.of(0, 0, 0, 0, 0, 3, 0, 0, 0, 101, 110, 100));
+    return { ok: true, body: { getReader: () => ({ read: async () => (parts.length ? { value: parts.shift(), done: false } : { done: true }) }) } };
+  };
+  const rec = [[0, 2, Uint8Array.of(0, 4, 0, 3, 16)], [10, 1, Uint8Array.of(5)], [20, 7, Uint8Array.of(87, 0, 0, 1, 2)], [25, 32, Uint8Array.of(1, 2)],
+    [30, 15, Uint8Array.of(1, 0, 2, 0)], [200, 1, Uint8Array.of(5)], [210, 3, new TextEncoder().encode('{}')], [215, 7, Uint8Array.of(70, 91, 93)], [216, 32, Uint8Array.of(3, 4)]];
+  const videoRun = async (o) => {
+    globalThis.fetch = async () => recStream(rec);
+    const seen = [];
+    globalThis.postMessage = (m) => {
+      if (m.t === 'frame') seen.push(`f${m.type}@${m.ms}`);
+      if (m.t === 'cap') {
+        seen.push(`cap@${Math.round(m.ms)}`);
+        setTimeout(() => { seen.push('ack'); globalThis.onmessage({ data: { cmd: 'ack' } }); }, 30);   // (the page takes a while)
+      }
+      if (m.t === 'pos' && m.done) seen.push('done');
+    };
+    const t0 = performance.now();
+    await Promise.race([globalThis.onmessage({ data: { url: 'https://gateway.test/rdp.php?a=replay', headers: {}, body: '', timed: true, ...o } }),
+      new Promise((r) => setTimeout(r, 3000))]);
+    globalThis.onmessage({ data: { cmd: 'stop' } });
+    globalThis.postMessage = (m) => posted.push(m);
+    return { seen, ms: performance.now() - t0 };
+  };
+  const vid = await videoRun({ from: 0, speed: 1, exp: true });
+  const fromPoint = (await videoRun({ from: 100, speed: 1 })).seen.filter((x) => x.startsWith('f7') || x.startsWith('f32'));
+  check('worker: a recording made into a video at once, its pictures asked for in time and waited for (not for sound or the microphone), each frame with its time; played from a point its sound and microphone left out up to there',
+    vid.seen.join() === 'f2@0,cap@0,ack,f1@10,f7@20,f32@25,f15@30,cap@67,ack,f1@200,cap@200,ack,f3@210,f7@215,f32@216,done'
+      && vid.ms < 1000 && fromPoint.join() === 'f7@215,f32@216', JSON.stringify({ vid, fromPoint }));
   globalThis.fetch = fetch0;
 }
 
@@ -1297,6 +1336,27 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   });
   check('audio: chunks of a format the page cannot play dropped, never thrown (the good one still played)',
     thrown.length === 0 && played.length === 1 && decodeAudio(fmts[4], new Uint8Array(4096)).length === 0, JSON.stringify({ thrown, played: played.length }));
+  // a recording played: the microphone on a line of its own (it does not push the session's sound back), nothing before
+  // its format, nothing of a format it could not have had, nothing muted
+  const starts = [];
+  ctx.createBufferSource = () => ({ connect() {}, start(at) { starts.push(at); } });
+  const q = new AudioPlayer();
+  q.ctx = ctx;
+  q.onMessage(new Uint8Array([70, ...new TextEncoder().encode(JSON.stringify([fmts[0]]))]));
+  q.micData(new Uint8Array(882));                       // no format yet
+  q.micFormat(Uint8Array.of(1, 0x44, 0xac, 0, 0, 1));    // 44100 Hz, mono
+  q.onMessage(new Uint8Array([87, 0, 0, ...new Uint8Array(17640)]));   // 0.1 s of the session's sound
+  q.micData(new Uint8Array(8820));                      // 0.1 s of the microphone
+  q.micData(new Uint8Array(8820));
+  const heard = starts.map((x) => +x.toFixed(3));
+  q.micFormat(Uint8Array.of(1, 0, 0, 0, 0, 1));          // a rate of 0: no format
+  const badFmt = q.micFmt;
+  q.micData(new Uint8Array(8820));
+  q.micFormat(Uint8Array.of(1, 0x44, 0xac, 0, 0, 1));
+  q.setMuted(true);
+  q.micData(new Uint8Array(8820));
+  check('audio: a recording\'s microphone played on a line of its own, after its format; none of a bad format or muted',
+    heard.join() === '0.06,0.06,0.16' && starts.length === 3 && badFmt === null && q.micNext === 0, JSON.stringify({ starts, badFmt, micNext: q.micNext }));
 }
 
 { // microphone: the gateway's word passed to the capture; audio joined to the piece still waiting (at most max bytes, whole
@@ -1538,6 +1598,54 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
       && req.headers['X-CSRF'] === 'x' && sent.length === n0 && pos === 6000 && pw.msgs.at(-1)?.cmd === 'pause' && told === null,
     JSON.stringify({ rec, req, sent: sent.length - n0, pos, last: pw.msgs.at(-1), told }));
   p.stop();
+
+  // the page told who records (the connection, an administrator or its user) and a recording started in the session that
+  // could not be written; a recording made into a video: asked for so, each picture taken (onCapture) before the worker goes
+  // on, its sound with its time; one that fails ends it
+  let by = null;
+  s.onRecording = (on, who, error) => { by = [on, who, error]; };
+  wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode('{"recording":false,"record_error":"record_failed"}') } });
+  const byFailed = by;
+  wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode('{"recording":true,"record_by":"admin"}') } });
+  const v = new RdpSession({ container: new El(), canvas: new El(), keyboard: new El(), conn: { id: '', name: '' }, csrf: 'x', retries: 0,
+    replay: { sid: 'abc', from: 0, speed: 1, video: true }, onState: () => {} });
+  const caps = [], sounds = [];
+  let release = null;
+  v.onCapture = (ms) => { caps.push(ms); return new Promise((r) => { release = r; }); };
+  v.audio = { onMessage: (d, ms) => sounds.push([d[0], ms]) };
+  v.start();
+  await tick();
+  const vw = workers.at(-1), vreq = vw.msgs.at(-1);
+  vw.onmessage({ data: { t: 'cap', ms: 66.7 } });
+  await tick();
+  const before = vw.msgs.filter((m) => m.cmd === 'ack').length;
+  release();
+  await tick();
+  const after = vw.msgs.filter((m) => m.cmd === 'ack').length;
+  vw.onmessage({ data: { t: 'frame', type: 7, d: Uint8Array.of(87, 0, 0), ms: 1234 } });
+  const mics = [];
+  v.audio.micFormat = (d) => mics.push(['format', d[0]]);
+  v.audio.micData = (d, ms) => mics.push(['data', d[0], ms]);
+  vw.onmessage({ data: { t: 'frame', type: 13, d: Uint8Array.of(1, 0x80, 0xbb, 0, 0, 1), ms: 1300 } });
+  vw.onmessage({ data: { t: 'frame', type: 32, d: Uint8Array.of(9, 9), ms: 1310 } });
+  const liveMic = [];
+  s.mic = { onMessage: (d) => liveMic.push(d[0]) };
+  s.audio = { micFormat: () => liveMic.push('replay only'), onMessage: () => {} };
+  wk.onmessage({ data: { t: 'frame', type: 13, d: Uint8Array.of(1, 0x80, 0xbb, 0, 0, 1) } });
+  v.onCapture = () => Promise.reject(new Error('encoder'));
+  vw.onmessage({ data: { t: 'cap', ms: 133 } });
+  await tick();
+  check('recording: who records told, and a recording that could not be written; made into a video: each picture taken before the worker goes on, its sound and microphone with their time, a failure ends it; a live session\'s microphone only to its capture',
+    JSON.stringify(byFailed) === '[false,null,"record_failed"]' && JSON.stringify(by) === '[true,"admin",null]' && vreq.exp === true
+      && caps.join() === '66.7' && before === 0 && after === 1 && JSON.stringify(sounds) === '[[87,1234]]' && vw.msgs.at(-1)?.cmd === 'stop'
+      && JSON.stringify(mics) === '[["format",1],["data",9,1310]]' && JSON.stringify(liveMic) === '[1]',
+    JSON.stringify({ byFailed, by, exp: vreq.exp, caps, before, after, sounds, mics, liveMic, last: vw.msgs.at(-1) }));
+  v.stop();
+  // the page done with a session (a recording's player left, a video made): its sound's audio context closed with it
+  let closed = false;
+  v.audio = { close: () => { closed = true; } };
+  v.dispose();
+  check('session: its audio context closed when the page is done with it', closed);
 }
 
 {
@@ -1624,6 +1732,114 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   check('the lane: a folder\'s answer lost sent again 3 times at most, a picture not; again when the gateway was busy, not to a session gone; connected again for a guest: the camera let go, answers waiting left out',
     JSON.stringify(lost) === JSON.stringify(['20:80', '18:4', '20:80', '20:80', '20:80']) && JSON.stringify(busy) === JSON.stringify(['20:81', '20:81', '20:82'])
     && camStops === 1 && JSON.stringify(reset) === '[90,91]', JSON.stringify({ lost, busy, camStops, reset }));
+  // a recording started in the session, made in this page: begun when the gateway says so (record_video: its number), with
+  // sound when the session has sound or the microphone (a browser that cannot record says so on the lane at once); the
+  // session's sound formats and microphone's kept for it, and its sound and microphone given to it; the same number again:
+  // the same recording; stopped when the gateway says so; its pieces on the lane one at a time, in order, after the
+  // folder's answers and before a picture; one lost sent again at once ahead of the next, 3 times at most; the session
+  // over: let go; never for a guest
+  const recLane = [];
+  let recFail = 0, recStatus404 = false;
+  hold = [];
+  globalThis.fetch = (url, o) => {
+    recLane.push([o.body[4], o.body[4] === 22 ? new DataView(o.body.buffer).getUint32(7, true) : o.body[5], o.body[4] === 22 ? o.body[11] : 0]);
+    if (o.body[4] === 22 && recFail > 0) { recFail--; return Promise.reject(new TypeError('network')); }
+    if (o.body[4] === 22 && recStatus404) return Promise.resolve({ ok: false, status: 404 });
+    return new Promise((r) => hold.push(r));
+  };
+  const recStatus = (j) => wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify(j)) } });
+  s.audio = { onMessage() {}, micFormat() {} };
+  wk.onmessage({ data: { t: 'frame', type: 7, d: Uint8Array.of(70, 91, 93) } });   // (its formats, before any recording)
+  recStatus({ recording: true, record_by: 'owner', record_video: 3 });
+  await tick(); await tick();
+  const realRec = s.recorder;
+  const begun = [realRec?.gen, realRec?.sound, recLane.map((x) => x.join(':')).join(), s.soundFormats?.[0]];
+  hold.splice(0).forEach((r) => r({ ok: true }));
+  await tick();
+  const fed = [];
+  s.recorder = { gen: 3, onSound: (d) => fed.push('sound' + d[0]), micFormat: (d) => fed.push('micfmt' + d[0]), micData: (p) => fed.push('mic' + p.length),
+    stop: () => fed.push('stop'), dispose: () => fed.push('dispose'), unlock() {} };
+  wk.onmessage({ data: { t: 'frame', type: 7, d: Uint8Array.of(87, 0, 0, 1, 2) } });
+  wk.onmessage({ data: { t: 'frame', type: 13, d: Uint8Array.of(1, 0x44, 0xac, 0, 0, 1) } });
+  s.sendMic(new Uint8Array(4), 100, 2);
+  recStatus({ recording: true, record_by: 'owner', record_video: 3 });
+  const sameKept = s.recorder?.gen === 3 && typeof s.recorder.onSound === 'function' && !fed.includes('stop');
+  recStatus({ recording: false });
+  const stopped = [fed.join(), s.recorder, s.micFormatMsg?.[0]];
+  const piece = (n) => { const m = new Uint8Array(12); m[0] = 22; new DataView(m.buffer).setUint32(3, n, true); return m; };
+  const l0 = recLane.length;
+  realRec.send(piece(0));                            // out at once
+  realRec.send(piece(1));                            // waits: one at a time
+  s.sendFolderReply(70, new Uint8Array(3));          // out (two out)
+  s.sendCam(new Uint8Array(10), 4);                  // waits, after the next piece
+  const order1 = recLane.slice(l0).map((x) => x.join(':'));
+  hold.splice(0).forEach((r) => r({ ok: true }));
+  await tick(); await tick();
+  hold.splice(0).forEach((r) => r({ ok: true }));
+  await tick(); await tick();
+  const order2 = recLane.slice(l0 + order1.length).map((x) => x.join(':'));
+  // one that did not get there waits ahead of the next ones, sent again with each next piece (about a second apart)
+  const flush = async () => { for (let i = 0; i < 6; i++) { await tick(); hold.splice(0).forEach((r) => r({ ok: true })); } };
+  const l1 = recLane.length;
+  recFail = 2;
+  realRec.send(piece(2));
+  await flush();
+  const waited = [recLane.slice(l1).map((x) => x[1]).join(), s.lane.rec.length];
+  realRec.send(piece(3));
+  await flush();
+  realRec.send(piece(4));
+  await flush();
+  const resent = recLane.slice(l1).map((x) => x[1]).join();
+  // ... 10 times at most: then given up, the waiting ones left out (the recorder told: its REC_FAILED next)
+  const abandoned = [];
+  const rec0 = s.recorder;
+  s.recorder = { gen: 3, abandon: () => abandoned.push('abandon'), stop() {}, dispose() {}, unlock() {} };
+  const l2 = recLane.length;
+  recFail = 99;
+  for (let n = 5; n < 15; n++) { realRec.send(piece(n)); await flush(); }   // (its 10th time with the 10th piece)
+  recFail = 0;
+  const gaveUp = [recLane.slice(l2).filter((x) => x[1] === 5).length, abandoned.join(), s.lane.rec.length];
+  // refused by the gateway (404: not a piece it takes): given up at once
+  recStatus404 = true;
+  realRec.send(piece(20));
+  await flush();
+  recStatus404 = false;
+  gaveUp.push(abandoned.length, s.lane.rec.length);
+  // more than 32 MB waiting (an upload slower than the video): given up
+  hold = [];
+  globalThis.fetch = (url, o) => new Promise((r) => hold.push(r));
+  for (let n = 30; n < 35; n++) realRec.send(Object.assign(new Uint8Array(10 << 20), { 0: 22 }));   // (one out, 40 MB waiting)
+  gaveUp.push(abandoned.length, s.lane.rec.length);
+  hold.splice(0).forEach((r) => r({ ok: true }));
+  await flush();
+  s.recorder = rec0;
+  s.recorder = { gen: 4, dispose: () => fed.push('ended'), stop() {} };
+  s.onRecording = (on) => fed.push('said ' + on);
+  s.lane.rec.push(piece(9));
+  hold = null;
+  globalThis.fetch = fetch0;
+  wk.onmessage({ data: { t: 'end' } });
+  await tick();
+  const ended = [fed.slice(-2).join(), s.recorder, s.lane.rec.length];
+  // the page leaves the session (its view closed): the recorder let go at once (the worker ends without telling)
+  const left = [];
+  const s2 = await session();
+  s2.s.recorder = { gen: 1, dispose: () => left.push('disposed on stop'), stop() {} };
+  s2.s.stop();
+  left.push(s2.s.recorder);
+  s2.s.recorder = { gen: 1, dispose: () => left.push('disposed on dispose'), stop() {} };
+  s2.s.dispose();
+  left.push(s2.s.recorder);
+  const g = await session({ guest: { link: 'ab.cd' } });
+  g.wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify({ watch: 'control', sid: 's' })) } });
+  g.wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify({ recording: true, record_by: 'admin', record_video: 1 })) } });
+  const guestNone = g.s.recorder === null;
+  check('recording made in this page: begun with the gateway\'s number (with sound; a browser that cannot record says so at once), the sound and microphone given to it, stopped when told; its pieces one at a time in order on the lane (after the folder\'s answers, before a picture), one that did not get there sent again with each next piece (10 times at most), then given up, as one refused or more than 32 MB waiting; let go with the session, and when the page leaves it (no longer said: a new connection is not recorded unless started again); never for a guest',
+    JSON.stringify(begun) === JSON.stringify([3, true, '22:0:5', 70]) && sameKept && JSON.stringify(stopped) === JSON.stringify(['sound87,micfmt1,mic4,stop', null, 1])
+      && JSON.stringify(order1) === JSON.stringify(['22:0:0', '20:70:0']) && JSON.stringify(order2) === JSON.stringify(['22:1:0', '18:4:0'])
+      && JSON.stringify(waited) === '["2",1]' && resent === '2,2,2,3,4' && JSON.stringify(gaveUp) === '[10,"abandon",0,2,0,3,0]'
+      && JSON.stringify(left) === '["disposed on stop",null,"disposed on dispose",null]' && JSON.stringify(ended) === JSON.stringify(['ended,said false', null, 0]) && guestNone,
+    JSON.stringify({ begun, sameKept, stopped, order1, order2, waited, resent, gaveUp, left, ended, guestNone }));
   s.stop();
 }
 

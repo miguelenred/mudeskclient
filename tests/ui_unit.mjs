@@ -30,6 +30,7 @@ class El extends Node0 {
   constructor(tag) {
     super();
     Object.assign(this, { tagName: tag.toUpperCase(), childNodes: [], parentNode: null, attrs: {}, l: {}, style: {}, value: '', checked: false });
+    if (this.tagName === 'VIDEO') this.play = async () => {};   // (a media element: played by the browser)
     this.dataset = new Proxy({}, { get: (_, k) => this.attrs['data-' + String(k)], set: (_, k, v) => { this.attrs['data-' + String(k)] = String(v); return true; } });
   }
   get className() { return this.attrs.class || ''; }
@@ -45,6 +46,7 @@ class El extends Node0 {
   get isConnected() { let n = this; while (n.parentNode) n = n.parentNode; return n === document.documentElement; }
   setAttribute(k, v) { this.attrs[k] = String(v); }
   getAttribute(k) { return this.attrs[k] ?? null; }
+  removeAttribute(k) { delete this.attrs[k]; if (k === 'src') delete this.src; }
   append(...cs) { for (const c of cs) { const n = c instanceof Node0 ? c : new Text0(String(c)); n.parentNode?.removeChild(n); n.parentNode = this; this.childNodes.push(n); } }
   appendChild(c) { this.append(c); return c; }
   removeChild(c) { this.childNodes = this.childNodes.filter((x) => x !== c); c.parentNode = null; }
@@ -153,7 +155,7 @@ const go = async (hash) => { location.hash = hash; (winL.hashchange || []).forEa
 const byText = (text, root = appEl) => root.querySelectorAll('button,a').find((b) => b.textContent === text);
 const submit = (form) => form.dispatchEvent(new Ev('submit'));
 
-const { t } = await import('../public/assets/i18n.js');
+const { t, getLang } = await import('../public/assets/i18n.js');
 await import('../public/assets/app.js');
 await settle();
 
@@ -208,7 +210,6 @@ await settle();
   const begin = calls.find((c) => c.action === 'totp.begin');
   check('profile: TOTP is set up with the current password', begin?.password === 'pass-1', JSON.stringify(begin));
   check('profile: a key too long for a QR code is still shown to type in', appEl.textContent.includes(secret));
-
   answers['passkey.create.begin'] = () => ({ error: 'invalid_password' });
   if (unnamed[1]) unnamed[1].value = 'pass-2';
   byText(t('passkey_add'))?.click();
@@ -216,6 +217,22 @@ await settle();
   const pk = calls.find((c) => c.action === 'passkey.create.begin');
   check('profile: a passkey is added with the current password', pk?.password === 'pass-2', JSON.stringify(pk));
   check('profile: the error is announced (role=alert)', appEl.querySelectorAll('.error').some((e) => e.getAttribute('role') === 'alert' && e.textContent === t('e_invalid_password')));
+  // one that fits: its QR code drawn as nodes, an SVG of a white square and the black modules; no markup parsed anywhere (the
+  // page's scripts set no innerHTML: before, the QR code's markup went in that way)
+  answers['totp.begin'] = () => ({ secret, uri: `otpauth://totp/MuDeskClient:ana?secret=${secret}&issuer=MuDeskClient` });
+  await go('#/profile');
+  const pwQr = appEl.querySelectorAll('input[type=password]').filter((i) => !i.getAttribute('name'))[0];
+  if (pwQr) pwQr.value = 'pass-1';
+  byText(t('enable'))?.click();
+  await settle();
+  const svg = appEl.querySelector('.qr')?.children[0];
+  const { readdirSync, readFileSync } = await import('node:fs');
+  const dir = new URL('../public/assets/', import.meta.url);
+  const markup = readdirSync(dir).filter((f) => f.endsWith('.js')).filter((f) => /\.(innerHTML|outerHTML)\s*=|insertAdjacentHTML/.test(readFileSync(new URL(f, dir), 'utf8')));
+  check('profile: the QR code drawn as nodes (an SVG with its square and modules), no markup set by any script',
+    svg?.tagName === 'SVG' && svg.children.map((c) => c.tagName).join() === 'RECT,PATH' && /^(M\d+ \d+h1v1h-1z)+$/.test(svg.children[1].getAttribute('d') ?? '')
+    && /^0 0 \d+ \d+$/.test(svg.getAttribute('viewBox') ?? '') && markup.length === 0, JSON.stringify([svg?.tagName, markup]));
+
 }
 
 // ------------------------------------------------------------ audit: export and searches
@@ -371,9 +388,179 @@ await settle();
   wk.onmessage({ data: { t: 'end' } });
   await settle();
   const certSaid = appEl.querySelector('.overlay')?.textContent || '';
+  // a computer never seen: its fingerprints shown to compare (SHA-256, and SHA-1 as Windows shows it, in groups of four),
+  // trusted only when the user says so (the next connection carries it); an administrator's box, ticked, trusts it for every
+  // user (also a renewed one in place of the one fixed); a user has no box and cannot accept one other than the one fixed
+  // (before, a first certificate was trusted at once, unseen)
+  const sha256 = 'ab'.repeat(32), sha1 = 'cd'.repeat(20);
+  const endWith = async (j) => {
+    byText(t('accept_cert'), appEl.querySelector('.overlay'))?.click() || byText(t('reconnect'), appEl.querySelector('.overlay'))?.click();
+    await settle();
+    wk = workers.at(-1);
+    status(wk, { token: 'tk' });
+    status(wk, j);
+    wk.onmessage({ data: { t: 'end' } });
+    await settle();
+    return appEl.querySelector('.overlay');
+  };
+  const sent = () => JSON.parse(workers.at(-1).sent.find((m) => m.body)?.body || '{}');
+  const boxOf = (ov) => ov?.querySelectorAll('input[type=checkbox]')[0];
+  let ov = await endWith({ end: 'cert_new', detail: sha256, sha1 });
+  const newSaid = ov?.textContent || '';
+  const shown = ov?.querySelectorAll('.mono').map((p) => p.textContent) ?? [];
+  const adminBox = [boxOf(ov)?.checked, !!boxOf(ov)?.disabled];
+  byText(t('accept_cert'), ov)?.click();
+  await settle();
+  const adminSent = [sent().trust, sent().trust_all];
+  ov = await endWith({ end: 'cert_unexpected', detail: sha256, sha1 });
+  const adminRenew = [boxOf(ov)?.checked, !!boxOf(ov)?.disabled, !!byText(t('accept_cert'), ov)];
+  // connected, then connecting again to a computer never seen (a broker's other one): asked at once, never tried again unseen
+  byText(t('accept_cert'), ov)?.click();
+  await settle();
+  wk = workers.at(-1);
+  status(wk, { token: 'tk' });
+  status(wk, { connected: true });
+  await settle();
+  const late = [];
+  for (const end of ['cert_new', 'cert_unexpected']) {
+    if (end !== 'cert_new') {
+      byText(t('accept_cert'), appEl.querySelector('.overlay'))?.click();
+      await settle();
+      wk = workers.at(-1);
+      status(wk, { token: 'tk' });
+      status(wk, { connected: true });
+      await settle();
+    }
+    status(wk, { end, detail: sha256, sha1 });
+    wk.onmessage({ data: { t: 'end' } });
+    await settle();
+    late.push(!!byText(t('accept_cert'), appEl.querySelector('.overlay')));
+  }
+  const lateNew = late.join() === 'true,true';
+  STATE.user.role = 'user';
+  ov = await endWith({ end: 'cert_new', detail: sha256, sha1 });
+  const userBox = !boxOf(ov);
+  byText(t('accept_cert'), ov)?.click();
+  await settle();
+  const userSent = [sent().trust, sent().trust_all];
+  ov = await endWith({ end: 'cert_unexpected', detail: sha256, sha1 });
+  const unexpected = [ov?.textContent.startsWith(t('r_cert_unexpected') + t('cert_unexpected_text')), !byText(t('accept_cert'), ov), !!byText(t('close'), ov), !boxOf(ov)];
+  STATE.user.role = 'admin';
   answers['conns.list'] = list0;
-  check('session: a password the gateway refused asked again; a changed certificate says whose it is', askedAgain && certSaid.startsWith(t('r_cert_changed_host', 'rdg.empresa.com') + t('cert_changed')),
+  check('session: a password the gateway refused asked again; a changed certificate says whose it is', askedAgain && certSaid.startsWith(t('r_cert_changed_host', 'rdg.empresa.com') + t('cert_changed_text')),
     JSON.stringify({ askedAgain, certSaid }));
+  check('session: a computer never seen shows its SHA-256 and SHA-1 to compare and is trusted only when the user says so (also met when connecting again); an administrator’s box trusts it for every user (a renewed one too); a user cannot accept one other than the one fixed',
+    newSaid.startsWith(t('r_cert_new') + t('cert_new_text')) && JSON.stringify(shown) === JSON.stringify(['ABAB '.repeat(16).trim(), 'CDCD '.repeat(10).trim()])
+    && JSON.stringify([adminBox, adminSent, adminRenew, lateNew, userBox, userSent, unexpected]) === JSON.stringify([[true, false], [sha256, true], [true, true, true], true, true, [sha256, false], [true, true, true, true]]),
+    JSON.stringify({ newSaid, shown, adminBox, adminSent, adminRenew, lateNew, userBox, userSent, unexpected }));
+}
+
+// ------------------------------------------------------------ the data folder readable from the browser
+
+{
+  // read at either place (the page's folder or the one above): what it read goes to the gateway, and the page loads again only
+  // when the gateway took it (its code now); not readable: said once per browser session, nothing sent
+  const { checkDataFolder } = await import('../public/assets/datacheck.js');
+  const run = async (answers, kept = null, stopped = true) => {
+    const prefs = kept === null ? {} : { 'mudesk-data-check': kept }, sent = [], asked = [];
+    let reloaded = 0;
+    const read = await checkDataFolder({ base: 'https://h.test/mudesk/public/', pref: (k, v) => (v === undefined ? prefs[k] ?? null : (prefs[k] = v)),
+      api: async (a, b) => { sent.push([a, b]); return { stopped }; }, reload: () => { reloaded++; },
+      get: async (u) => { asked.push(String(u)); const body = answers[String(u)]; return { ok: body !== undefined, text: async () => body ?? '' }; } });
+    return { read, sent, asked, reloaded, pref: prefs['mudesk-data-check'] };
+  };
+  const code = 'MuDeskClient data folder: must not be reachable from the web\n' + 'f'.repeat(32) + '\n';
+  const open = await run({ 'https://h.test/mudesk/data/web-check.txt': code });
+  const closed = await run({});
+  const known = await run({ 'https://h.test/mudesk/data/web-check.txt': code }, '0');
+  const refused = await run({ 'https://h.test/mudesk/public/data/web-check.txt': code }, null, false);
+  check('data folder: what the browser read sent to the gateway, the page loaded again once it stopped; not readable, said once a session; a word it refused, no reload',
+    open.read && JSON.stringify(open.sent) === JSON.stringify([['data.exposed', { proof: code }]]) && open.reloaded === 1 && open.pref === '1'
+    && JSON.stringify(open.asked) === JSON.stringify(['https://h.test/mudesk/data/web-check.txt', 'https://h.test/mudesk/public/data/web-check.txt'])
+    && !closed.read && closed.sent.length === 0 && closed.pref === '0' && known.asked.length === 0 && !known.read
+    && refused.read && refused.reloaded === 0, JSON.stringify({ open, closed, known, refused }));
+}
+
+// ------------------------------------------------------------ administration: a backup
+
+{
+  // made with its password twice (not the same: said, nothing asked), the users' folders when ticked, downloaded at the
+  // address the gateway gives; restored only after yes: the file sent in pieces of 2 MB, in order, with the CSRF token, then
+  // restored with its password; the page loads again (signed out)
+  answers['admin.backup.prepare'] = () => ({ id: '0123456789abcdef' });
+  answers['admin.backup.restore'] = () => ({ ok: true });
+  await go('#/admin/backup');
+  const pws = appEl.querySelectorAll('input[type=password]');
+  const boxes = appEl.querySelectorAll('input[type=checkbox]');
+  pws[0].value = 'Clave-de-copia-1';
+  pws[1].value = 'otra';
+  const c0 = calls.length;
+  byText(t('bk_download'))?.click();
+  await settle();
+  const mismatch = [appEl.textContent.includes(t('e_backup_mismatch')), calls.length === c0];
+  pws[1].value = 'Clave-de-copia-1';
+  boxes[0].checked = true;
+  const href0 = location.href;
+  byText(t('bk_download'))?.click();
+  await settle();
+  const prep = calls.filter((c) => c.action === 'admin.backup.prepare').at(-1);
+  const href = location.href;
+  location.href = href0;
+  const fetch0 = globalThis.fetch;
+  const pieces = [];
+  globalThis.fetch = (url, o = {}) => (String(url).startsWith('backup.php')
+    ? (pieces.push([String(url), o.body.size, o.headers['X-CSRF']]), Promise.resolve({ ok: true, json: async () => ({ ok: true }) })) : fetch0(url, o));
+  let reloaded = 0;
+  location.reload = () => { reloaded++; };
+  const fileIn = appEl.querySelector('input[type=file]');
+  fileIn.files = [new File([new Uint8Array(5 * 1048576)], 'copia.mudeskbackup')];
+  pws[2].value = 'Clave-de-copia-1';
+  const c1 = calls.length;
+  byText(t('bk_restore'))?.click();
+  await settle();
+  const askedFirst = pieces.length === 0 && calls.length === c1;
+  document.body.querySelectorAll('button').find((b) => b.textContent === t('yes'))?.click();
+  for (let i = 0; i < 6; i++) await settle();
+  globalThis.fetch = fetch0;
+  const rest = calls.filter((c) => c.action === 'admin.backup.restore').at(-1);
+  const ids = [...new Set(pieces.map(([u]) => new URLSearchParams(u.split('?')[1]).get('id')))];
+  timers.filter((x) => x.ms === 1500).forEach((x) => x.f());   // (the page loaded again after the toast)
+  delete answers['admin.backup.prepare'];
+  delete answers['admin.backup.restore'];
+  check('backup: made with its password twice (else said), the folders when ticked, downloaded at its address; restored after yes, sent in pieces of 2 MB in order, then with its password; the page loaded again',
+    JSON.stringify(mismatch) === '[true,true]' && prep?.password === 'Clave-de-copia-1' && JSON.stringify(prep?.with) === '["files"]' && href === 'backup.php?a=download&id=0123456789abcdef'
+    && askedFirst && JSON.stringify(pieces.map(([u, n, c]) => [new URLSearchParams(u.split('?')[1]).get('o'), n, !!c])) === JSON.stringify([['0', 2097152, true], ['2097152', 2097152, true], ['4194304', 1048576, true]])
+    && ids.length === 1 && /^[0-9a-f]{16}$/.test(ids[0]) && rest?.id === ids[0] && rest?.password === 'Clave-de-copia-1' && reloaded === 1,
+    JSON.stringify({ mismatch, prep, href, askedFirst, pieces: pieces.map(([u, n]) => [u, n]), rest, reloaded }));
+}
+
+// ------------------------------------------------------------ administration: the status
+
+{
+  // now: figures, the memory and disk meters (their colour by how close to the limit), the problems, the server; the last 30
+  // days: a column a day (sessions; most at once with the limit drawn), the hover giving the day's figures, the computers used
+  // most as ranked bars with their hours, each chart with its table
+  answers['admin.status'] = () => ({ status: { sessions: 3, limit: 20, guests: 1, recording: 1, processes: 4, memory: { sessions: 30 << 20, largest: 100 << 20, limit: 128 << 20 },
+    disk: { free: 10 * 2 ** 30, total: 100 * 2 ** 30, recordings: 2 ** 30, recordings_count: 7 }, housekeeping: '2026-11-24T10:00:00+01:00', load: [0.5, 0.4, 0.3],
+    problems: { login_fail: 5, session_error: 2, cert_mismatch: 0, access_denied: 1 }, server: { version: '1.2.0', php: '8.4.1', sapi: 'fpm-fcgi', os: 'Linux 6', openssl: 'OpenSSL 3', time_limit: 0 } } });
+  const days = Array.from({ length: 30 }, (_, i) => ({ day: new Date(Date.UTC(2026, 9, 26 + i)).toISOString().slice(0, 10), sessions: i % 3, hours: i / 2, peak: i % 4 }));
+  answers['admin.usage'] = () => ({ days, hosts: [{ host: 'pc1.test', hours: 12.5, sessions: 9 }, { host: 'pc2.test', hours: 3, sessions: 2 }] });
+  await go('#/admin/status');
+  await settle();
+  const text = appEl.textContent;
+  const charts = appEl.querySelectorAll('svg.chart');
+  const bars = charts.map((s) => s.querySelectorAll('.chart-col').length);
+  const meters = appEl.querySelectorAll('.meter').map((m) => [m.className, m.getAttribute('aria-valuenow')]);
+  charts[0]?.querySelectorAll('.hit')[29]?.dispatchEvent(new Ev('pointerenter'));
+  const tip = appEl.querySelector('.chart-tip')?.textContent || '';
+  const widths = appEl.querySelectorAll('.hbar-fill').map((f) => f.style.cssText);
+  const seen = { bars, meters, tip, widths, limit: charts[1]?.querySelectorAll('.limit').length, tables: appEl.querySelectorAll('details').filter((d) => d.className === 'chart-table').length,
+    said: [t('st_of_limit', '20'), t('st_login_fail'), '1.2.0', 'fpm-fcgi', 'pc1.test', '12,5 h'].map((x) => text.includes(x)) };
+  delete answers['admin.status'];
+  delete answers['admin.usage'];
+  check('administration status: figures, meters by how close to their limit, problems and server; a column a day with the day’s figures on hover, the limit drawn, the computers used most, each with its table',
+    JSON.stringify(seen.bars) === '[20,22]' && JSON.stringify(seen.meters) === JSON.stringify([['meter warn', '78'], ['meter danger', '90']]) && seen.tip.includes('14,5') && seen.tip.includes(t('st_t_sessions'))
+    && JSON.stringify(seen.widths) === JSON.stringify(['width:100.0%', 'width:24.0%']) && seen.limit === 1 && seen.tables === 2 && seen.said.every(Boolean), JSON.stringify(seen));
 }
 
 // ------------------------------------------------------------ session toolbar: on-screen keyboard and clipboard history
@@ -1403,6 +1590,14 @@ await settle();
   answers['admin.user.save'] = (b) => { saves.push([b.role, b.username ?? b.id]); hoursSent.push(b.hours); return { user: {} }; };
   await go('#/admin/users');
   check('admin: warned while all remote computers are allowed', appEl.textContent.includes(t('targets_all_warn')));
+  // the hosting diagnostics (check.php) left in the public folder: the administrator told (administration pages, as the
+  // warning above) until it is gone
+  STATE.user.check_php = true;
+  await go('#/admin/settings');
+  const checkWarned = appEl.textContent.includes(t('check_php_left'));
+  STATE.user.check_php = false;
+  await go('#/admin/users');
+  check('admin: warned while the hosting diagnostics stay in the public folder', checkWarned && !appEl.textContent.includes(t('check_php_left')));
   byText(t('new_user')).click();
   await settle();
   const newForm = document.body.querySelector('.modal')?.querySelector('form');
@@ -1460,8 +1655,8 @@ await settle();
   STATE.user.role = role;
   await go('#/admin/sessions');
   const endForAdmin = !!byText(t('terminate'));
-  check('auditor: the administration with the audit log and the active sessions only, no session ended; an administrator still ends them',
-    navAdmin && JSON.stringify(tabLinks) === JSON.stringify(['#/admin/audit', '#/admin/sessions']) && noEnd && usersBlocked && endForAdmin,
+  check('auditor: the administration with the audit log, the active sessions, the recordings and the status only, no session ended; an administrator still ends them',
+    navAdmin && JSON.stringify(tabLinks) === JSON.stringify(['#/admin/audit', '#/admin/sessions', '#/admin/recordings', '#/admin/status']) && noEnd && usersBlocked && endForAdmin,
     JSON.stringify({ navAdmin, tabLinks, noEnd, usersBlocked, endForAdmin }));
   delete answers['admin.sessions'];
 }
@@ -1535,7 +1730,8 @@ await settle();
   check('sign-in: a code already used says to wait for the next one, the field is emptied', form.code.value === ''
     && appEl.querySelectorAll('.error').some((e) => e.textContent === t('e_code_used')), appEl.querySelector('.error')?.textContent);
 
-  // signed in: the previous sign-in and the failed attempts since then, until closed
+  // signed in: the failed attempts since the last sign-in, until closed, only when there were some (never the last
+  // sign-in itself)
   answers['conns.list'] = () => ({ conns: [CONN], keyboards: [0x040A] });
   answers.state = () => STATE;
   answers.login = () => ({ ...STATE, previous: { login: '2026-11-17T08:00:00+01:00', ip: '198.51.100.7', failures: 3,
@@ -1544,7 +1740,7 @@ await settle();
   submit(form);
   await settle();
   const note = appEl.querySelector('[role=status]');
-  check('sign-in: the last sign-in and the failures since then are shown', !!note && note.textContent.includes('198.51.100.7') && note.textContent.includes('203.0.113.66')
+  check('sign-in: the failures since the last sign-in are shown, not that sign-in', !!note && !note.textContent.includes('198.51.100.7') && note.textContent.includes('203.0.113.66')
     && note.textContent.includes(t('prev_failures', 3, '', '').slice(0, 20)), note?.textContent);
   note?.querySelector('button').click();
   await go('#/conns');
@@ -2265,6 +2461,57 @@ await settle();
   delete answers['conns.save'];
   check('connections: the microphone box unticked for a new connection, saved when ticked', unticked && micSaved?.mic === true && micSaved?.host === 'micro.test',
     JSON.stringify({ unticked, mic: micSaved?.mic }));
+  // an administrator's field: the computer's certificate for every connection to it, shown as fixed now and fixed when changed
+  // (before the connection is saved: a fingerprint refused saves nothing); none for a user
+  answers['admin.certs'] = () => ({ certs: { 'rdp:pc.test:3389': { fp: 'ab'.repeat(20), by: 'ana', at: '' } } });
+  answers['admin.cert.fix'] = () => ({ certs: {} });
+  answers['conns.save'] = (b) => ({ conn: { ...b.conn } });
+  const editOf = () => appEl.querySelectorAll('button').find((b) => b.getAttribute('title') === t('edit'));
+  await go('#/conns');
+  editOf()?.click();
+  await settle();
+  const me = document.body.querySelectorAll('.modal').at(-1);
+  const fixField = me?.querySelector('[name=cert_fixed]');
+  const fixShown = fixField?.value;
+  if (fixField) fixField.value = 'CD:'.repeat(19) + 'CD';
+  const c0 = calls.length;
+  byText(t('save'), me)?.click();
+  await settle();
+  const fixOrder = calls.slice(c0).map((c) => c.action).filter((a) => ['admin.cert.fix', 'conns.save'].includes(a));
+  const fixCall = calls.slice(c0).find((c) => c.action === 'admin.cert.fix');
+  // the field follows the computer: another name shows that one's (none here), and nothing is fixed on saving (before, the
+  // first one's stayed and was taken as unchanged); one typed in stays, fixed for the new name
+  const moved = [];
+  for (const typed of [null, 'ef'.repeat(32)]) {
+    await go('#/conns');
+    editOf()?.click();
+    await settle();
+    const mx = document.body.querySelectorAll('.modal').at(-1);
+    const fx = mx?.querySelector('[name=cert_fixed]'), hx = mx?.querySelector('[name=host]');
+    if (typed) fx.value = typed;
+    if (hx) { hx.value = typed ? 'nuevo.test' : 'otro.test'; hx.dispatchEvent(new Ev('input')); }
+    const cx = calls.length;
+    moved.push(fx?.value);
+    byText(t('save'), mx)?.click();
+    await settle();
+    moved.push(calls.slice(cx).filter((c) => c.action === 'admin.cert.fix').map((c) => [c.host, c.fingerprint]));
+  }
+  STATE.user.role = 'user';
+  await go('#/conns');
+  editOf()?.click();
+  await settle();
+  const mu = document.body.querySelectorAll('.modal').at(-1);
+  const userField = !!mu?.querySelector('[name=cert_fixed]');
+  byText(t('cancel'), mu)?.click();
+  await settle();
+  STATE.user.role = 'admin';
+  delete answers['admin.certs'];
+  delete answers['admin.cert.fix'];
+  delete answers['conns.save'];
+  check('connections: an administrator fixes the computer’s certificate for every connection to it (shown, fixed before the connection is saved; the field follows the computer); a user has no such field',
+    fixShown === 'ab'.repeat(20) && JSON.stringify(fixOrder) === '["admin.cert.fix","conns.save"]' && fixCall?.host === 'pc.test' && fixCall?.port === 3389
+    && fixCall?.fingerprint === 'CD:'.repeat(19) + 'CD' && !userField
+    && JSON.stringify(moved) === JSON.stringify(['', [], 'ef'.repeat(32), [['nuevo.test', 'ef'.repeat(32)]]]), JSON.stringify({ fixShown, fixOrder, fixCall, userField, moved }));
   // the connect dialog: an info button beside the microphone (the browser's permission, the Windows policy step by step,
   // the registry command and the audio service's) and beside the screens (this browser's permission first: Window
   // Management in Chrome and Edge, pop-ups in Firefox and Safari)
@@ -2346,7 +2593,8 @@ await settle();
   // address, revokes it; while guests watch, how many is always in sight
   Object.assign(CONN, { clipboard: false, ask: true, app: '' });
   answers['session.shares'] = () => ({ shares: [] });
-  answers['session.share'] = (b) => ({ id: 's1', mode: b.mode, link: 'abc.SECRET', shares: [{ id: 's1', mode: b.mode, created: '2026-11-20T10:00:00+01:00' }] });
+  answers['session.share'] = (b) => ({ id: 's1', mode: b.mode, link: 'abc.SECRET', shares: [{ id: 's1', mode: b.mode, created: '2026-11-20T10:00:00+01:00',
+    expires: b.minutes ? '2026-11-20T10:15:00+01:00' : null }] });
   answers['session.unshare'] = () => ({ shares: [] });
   await go('#/conns');
   await go('#/s/c1');
@@ -2380,6 +2628,19 @@ await settle();
   const revoked = calls.filter((c) => c.action === 'session.unshare').at(-1);
   status({ viewers: 0 });
   await settle();
+  // for a while: chosen before it is made (as long as the session by default), listed with its end
+  const until = panel.querySelectorAll('select')[1];
+  const untilFirst = until?.children[0]?.value;
+  until.value = '15';
+  until.dispatchEvent(new Ev('change'));
+  byText(t('share_make'), panel).click();
+  await settle();
+  const made15 = calls.filter((c) => c.action === 'session.share').at(-1);
+  const endSaid = panel.querySelector('li')?.textContent.includes(t('share_expires', new Date('2026-11-20T10:15:00+01:00').toLocaleTimeString(getLang(), { hour: '2-digit', minute: '2-digit' })));
+  check('sharing, the owner: a link for a while (as long as the session unless chosen), listed with its end', String(untilFirst) === '0' && made?.minutes === 0 && made15?.minutes === 15 && endSaid,
+    JSON.stringify({ untilFirst, made, made15, endSaid }));
+  byText(t('share_revoke'), panel).click();
+  await settle();
   check('sharing, the owner: links listed, made (view only by default) with their address, revoked; how many guests watch in sight',
     empty && firstMode === 'view' && made?.mode !== 'control' && /^[0-9a-f]{32}$/.test(made?.sid) && link === 'https://gateway.test/#/watch/abc.SECRET' && listed === 1
       && JSON.stringify(shown) === '[false,true,true]' && revoked?.id === 's1' && revoked?.sid === made?.sid && !panel.querySelector('.share-made')
@@ -2395,14 +2656,18 @@ await settle();
   await settle();
   const gBadge = appEl.querySelector('.watch-badge');
   const watching = [gBadge?.classList.contains('hidden'), gBadge?.textContent.trim(), !appEl.querySelector('.bar'), appEl.querySelector('.overlay')?.classList.contains('hidden')];
+  // its control unused for the administrator's minutes: told, watching on
+  gw?.onmessage?.({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify({ watch: 'view', owner: 'ana', conn: 'PC', sid: 'abc', control_ended: 'idle' })) } });
+  await settle();
+  const idleSaid = [document.body.querySelector('.toasts')?.textContent.includes(t('share_control_idle')), appEl.querySelector('.watch-badge')?.textContent.trim()];
   gw?.onmessage?.({ data: { t: 'end' } });
   await settle();
   const over = appEl.querySelector('.overlay')?.textContent || '';
-  check('sharing, a guest: the link\'s page watches the session (whose, with control or not), no toolbar; its end said',
+  check('sharing, a guest: the link\'s page watches the session (whose, with control or not), no toolbar; control lost when unused, said; its end said',
     req?.url?.endsWith('rdp.php?a=watch') && JSON.parse(req.body).link === 'abc.SECRET'
       && JSON.stringify(watching) === JSON.stringify([false, t('share_watching_control', 'ana', 'PC'), true, true])
-      && over.includes(t('share_over')) && over.includes(t('share_over_text')),
-    JSON.stringify({ req, watching, over }));
+      && over.includes(t('share_over')) && over.includes(t('share_over_text')) && JSON.stringify(idleSaid) === JSON.stringify([true, t('share_watching', 'ana', 'PC')]),
+    JSON.stringify({ req, watching, over, idleSaid }));
   await go('#/conns');
   delete answers['session.shares'];
   delete answers['session.share'];
@@ -2477,16 +2742,27 @@ await settle();
 // ------------------------------------------------------------ recorded sessions
 
 {
-  // the administrator's editors have "Record" (a user's own does not); the user sees the connection marked, is told in the
+  // the administrator's editors have "Record", also their own one (a user's own does not); the user sees the connection marked, is told in the
   // connect dialog and during the session; the audit plays a recorded session; the player: its position, speed, a jump and its end
   Object.assign(CONN, { record: true, ask: true, app: '', clipboard: false });
   await go('#/conns');
   const card = appEl.querySelectorAll('.badge').some((b) => b.textContent === t('rec_conn'));
   appEl.querySelectorAll('button').find((b) => b.getAttribute('title') === t('edit'))?.click();
   await settle();
+  const adminOwnEditor = !!document.body.querySelectorAll('.modal').at(-1)?.querySelector('[name=record]');   // (an administrator's own)
+  byText(t('cancel'), document.body)?.click();
+  await settle();
+  STATE.user.role = 'user';                              // a user's own editor: not there
+  await go('#/profile');
+  await go('#/conns');
+  appEl.querySelectorAll('button').find((b) => b.getAttribute('title') === t('edit'))?.click();
+  await settle();
   const userEditor = !!document.body.querySelectorAll('.modal').at(-1)?.querySelector('[name=record]');
   byText(t('cancel'), document.body)?.click();
   await settle();
+  STATE.user.role = 'admin';
+  await go('#/profile');
+  await go('#/conns');
   await go('#/s/c1');
   const dialog = (appEl.querySelector('.overlay')?.textContent || '').includes(t('rec_notice'));
   const form = appEl.querySelector('.overlay').querySelector('form');
@@ -2516,7 +2792,7 @@ await settle();
   const sid = 'ab'.repeat(16);
   answers['admin.audit'] = () => ({ rows: [{ t: '2026-11-20T10:00:00.000+01:00', ip: '203.0.113.9', user: 'ana', event: 'rdp_start', ok: true, sid, conn: 'PC', recording: true, _d: '2026-11-20', _n: 1 }],
     total: 1, events: {}, failures: 0 });
-  answers['admin.recording'] = () => ({ recording: { sid, user: 'ana', conn: 'PC', started: '2026-11-20T10:00:00+01:00', ended: '2026-11-20T10:02:05+01:00', seconds: 125, bytes: 1000 } });
+  answers['recording.info'] = () => ({ recording: { sid, user: 'ana', conn: 'PC', started: '2026-11-20T10:00:00+01:00', ended: '2026-11-20T10:02:05+01:00', seconds: 125, bytes: 1000 } });
   await go('#/admin/audit');
   const marked = (appEl.querySelector('tbody')?.textContent || '').includes(t('rec_conn'));
   appEl.querySelector('tbody').children[0].click();
@@ -2540,12 +2816,290 @@ await settle();
   await settle();
   const over = appEl.querySelector('.overlay')?.textContent || '';
   check('recording: set in the administrator\'s editors only; the user told (card, dialog, session); played from the audit with its position, speed, a jump and its end',
-    card && !userEditor && dialog && during && adminEditor && marked && hash === '#/rec/' + sid && first?.timed === true && JSON.parse(first?.body || '{}').sid === sid
+    card && adminOwnEditor && !userEditor && dialog && during && adminEditor && marked && hash === '#/rec/' + sid && first?.timed === true && JSON.parse(first?.body || '{}').sid === sid
       && time === '1:05 / 2:05' && speedCmd?.cmd === 'speed' && speedCmd?.v === 4 && jumped?.from === 90000 && jumped?.speed === 4 && over.includes(t('rec_end')),
-    JSON.stringify({ card, userEditor, dialog, during, adminEditor, marked, hash, first, time, speedCmd, jumped, over }));
+    JSON.stringify({ card, adminOwnEditor, userEditor, dialog, during, adminEditor, marked, hash, first, time, speedCmd, jumped, over }));
   delete answers['admin.audit'];
-  delete answers['admin.recording'];
+  delete answers['recording.info'];
   await go('#/conns');
+}
+{
+  // recording started and stopped in a session: the toolbar's button for whoever may (administrators; users when the settings
+  // allow it), following what the session says; one recorded by the connection or an administrator not stopped by a user
+  // (its button hidden for them); the active sessions: recorded or not, started and stopped by an administrator; the setting;
+  // the audit opening a recording by its own id; the player with its video download where the browser makes videos
+  Object.assign(CONN, { record: false, ask: true, app: '', clipboard: false });
+  const own0 = STATE.user.record_own, role0 = STATE.user.role;
+  STATE.user.record_own = true;
+  await go('#/conns');
+  await go('#/s/c1');
+  const form = appEl.querySelector('.overlay').querySelector('form');
+  const pw = form.querySelector('[name=password]');
+  if (pw) pw.value = 'pw';
+  submit(form);
+  await settle();
+  const wk = workers.at(-1);
+  const status = (j) => wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify(j)) } });
+  status({ token: 't9' });
+  status({ connected: true });
+  await settle();
+  const recBtn = () => appEl.querySelector('.bar').querySelectorAll('button').find((b) => [t('rec_start'), t('rec_stop')].includes(b.getAttribute('title')));
+  const offered = recBtn()?.getAttribute('title') === t('rec_start') && !recBtn().hidden;
+  const n0 = calls.length;
+  recBtn()?.click();
+  for (let i = 0; i < 3; i++) await settle();
+  const asked = calls.slice(n0).find((c) => c.action === 'session.record');
+  status({ recording: true, record_by: 'owner' });
+  await settle();
+  const recording = [recBtn()?.getAttribute('title') === t('rec_stop'), recBtn()?.classList.contains('on'), !appEl.querySelector('.rec-badge').classList.contains('hidden')];
+  STATE.user.role = 'user';
+  status({ recording: true, record_by: 'policy' });
+  await settle();
+  const lockedForUser = recBtn()?.hidden === true;
+  STATE.user.role = role0;
+  status({ recording: true, record_by: 'admin' });
+  await settle();
+  const adminStops = recBtn()?.hidden === false;
+  status({ recording: false, record_error: 'record_failed' });
+  await settle();
+  const failedSaid = (document.body.querySelector('.toasts')?.textContent || '').includes(t('e_record_failed'));
+  STATE.user.record_own = false;
+  await go('#/conns');
+  await go('#/s/c1');
+  const form2 = appEl.querySelector('.overlay').querySelector('form');
+  if (form2.querySelector('[name=password]')) form2.querySelector('[name=password]').value = 'pw';
+  submit(form2);
+  await settle();
+  workers.at(-1).onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode('{"token":"t10"}') } });
+  await settle();
+  const notOffered = !recBtn();
+  await go('#/conns');
+  // the active sessions
+  answers['admin.sessions'] = () => ({ sessions: [{ sid: 's1', user: 'ana', conn: 'Oficina', host: 'pc', ip: '1.2.3.4', started: '2026-11-20T10:00:00Z', record: true, record_by: 'policy' },
+    { sid: 's2', user: 'luis', conn: 'Casa', host: 'pc2', ip: '1.2.3.5', started: '2026-11-20T10:00:00Z', record: false }] });
+  await go('#/admin/sessions');
+  const rows = appEl.querySelector('tbody').children;
+  const marks = [rows[0].textContent.includes(t('rec_conn')), rows[1].textContent.includes(t('rec_conn'))];
+  const n1 = calls.length;
+  byText(t('rec_start'), rows[1])?.click();
+  byText(t('rec_stop'), rows[0])?.click();
+  for (let i = 0; i < 3; i++) await settle();
+  const adminCalls = calls.slice(n1).filter((c) => c.action === 'admin.sessions.record').map((c) => [c.sid, c.on]);
+  delete answers['admin.sessions'];
+  // the setting
+  answers['admin.settings'] = () => ({ settings: { clients: { mode: 'all', list: [] }, targets: { mode: 'all', list: [] }, record_users: false, timezone: '' }, server_timezone: 'UTC' });
+  await go('#/admin/settings');
+  const box = appEl.querySelectorAll('input').find((i) => i.getAttribute('name') === 'record_users');
+  const settingOff = !!box && !box.checked && appEl.textContent.includes(t('s_record_users_help'));
+  if (box) box.checked = true;
+  const n2 = calls.length;
+  byText(t('save'))?.click();
+  for (let i = 0; i < 3; i++) await settle();
+  const settingSaved = calls.slice(n2).find((c) => c.action === 'admin.settings' && c.settings)?.settings?.record_users;
+  delete answers['admin.settings'];
+  // the audit: a recording started in a session opened by its own id; its player offers the video where VideoEncoder is
+  const sid = 'cd'.repeat(16), rec = 'ef'.repeat(16);
+  answers['admin.audit'] = () => ({ rows: [{ t: '2026-11-20T10:00:00.000+01:00', ip: '203.0.113.9', user: 'ana', event: 'recording_start', ok: true, sid, rec, by: 'admin',
+    conn: 'PC', recording: true, _d: '2026-11-20', _n: 1 }], total: 1, events: {}, failures: 0 });
+  answers['recording.info'] = () => ({ recording: { id: rec, sid, user: 'ana', conn: 'PC', started: '2026-11-20T10:00:00+01:00', ended: '2026-11-20T10:02:05+01:00', seconds: 125,
+    sound: true, width: 1280, height: 720 } });
+  const video0 = [globalThis.VideoEncoder, globalThis.VideoFrame];
+  globalThis.VideoEncoder = class {};
+  globalThis.VideoFrame = class {};
+  await go('#/admin/audit');
+  appEl.querySelector('tbody').children[0].click();
+  await settle();
+  byText(t('rec_play'), document.body)?.click();
+  await settle();
+  const recHash = location.hash;
+  (winL.hashchange || []).forEach((f) => f());
+  for (let i = 0; i < 3; i++) await settle();
+  const videoBtn = !!appEl.querySelector('.rec-bar')?.querySelectorAll('button').find((b) => b.getAttribute('title') === t('rec_video'));
+  [globalThis.VideoEncoder, globalThis.VideoFrame] = [undefined, undefined];
+  await go('#/conns');
+  location.hash = '#/rec/' + rec;
+  (winL.hashchange || []).forEach((f) => f());
+  for (let i = 0; i < 3; i++) await settle();
+  const noVideoBtn = !appEl.querySelector('.rec-bar')?.querySelectorAll('button').find((b) => b.getAttribute('title') === t('rec_video'));
+  [globalThis.VideoEncoder, globalThis.VideoFrame] = video0;
+  delete answers['admin.audit'];
+  delete answers['recording.info'];
+  STATE.user.record_own = own0;
+  await go('#/conns');
+  check('recording in a session: the toolbar\'s button for whoever may, following the session; one of the connection or an administrator not stopped by a user; the active sessions; the setting; the audit by its id; the video offered where it can be made',
+    offered && asked?.on === true && asked?.sid && recording.every(Boolean) && lockedForUser && adminStops && failedSaid && notOffered
+      && JSON.stringify(marks) === '[true,false]' && JSON.stringify(adminCalls) === '[["s2",true],["s1",false]]' && settingOff && settingSaved === true
+      && recHash === '#/rec/' + rec && videoBtn && noVideoBtn,
+    JSON.stringify({ offered, asked, recording, lockedForUser, adminStops, failedSaid, notOffered, marks, adminCalls, settingOff, settingSaved, recHash, videoBtn, noVideoBtn }));
+}
+{
+  // a user's own recordings, in their own section (Recordings, in the menu of every user, also one who may not record: told
+  // so; an administrator's too, theirs there and every one in the administration): listed (one still being recorded marked, with no
+  // delete), watched, downloaded as a video (one made in the page: its file, its size said first; another made here, the
+  // room it may take said first), deleted only after saying yes; the player goes back to it
+  const own0 = STATE.user.record_own, role0 = STATE.user.role;
+  Object.assign(STATE.user, { record_own: true, role: 'user' });
+  const a = 'a1'.repeat(16), b = 'b2'.repeat(16), v = 'f6'.repeat(16);
+  let mine = [{ id: a, conn: 'PC', started: '2026-11-20T10:00:00+01:00', ended: '2026-11-20T10:01:05+01:00', seconds: 65, bytes: 2048, sound: true },
+    { id: b, conn: 'PC2', started: '2026-11-20T11:00:00+01:00', seconds: 0, bytes: 10, running: true },
+    { id: v, conn: 'PC3', started: '2026-11-20T12:00:00+01:00', ended: '2026-11-20T12:00:09+01:00', seconds: 9, bytes: 3 * 1048576, kind: 'video', mime: 'video/webm' }];
+  answers['recordings.mine'] = () => ({ recordings: mine });
+  answers['recordings.delete'] = (body) => { mine = mine.filter((r) => r.id !== body.id); return { ok: true }; };
+  const video0 = [globalThis.VideoEncoder, globalThis.VideoFrame];
+  [globalThis.VideoEncoder, globalThis.VideoFrame] = [class {}, class {}];
+  await go('#/conns');
+  const navLink = () => appEl.querySelector('nav')?.querySelectorAll('a').find((x) => x.getAttribute('href') === '#/recordings');
+  const inMenu = [navLink()?.textContent === t('recordings')];
+  await go('#/recordings');
+  for (let i = 0; i < 3; i++) await settle();
+  const page = () => appEl.querySelector('main');
+  const rows = () => page()?.querySelector('tbody')?.children || [];
+  const btnIn = (row, title) => row?.querySelectorAll('button').find((x) => x.getAttribute('title') === title);
+  const listed = [page()?.querySelector('.toolbar')?.children[0]?.textContent === t('my_recs'), rows().length, rows()[0]?.textContent.includes('1:05'),
+    rows()[1]?.textContent.includes(t('rec_badge')), !btnIn(rows()[1], t('delete')), !!btnIn(rows()[0], t('rec_video')),
+    !(page()?.textContent || '').includes(t('my_recs_off'))];   // (they may record: no notice)
+  // its video: first the room it may take, by how long it lasts; Cancel makes nothing
+  const w0 = workers.length, m0 = document.body.querySelectorAll('.modal').length;
+  document.body.querySelector('.toasts')?.replaceChildren();
+  btnIn(rows()[0], t('rec_video'))?.click();
+  await settle();
+  const sizeText = document.body.querySelectorAll('.modal').at(-1)?.textContent || '';
+  const roomSaid = sizeText.includes(t('rec_video_size').split('{0}')[0]) && /\d (KB|MB)/.test(sizeText);
+  byText(t('cancel'), document.body)?.click();
+  for (let i = 0; i < 3; i++) await settle();
+  const nothingMade = workers.length === w0 && document.body.querySelectorAll('.modal').length === m0 && !(document.body.querySelector('.toasts')?.textContent || '');
+  // one made in the page: its file's size said, also where this browser makes no video (nothing to make)
+  [globalThis.VideoEncoder, globalThis.VideoFrame] = [undefined, undefined];
+  await go('#/conns');
+  await go('#/recordings');
+  for (let i = 0; i < 3; i++) await settle();
+  const pageVideo = [!!btnIn(rows()[2], t('rec_video')), !btnIn(rows()[0], t('rec_video'))];
+  const f0 = rdpSent.length;
+  btnIn(rows()[2], t('rec_video'))?.click();
+  await settle();
+  const fileText = document.body.querySelectorAll('.modal').at(-1)?.textContent || '';
+  pageVideo.push(fileText.includes(t('rec_file_size', '3.0 MB').split('3.0 MB')[0]) && /3(\.|,)0 MB/.test(fileText));
+  byText(t('cancel'), document.body)?.click();
+  for (let i = 0; i < 3; i++) await settle();
+  pageVideo.push(rdpSent.length === f0 && document.body.querySelectorAll('.modal').length === m0);
+  [globalThis.VideoEncoder, globalThis.VideoFrame] = [class {}, class {}];
+  const n0 = calls.length;
+  btnIn(rows()[0], t('delete'))?.click();
+  await settle();
+  const asked = (document.body.querySelectorAll('.modal').at(-1)?.textContent || '').includes(t('rec_delete_q'));
+  byText(t('cancel'), document.body)?.click();
+  for (let i = 0; i < 3; i++) await settle();
+  const keptOnNo = !calls.slice(n0).some((c) => c.action === 'recordings.delete') && rows().length === 3;
+  btnIn(rows()[0], t('delete'))?.click();
+  await settle();
+  document.body.querySelectorAll('button').find((x) => x.textContent === t('yes'))?.click();
+  for (let i = 0; i < 4; i++) await settle();
+  const deleted = calls.slice(n0).find((c) => c.action === 'recordings.delete')?.id === a && rows().length === 2;
+  btnIn(rows()[0], t('rec_play'))?.click();
+  const played = location.hash === '#/rec/' + b;
+  answers['recording.info'] = () => ({ recording: mine[0] });
+  (winL.hashchange || []).forEach((f) => f());
+  for (let i = 0; i < 3; i++) await settle();
+  const backToList = appEl.querySelector('.rec-bar')?.querySelector('a')?.getAttribute('href') === '#/recordings';
+  // one made in the page, watched: its video read from the gateway (the recording's frames, read to their end), played by
+  // the browser's own player; the download offered once it is there
+  const fetch0 = globalThis.fetch;
+  const frame = (type, bytes) => { const f = new Uint8Array(9 + bytes.length); const dv = new DataView(f.buffer); dv.setUint8(4, type); dv.setUint32(5, bytes.length, true); f.set(bytes, 9); return f; };
+  const replayAsked = [];
+  globalThis.fetch = async (url, o = {}) => {
+    if (!String(url).includes('a=replay')) return fetch0(url, o);
+    replayAsked.push([JSON.parse(o.body).sid, o.signal]);
+    const body = [frame(33, new TextEncoder().encode('VIDEO-BYTES')), frame(0, new TextEncoder().encode('end'))];
+    return { ok: true, status: 200, body: new ReadableStream({ start(c) { body.forEach((x) => c.enqueue(x)); c.close(); } }) };
+  };
+  answers['recording.info'] = () => ({ recording: mine[1] });
+  await go('#/recordings');
+  await go('#/rec/' + v);
+  for (let i = 0; i < 6; i++) await settle();
+  const player = appEl.querySelector('video');
+  const src = player?.getAttribute('src') ?? player?.src;
+  const dlBtn = appEl.querySelector('.rec-bar')?.querySelectorAll('button').find((x) => x.getAttribute('title') === t('rec_video'));
+  // (each view of the page asks for it: the harness has the page loaded a few times, each one renders it)
+  const watched = [replayAsked.length >= 1 && replayAsked.every(([id, sig]) => id === v && sig && !sig.aborted), !!player && String(src).startsWith('blob:'), blobs.get(String(src))?.size === 11,
+    !!dlBtn && !dlBtn.disabled, appEl.querySelector('.overlay')?.classList.contains('hidden')];
+  await go('#/recordings');
+  watched.push(revoked.includes(String(src)));             // (its video let go once the player is left)
+  globalThis.fetch = fetch0;
+  delete answers['recording.info'];
+  STATE.user.record_own = false;                         // may not record, has none: the section there all the same, saying so
+  mine = [];
+  await go('#/conns');
+  inMenu.push(!!navLink());
+  await go('#/recordings');
+  for (let i = 0; i < 3; i++) await settle();
+  const notice = () => page()?.querySelectorAll('.banner').find((x) => x.textContent === t('my_recs_off'));
+  inMenu.push((page()?.textContent || '').includes(t('my_recs_none')) && !!notice() && notice().className.includes('warn'));
+  Object.assign(STATE.user, { record_own: true, role: 'admin' });   // an administrator too (theirs there; every one in the administration),
+  await go('#/conns');                                     // who always may record: no notice
+  inMenu.push(!!navLink());
+  await go('#/recordings');
+  for (let i = 0; i < 3; i++) await settle();
+  inMenu.push(!notice());
+  [globalThis.VideoEncoder, globalThis.VideoFrame] = video0;
+  delete answers['recordings.mine'];
+  delete answers['recordings.delete'];
+  Object.assign(STATE.user, { record_own: own0, role: role0 });
+  await go('#/conns');
+  // every recording for administrators (and auditors), in its own tab: who, which connection, who started it, watched and
+  // downloaded; deleted by an administrator only after saying yes (not one being recorded; an auditor only reads); the
+  // player goes back to that tab
+  let all = [
+    { id: 'c3'.repeat(16), user: 'ana', conn: 'PC', started: '2026-11-20T10:00:00+01:00', ended: '2026-11-20T10:00:30+01:00', seconds: 30, bytes: 500, started_as: 'admin', by: 'jefa' },
+    { id: 'd4'.repeat(16), user: 'luis', conn: 'PC2', started: '2026-11-20T09:00:00+01:00', ended: '2026-11-20T09:00:10+01:00', seconds: 10, bytes: 100, started_as: 'policy' },
+    { id: 'e5'.repeat(16), user: 'eva', conn: 'PC3', started: '2026-11-20T08:00:00+01:00', ended: '2026-11-20T08:00:05+01:00', seconds: 5, bytes: 50, started_as: 'owner' },
+    { id: 'f7'.repeat(16), user: 'eva', conn: 'PC3', started: '2026-11-20T07:00:00+01:00', bytes: 50, started_as: 'owner', kind: 'video', running: true },
+    { id: 'a9'.repeat(16), user: 'eva', conn: 'PC3', started: '2026-11-20T06:00:00+01:00', bytes: 40, started_as: 'owner', kind: 'video' }];   // (never closed: its process killed)
+  answers['admin.recordings'] = () => ({ keep_days: 30, recordings: all });
+  answers['admin.recordings.delete'] = (body) => { all = all.filter((r) => r.id !== body.id); return { ok: true }; };
+  STATE.user.role = 'admin';
+  [globalThis.VideoEncoder, globalThis.VideoFrame] = [class {}, class {}];
+  await go('#/admin/recordings');
+  for (let i = 0; i < 3; i++) await settle();
+  const allRows = () => appEl.querySelector('tbody')?.children || [];
+  const del = (row) => row?.querySelectorAll('button').find((x) => x.getAttribute('title') === t('delete'));
+  const allListed = [allRows().length, allRows()[0]?.textContent.includes(t('rec_by_admin', 'jefa')), allRows()[1]?.textContent.includes(t('rec_by_policy')),
+    allRows()[2]?.textContent.includes(t('rec_by_owner')), !!allRows()[0]?.querySelectorAll('button').find((x) => x.getAttribute('title') === t('rec_video')),
+    !!del(allRows()[0]), !del(allRows()[3]), allRows()[3]?.textContent.includes(t('rec_badge')), !!del(allRows()[4]), !allRows()[4]?.textContent.includes(t('rec_badge'))];
+  const d0 = calls.length;
+  del(allRows()[1])?.click();
+  await settle();
+  const adminAsked = (document.body.querySelectorAll('.modal').at(-1)?.textContent || '').includes(t('rec_delete_q'));
+  byText(t('cancel'), document.body)?.click();
+  for (let i = 0; i < 3; i++) await settle();
+  const adminKept = !calls.slice(d0).some((c) => c.action === 'admin.recordings.delete') && allRows().length === 5;
+  del(allRows()[1])?.click();
+  await settle();
+  document.body.querySelectorAll('button').find((x) => x.textContent === t('yes'))?.click();
+  for (let i = 0; i < 4; i++) await settle();
+  const adminDeleted = calls.slice(d0).find((c) => c.action === 'admin.recordings.delete')?.id === 'd4'.repeat(16) && allRows().length === 4;
+  allRows()[1]?.querySelectorAll('button').find((x) => x.getAttribute('title') === t('rec_play'))?.click();
+  answers['recording.info'] = () => ({ recording: { id: 'e5'.repeat(16), user: 'eva', conn: 'PC3', started: '2026-11-20T08:00:00+01:00', ended: '2026-11-20T08:00:05+01:00', seconds: 5 } });
+  (winL.hashchange || []).forEach((f) => f());
+  for (let i = 0; i < 3; i++) await settle();
+  const backToTab = appEl.querySelector('.rec-bar')?.querySelector('a')?.getAttribute('href') === '#/admin/recordings';
+  delete answers['recording.info'];
+  STATE.user.role = 'auditor';
+  await go('#/conns');
+  await go('#/admin/recordings');
+  for (let i = 0; i < 3; i++) await settle();
+  const auditorReads = allRows().length === 4 && ![...allRows()].some((r) => del(r));
+  delete answers['admin.recordings'];
+  delete answers['admin.recordings.delete'];
+  STATE.user.role = role0;
+  [globalThis.VideoEncoder, globalThis.VideoFrame] = video0;
+  await go('#/conns');
+  check('recordings: every one in its tab for administrators (who started it, watched, a video); deleted by an administrator after yes (not one being recorded; one never closed, its process killed, yes), an auditor only reads; the player back to it',
+    JSON.stringify(allListed) === '[5,true,true,true,true,true,true,true,true,true]' && adminAsked && adminKept && adminDeleted && backToTab && auditorReads,
+    JSON.stringify({ allListed, adminAsked, adminKept, adminDeleted, backToTab, auditorReads }));
+  check('my recordings: a section of their own in the menu of every user, administrators too (a user who may not record told so in a notice; an administrator never), listed (one being recorded marked, not deletable), watched, a video offered (the room it may take said first; one made in the page: its size, also without WebCodecs; Cancel makes nothing), deleted only after yes; one made in the page played by the browser; the player back to the section',
+    JSON.stringify(inMenu) === '[true,true,true,true,true]' && JSON.stringify(listed) === '[true,3,true,true,true,true,true]' && roomSaid && nothingMade
+      && JSON.stringify(pageVideo) === '[true,true,true,true]' && asked && keptOnNo && deleted && played && backToList && JSON.stringify(watched) === '[true,true,true,true,true,true]',
+    JSON.stringify({ inMenu, listed, roomSaid, nothingMade, pageVideo, asked, keptOnNo, deleted, played, backToList, watched }));
 }
 
 // ------------------------------------------------------------ signing in with a company account

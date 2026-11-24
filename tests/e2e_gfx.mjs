@@ -56,6 +56,9 @@ await s.goto(base + '/index.php' + href);
 await s.waitForSelector('.overlay form');
 await s.click('.overlay form button.primary');
 const t0 = Date.now();
+// a computer never seen: its certificate's fingerprints shown first, trusted here (the test's own computer)
+await s.waitForSelector('.overlay.hidden, .overlay .cert-prints', { state: 'attached', timeout: 30000 }).catch(() => {});
+if (await s.$('.overlay:not(.hidden) .cert-prints')) await s.click('.overlay button.primary');
 await s.waitForSelector('.overlay.hidden', { state: 'attached', timeout: 30000 });
 log('connected in', Date.now() - t0, 'ms');
 await s.mouse.move(1000, 790);                           // pointer out of the compared area

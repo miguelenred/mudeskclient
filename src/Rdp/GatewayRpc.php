@@ -437,7 +437,7 @@ trait GatewayRpc
         // this IN channel half used: a new one (when is the client's choice, MS-RPCH 3.2.2.4.2; Windows' own waits until 4 KB
         // are left: half leaves time for the gateway's answer while the session goes on)
         if ($this->inSent >= self::$inLifetime >> 1 && $this->inSock !== null && $this->inNext === [] && $this->inPrev === null
-            && $this->rpcState === 2 && !$this->closed && !$this->eof) {
+            && $this->rpcState === 2 && !$this->closed && !$this->eof && !$this->ending) {
             $this->rpcInRecycle();
         }
         if ($this->rpcHeaders) {                             // a new OUT channel: its HTTP answer first
@@ -593,8 +593,8 @@ trait GatewayRpc
             $this->rpcState = 2;
         } elseif ($this->inNext !== [] && $flags === 0 && ($cmds === [13, 6, 0, 2] || $cmds === [13]) && unpack('V', $p, 24)[1] === 0) {
             $this->rpcInSwitch();                                                   // IN_R1/A4, IN_R2/A4 (to the client)
-        } elseif ($this->rpcState === 2 && ($flags & 0x0004) && $this->recycle === 0) {   // OUT_R1/A2, OUT_R2/A2: a new OUT channel wanted
-            $this->rpcRecycle();
+        } elseif ($this->rpcState === 2 && ($flags & 0x0004) && $this->recycle === 0 && !$this->ending) {   // OUT_R1/A2, OUT_R2/A2:
+            $this->rpcRecycle();                                                    // a new OUT channel wanted (not when closing)
         } elseif ($this->recycle === 1 && $flags === 0 && in_array(10, $cmds, true)) {     // OUT_R2/A6: OUT_R2/C1 on the new one, A7 on IN
             $this->rpcWriteTo($this->succ, self::rts(0x0001, [[7, '']]));
             $this->out    .= self::rts(0x0010, [[13, pack('V', 2)], [3, $this->succCookie], [6, pack('V', 1)]]);

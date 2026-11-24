@@ -84,14 +84,13 @@ final class Access
         if ($t['mode'] === 'all') {
             return array_filter($ips, [self::class, 'unsafe']) === [] ? $ips[0] : null;
         }
+        // a name rule (the name itself, or *.domain) trusts its DNS: what it resolves to is allowed, but this computer,
+        // link-local and cloud metadata addresses only when listed themselves too (before, a name listed itself reached them
+        // whatever its DNS said: an answer changed to 169.254.169.254 or 127.0.0.1 took the gateway there)
+        $unlisted = static fn(string $ip): bool => self::unsafe($ip) && !self::ipAllowed($ip, $t['list']);
         foreach ($t['list'] as $rule) {
-            if (self::parseCidr($rule) === null && $host === $rule) {
-                return $ips[0];                    // a name listed itself: what it resolves to is allowed, this computer too
-            }
-            // *.domain trusts the DNS of every name under it: one of them pointing at this computer, link-local or cloud
-            // metadata addresses is refused, as with "Allow all" (list those addresses, or the exact name, to reach them)
-            if (self::parseCidr($rule) === null && str_starts_with($rule, '*.') && str_ends_with($host, substr($rule, 1))) {
-                return array_filter($ips, [self::class, 'unsafe']) === [] ? $ips[0] : null;
+            if (self::parseCidr($rule) === null && ($host === $rule || (str_starts_with($rule, '*.') && str_ends_with($host, substr($rule, 1))))) {
+                return array_filter($ips, $unlisted) === [] ? $ips[0] : null;
             }
         }
         foreach ($ips as $ip) {

@@ -42,7 +42,7 @@ Done (second review, see the [changelog](../CHANGELOG.md)):
 - The shared folder as a file explorer: folder tree, drag and drop of files and folders (uploads and moves), ZIP downloads made as they are sent.
 - Chinese, Japanese or Korean IME on a computer: the text is sent once, when confirmed; dead keys are not doubled.
 - Drawing orders with any ROP (MemBlt and PatBlt).
-- User panel in the profile: own remote sessions and trusted browsers; last sign-in and failed attempts shown at sign-in.
+- User panel in the profile: own remote sessions and trusted browsers; the failed attempts since the last sign-in shown at sign-in.
 - Signed audit export (RSA 3072, checked with `openssl`), streamed row by row.
 - Installable app on phones and computers.
 - Limit of RDP sessions of all users at once, which `tools/check.php` helps to set.
@@ -52,7 +52,7 @@ Done (second review, see the [changelog](../CHANGELOG.md)):
 - RemoteApp (MS-RDPERP): one program of the remote computer, its windows over the page with a Windows panel and a taskbar, also on several screens; the session ends when the program closes.
 - .rdp files imported (one into the editor, several at once) and exported.
 - Connections of the administrator for chosen users or for all, each user with their own password, certificate and options.
-- Graphics surfaces limited to 4 times the output (at most 8192 × 8192) and the bitmap cache to 100 MB.
+- Graphics surfaces limited to 4 times the output (at most the pixels of 8192 × 8192, 32766 a side) and the bitmap cache to 100 MB.
 
 Left:
 
@@ -64,10 +64,11 @@ Left:
 
 - **Done: the microphone** in RDP sessions (audio input, the AUDIO_INPUT dynamic channel): one more box in the connection options, off by default; the remote Windows must allow audio recording redirection ([HOSTING](HOSTING.md#remote-computers)). Left: a compressed format (IMA ADPCM would send a quarter of the 176 KB/s of PCM).
 - **Done: the camera** (1.1), with the microphone in one box (MS-RDPECAM, Motion JPEG from the page's own camera, in Chrome, Edge and Firefox), and **a folder of this computer** as a drive of the session (read and write in Chrome and Edge, read only elsewhere; see [USAGE](USAGE.md#a-folder-of-this-computer)). Decided: the camera goes with the microphone (one decision about this computer's devices, off by default); the folder needs the connection's shared folder, so an administrator who turns that off turns both off. Left out: H.264 pictures of the camera (less bandwidth; Motion JPEG works in every browser) and the folder's changes told to Windows as they happen (the browser cannot watch a folder).
-- **Done: session recording** (1.1), played back in the browser with the same decoders, opened from the audit. Decided: off unless the administrator records a connection; the user is told before anything is shown and while the session lasts; only the picture (not the keyboard, clipboard or sound); encrypted with a key of the server; kept 30 days (a setting) and at most 2 GB each (`record_max_mb`); watched only by administrators and auditors, each viewing audited. Left: sound, and skipping still stretches.
+- **Done: session recording** (1.1), played back in the browser with the same decoders, opened from the audit. Decided: off unless the administrator records a connection; the user is told before anything is shown and while the session lasts; encrypted with a key of the server; kept 30 days (a setting) and at most 2 GB each (`record_max_mb`); watched only by administrators and auditors, each viewing audited. **Done since 1.1:** its sound and the microphone's (not the keyboard or the clipboard); started and stopped at any moment, by administrators (in the session or in *Active sessions*) and by users when allowed; downloaded as a WebM video made in the browser (WebCodecs and a WebM writer of the project's own); one started in the session made by the user's browser, of what it shows (MediaRecorder: no new connection); kept until deleted by hand by default; deleted by administrators; users' own in **Recordings**. Left: skipping still stretches.
 - **Done: sharing a session** (1.1) with a link, view only or with control (see [USAGE](USAGE.md#sharing-a-session)).
 - **Done: Remote Desktop Gateway and connection broker** (1.1): a connection through an RD Gateway (MS-TSGU over a WebSocket, over two HTTPS connections, or RPC over HTTP for Windows Server 2008 and 2008 R2; in plain PHP) and with a farm's load balance info, the broker's redirections followed (its password for the next computer given with RDSTLS); tested through an open-source gateway in front of Windows 11 (RPC over HTTP against a gateway written from the specifications), not yet against Windows Server's own gateway or a real broker.
 - **Done: older Windows** (1.1): Standard RDP Security for Windows XP and Server 2003 (only with the security *Automatic*), TLS 1.0 and CredSSP 3 for Windows 7 and Server 2008 R2, Kerberos with RC4 for Windows Server 2003 domains; their limits in [SECURITY](../SECURITY.md).
+- **Done in 1.2**: the first connection to a computer confirmed by its fingerprints (SHA-256 and SHA-1), or one an administrator fixed for everyone; *Administration → Status* with charts of the last 30 days and `health.php` for monitors; encrypted backups and their restore; links for a while and guests' control lost when unused; nothing works while the data folder can be read from the web.
 
 Other ideas: persistent bitmap cache, copy of the audit to an external syslog server (stronger proof than the HMAC chain, whose key lives on the same server). Smart cards are not possible: a browser cannot let the gateway use the card's private key.
 
@@ -81,7 +82,7 @@ Other ideas: persistent bitmap cache, copy of the audit to an external syslog se
 | Kerberos when a domain controller can be reached, else NTLM | From a hosting the domain controllers are usually out of reach: NTLM then, as Windows does without a KDC (not where the domain blocks it). Kerberos with AES and, for Windows Server 2003 domains and passwords older than their domain's AES keys, RC4 (offered last), only if the administrator allows it (off by default: someone in the middle could make it be used, and the password then breaks far faster); passwords only (no smart cards) |
 | Standard RDP Security only with the security *Automatic* | Windows XP and Server 2003 have nothing else, but it proves nothing of the server and its RC4 is weak: it is never used by a connection set to *NLA only* or *TLS only*, the server's key is pinned as a certificate (a TLS computer that falls back to it is a changed certificate), and a server that encrypts nothing is refused |
 | Remote passwords encrypted with the user's password | Not even the administrator can read them |
-| Trust on first use for server certificates | RDP servers use self-signed certificates |
+| Server certificates confirmed by the user the first time (or fixed by an administrator for everyone) | RDP servers use self-signed certificates: nothing else can tell who a computer never seen is (before 1.2, trusted on first use) |
 | Allow-lists for client IPs and targets | Requested: "IPs and domains, or everything allowed" |
 | Multi-monitor as separate windows | Browsers allow one window per click and only Chromium exposes the screens |
 | A remote monitor only while its window is open | Otherwise programs open on a screen nobody sees |

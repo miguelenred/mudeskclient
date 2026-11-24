@@ -16,12 +16,32 @@ final class Config
             'data_dir'         => dirname(__DIR__) . '/data',
             'trusted_proxies'  => [],     // IPs whose X-Forwarded-For is trusted
             'force_https'      => true,   // refuse plain HTTP (except localhost)
+            // a computer or gateway never seen confirmed by the user (its fingerprints shown) before anything is sent to it;
+            // false: trusted on its first use, as before 1.2 (a man in the middle of that first connection is not noticed)
+            'confirm_new_certificates' => true,
             'ipc'              => 'auto', // 'auto' (Unix socket if possible) or 'file' (queue file, for restricted hostings)
             'drawing_orders'   => true,   // copy/fill commands and caches instead of bitmaps (less bandwidth); validated with xrdp and Windows 11
             'bulk_compression' => 'rdp61', // highest bulk compression offered: 'rdp61' (XCRUSH), 'rdp6' (NCRUSH), 'mppc' or false
         ];
+        // the proxies trusted with X-Forwarded-For: addresses, kept as PHP writes them (compared with the request's as such).
+        // Before, an entry that was none (a range, a name) matched nothing, and nobody was told: every client had the
+        // proxy's address, for the sign-in locks and the allow-list of clients
+        $proxies = [];
+        foreach ((array)self::$c['trusted_proxies'] as $p) {
+            $b = is_string($p) ? @inet_pton(trim($p, " []")) : false;
+            if ($b === false) {
+                error_log('MuDeskClient: config.php, trusted_proxies: ' . (is_string($p) ? $p : gettype($p)) . ' is not an IP address (ranges and names are not taken)');
+                ErrorPage::send(500, 'config_proxies');
+            }
+            $proxies[] = (string)inet_ntop($b);
+        }
+        self::$c['trusted_proxies'] = $proxies;
         $dir = self::$c['data_dir'];
         foreach (['', '/connections', '/hosts', '/audit', '/run', '/sessions', '/files', '/tmp'] as $sub) {
+            if (!is_dir($dir . $sub) && in_array($sub, ['/connections', '/hosts', '/audit', '/files'], true)
+                && time() - (int)@file_get_contents("$dir/run/restoring") < 300) {
+                continue;                     // a restore moving it into place (Backup::restore): made again, it stood in the way
+            }
             if (!is_dir($dir . $sub) && !mkdir($dir . $sub, 0700, true) && !is_dir($dir . $sub)) {
                 error_log("MuDeskClient: the web server cannot create $dir$sub: give the account that runs it permission to modify $dir");
                 ErrorPage::send(500, 'data_dir');
@@ -52,6 +72,23 @@ final class Config
     public static function get(string $key): mixed
     {
         return self::$c[$key] ?? null;
+    }
+
+    /**
+     * The site's public address from 'public_url' (scheme, host, port and path of public/, no trailing slash), or null when
+     * it is not set or not a plain http(s) address: then each request's own Host is used (a proxy that does not pass the
+     * public one on broke signing in with OpenID Connect or a passkey).
+     */
+    public static function publicUrl(): ?array
+    {
+        $u = self::get('public_url');
+        $p = is_string($u) ? parse_url(rtrim($u, '/')) : false;
+        if (!is_array($p) || !in_array($p['scheme'] ?? '', ['http', 'https'], true) || ($p['host'] ?? '') === ''
+            || isset($p['user']) || isset($p['pass']) || isset($p['query']) || isset($p['fragment'])) {
+            return null;
+        }
+        $host = strtolower($p['host']) . (isset($p['port']) ? ':' . $p['port'] : '');
+        return ['origin' => $p['scheme'] . '://' . $host, 'host' => strtolower($p['host']), 'path' => rtrim($p['path'] ?? '', '/')];
     }
 
     public static function dir(string $sub = ''): string

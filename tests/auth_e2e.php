@@ -239,7 +239,7 @@ check('audit: setup, user creation, password change and logout recorded',
 $plain = json_encode($find([]));
 check('audit: passwords never stored', !str_contains($plain, $pass) && !str_contains($plain, $new) && !str_contains($plain, 'bad-password-xx'));
 check('audit: search by IP', ($find(['ip' => '10.4.0.1'])[0]['ip'] ?? '') === '10.4.0.1');
-[$c, $j] = $s1->api('admin.audit', ['filter' => [], 'export' => 'csv']);
+[$c, $j] = $s1->api('admin.audit', ['filter' => [], 'export' => 'rows']);
 check('audit: export returns every filtered row', $c === 200 && count($j['rows']) === $j['total'] && $j['total'] > 50, "{$j['total']} rows");
 [, $v] = $s1->api('admin.audit.verify');
 check('audit: chain intact', ($v['ok'] ?? false) === true && $v['lines'] > 50, json_encode($v['problems'] ?? null));

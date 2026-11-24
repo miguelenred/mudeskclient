@@ -91,13 +91,13 @@ Si al subir un archivo aparece «PHP no puede escribir en su carpeta temporal»,
 
 1. Abre **`https://tu-dominio/mudesk/`** en el navegador.
 2. La pantalla pide un **código de instalación**. Está en el archivo `mudesk/data/setup-code.php`, que se crea en ese momento. Ábrelo con el Administrador de archivos (**Ver** o **Editar**, no lo abras en el navegador: no mostraría nada). La segunda línea es el código, con este aspecto: `1A2B3-C4D5E-F6A7B-8C9D0`. Cópialo.
-3. Escribe el código, el nombre del administrador y una contraseña de **al menos 12 caracteres** (con 4 distintos como mínimo, que no sea una contraseña común ni contenga el nombre). El código solo sirve una vez y el archivo se borra al terminar.
+3. Escribe el código, el nombre del administrador y una contraseña de **al menos 12 caracteres** (con 4 distintos como mínimo, que no sea una contraseña común ni contenga el nombre). El código solo sirve una vez y el archivo se borra al terminar. Sirve durante un día: después otro código ocupa su lugar en el mismo archivo (vuelve a abrirlo).
 
 Este código existe para que nadie más pueda adueñarse de una instalación recién copiada antes que tú.
 
 ### 3.5 Comprobar que los datos están protegidos
 
-Abre **`https://tu-dominio/mudesk/data/web-check.txt`**. Debe salir un error **403 (Prohibido)** o **404 (No encontrado)**. Si en cambio ves un texto que empieza por «MuDeskClient data folder», tu hosting no aplica los archivos `.htaccess` y la carpeta de datos se puede descargar. La aplicación también lo avisa en rojo al administrador. En ese caso, pide al proveedor que active `AllowOverride` para tu sitio, o usa la distribución B de [HOSTING](HOSTING.md) (solo `public` dentro de la carpeta web).
+Abre **`https://tu-dominio/mudesk/data/web-check.txt`**. Debe salir un error **403 (Prohibido)** o **404 (No encontrado)**. Si en cambio ves un texto que empieza por «MuDeskClient data folder», tu hosting no aplica los archivos `.htaccess` y la carpeta de datos se puede descargar. La aplicación también lo detecta, y mientras tanto no funciona (cada página dice «La carpeta de datos se puede descargar»). En ese caso, pide al proveedor que active `AllowOverride` para tu sitio, o usa la distribución B de [HOSTING](HOSTING.md) (solo `public` dentro de la carpeta web).
 
 ### 3.6 Comprobar que el hosting llega a tus equipos
 
@@ -107,7 +107,7 @@ Algunos hostings **no dejan salir conexiones** a otros puertos, entre ellos el d
 2. Copia ese archivo a la carpeta `mudesk/public/`.
 3. Abre `https://tu-dominio/mudesk/public/check.php`, escribe tu palabra secreta en *Token* y, en *RDP saliente*, la dirección de tu equipo remoto y **su puerto** (3389 si no se cambió; si tu equipo usa otro, escribe ese). Pulsa el botón de la prueba.
 4. Si dice que no puede conectar, revisa el [apartado 7, cortafuegos](#7-cortafuegos-que-hay-que-dejar-pasar).
-5. **Borra `public/check.php` al terminar.**
+5. **Borra `public/check.php` al terminar.** Funciona durante un día desde que se copió, y mientras está allí la administración lo dice en rojo.
 
 ## 4. Opción B: en un PC con Windows de la red local (XAMPP)
 
@@ -217,7 +217,7 @@ Si una conexión falla con «No se puede conectar con el equipo remoto», casi s
 
 1. Entra en MuDeskClient con el administrador.
 2. **Conexiones → Nueva conexión**: pon un nombre, la dirección del equipo, su **puerto** y el usuario de Windows. Guarda.
-3. Pulsa **Conectar**, escribe la contraseña de Windows y listo.
+3. Pulsa **Conectar** y escribe la contraseña de Windows. La primera vez se muestran las huellas del certificado del equipo («Primera conexión con este equipo»): compáralas con las del equipo y pulsa **Confiar y conectar** (la casilla *Válida para todos los usuarios* de un administrador la fija para todos).
 
 Para más usuarios: *Administración → Usuarios → Nuevo usuario*. La casilla **Permisos de administrador** convierte al usuario en administrador; puede haber varios. La guía completa está en [USO](USO.md).
 
@@ -229,7 +229,7 @@ Para más usuarios: *Administración → Usuarios → Nuevo usuario*. La casilla
 
 ## 10. Copias de seguridad
 
-Todo lo tuyo está en la carpeta **`data`**: usuarios, conexiones, auditoría, archivos compartidos y la clave del servidor (`data/secret.php`). Cópiala entera, con regularidad, a un lugar seguro. **Sin `secret.php`** los códigos de las aplicaciones de autenticación dejan de servir y la auditoría no se puede verificar. Guarda esa copia como algo confidencial.
+Todo lo tuyo está en la carpeta **`data`**: usuarios, conexiones, auditoría, archivos compartidos y la clave del servidor (`data/secret.php`). *Administración → Copia de seguridad* la descarga cifrada con una contraseña que eliges (con las carpetas de los usuarios y las grabaciones si se marcan) y la restaura; o copia la carpeta entera. Hazlo con regularidad, a un lugar seguro. **Sin `secret.php`** los códigos de las aplicaciones de autenticación dejan de servir y la auditoría no se puede verificar. Guarda esa copia, y la contraseña de la copia, como algo confidencial.
 
 ## 11. Problemas frecuentes
 
@@ -239,7 +239,7 @@ Todo lo tuyo está en la carpeta **`data`**: usuarios, conexiones, auditoría, a
 | «PHP no puede escribir en su carpeta temporal» | Da a PHP permiso de escritura en su carpeta temporal ([3.3](#33-permisos-de-la-carpeta-data)); en un hosting, pídeselo al proveedor |
 | «Hace falta una conexión segura» | Abre la dirección con `https://`. En un hosting, activa el certificado gratuito; en la red local, XAMPP y Linux ya lo traen |
 | «Versión de PHP no admitida» | Elige PHP 8.1 a 8.5 en el panel del hosting |
-| Aviso rojo: la carpeta de datos se puede descargar | Tu servidor no aplica `.htaccess`: [3.5](#35-comprobar-que-los-datos-están-protegidos) |
+| «La carpeta de datos se puede descargar», y nada funciona | Tu servidor no aplica `.htaccess`: [3.5](#35-comprobar-que-los-datos-están-protegidos) |
 | «Código de instalación incorrecto» | Copia la segunda línea de `data/setup-code.php` entera, con los guiones |
 | «No se puede conectar con el equipo remoto» | Equipo encendido, dirección, **puerto** y [cortafuegos](#7-cortafuegos-que-hay-que-dejar-pasar) |
 | «Usuario o contraseña remotos incorrectos» | Usuario y contraseña de **Windows** del equipo remoto (no los de MuDeskClient). Para una cuenta local, escribe `.\usuario`; para una de dominio, `DOMINIO\usuario` (un dominio que bloquea NTLM necesita Kerberos: el dominio por su nombre DNS; README, *Limitaciones*) |
@@ -269,12 +269,12 @@ docker run -d --name mudesk --restart unless-stopped -p 8443:443 -v mudesk-data:
 docker compose up -d
 ```
 
-El código de instalación: `docker compose exec mudesk cat /var/www/mudesk/data/setup-code.php`. Para actualizar: `docker compose pull` y después `docker compose up -d`. Usa la imagen publicada; para construir la imagen con el código de esa carpeta, quita el comentario de la línea `build: .` en `compose.yaml` y arráncalo con `docker compose up -d --build`. El nombre del certificado (`MUDESK_HOSTNAME`) y tu propio certificado también se ponen en ese archivo.
+El código de instalación: `docker compose exec mudesk cat /var/www/mudesk/data/setup-code.php`. `compose.yaml` nombra la imagen de su versión (`ghcr.io/miguelenred/mudeskclient:1.2.0`, por ejemplo), que no cambia sola. Para actualizar: pon allí el número de la nueva versión y después `docker compose pull` y `docker compose up -d`. Usa la imagen publicada; para construir la imagen con el código de esa carpeta, quita el comentario de la línea `build: .` en `compose.yaml` y arráncalo con `docker compose up -d --build`. El nombre del certificado (`MUDESK_HOSTNAME`) y tu propio certificado también se ponen en ese archivo.
 
 Opciones:
 
 - **Tu propio certificado**: monta una carpeta con `cert.pem` y `key.pem` en `/etc/mudesk/tls` (`-v /ruta/a/tls:/etc/mudesk/tls:ro`). Sin él, `-e MUDESK_HOSTNAME=nombre` pone ese nombre en el certificado autofirmado (también como subjectAltName, que los navegadores comprueban). Esa carpeta es un volumen propio, así que el certificado autofirmado se mantiene al rehacer el contenedor en una actualización (ponle nombre, `-v mudesk-tls:/etc/mudesk/tls`, para conservarlo con `docker rm`). El código no se puede escribir desde el servidor web (solo `data/`), y OPcache está activado.
 - **Detrás de tu proxy inverso** (Nginx, Caddy, Traefik): apúntalo a `https://contenedor:443`. Pon su dirección en `trusted_proxies` de un `config.php` montado en `/var/www/mudesk/config.php`, y deja abiertas las peticiones largas (ver [HOSTING](HOSTING.md)).
-- **Una versión**: `ghcr.io/miguelenred/mudeskclient:1.1.0` en lugar de la última.
+- **Una versión**: `ghcr.io/miguelenred/mudeskclient:1.2.0` en lugar de la última.
 
 El contenedor tiene que llegar al puerto RDP de los equipos remotos; los paquetes de Wake-on-LAN solo salen de él con `--network host` (Linux).

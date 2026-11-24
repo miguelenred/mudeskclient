@@ -8,9 +8,10 @@ declare(strict_types=1);
 // TERMSRV/viejo.test.local, a Windows Server 2003 domain's computer: RC4, RFC 4757's tokens) is taken as Windows
 // does: its AP-REP sent with a mechListMIC, the client's mechListMIC checked, the bindings and the credentials sealed with
 // GSS Wrap as Windows seals them (EC 16, RRC 28): "ok creds kerberos <user> <password ok|password bad>".
-//   php nla_server.php user domain password openssl.cnf [x224|v3]   (prints the port, then one line per connection: ok|bad,
-//   creds|none; with x224, first a line "x224 <hex>" with the X.224 request it got; with v3, CredSSP version 3 as Windows 7
-//   and Server 2008 R2 without updates speak it: the public key itself bound, the server's with its first byte plus one)
+//   php nla_server.php user domain password openssl.cnf [x224|v3|tls10]   (prints the port, then one line per connection:
+//   ok|bad, creds|none, or "tls" when the TLS handshake failed; with x224, first a line "x224 <hex>" with the X.224 request
+//   it got; with v3, CredSSP version 3 as Windows 7 and Server 2008 R2 without updates speak it: the public key itself bound,
+//   the server's with its first byte plus one; with tls10, only TLS 1.0 with AES128-SHA, as they offer TLS too)
 use MuDesk\Rdp\{Der, KerberosCrypto, Ntlm, Rc4};
 use MuDesk\Text;
 
@@ -20,6 +21,7 @@ require __DIR__ . '/krb_fixture.php';
 [, $user, $domain, $password, $cnf] = $argv;
 $showX224 = ($argv[5] ?? '') === 'x224';
 $v3       = ($argv[5] ?? '') === 'v3';
+$tls10    = ($argv[5] ?? '') === 'tls10';
 ini_set('display_errors', 'stderr');                    // (stdout: one line per connection, read by the test)
 $o    = ['config' => $cnf, 'private_key_bits' => 2048, 'digest_alg' => 'sha256'];
 $key  = openssl_pkey_new($o);
@@ -30,7 +32,8 @@ $pem = (getenv('MUDESK_TEST_TMP') ?: sys_get_temp_dir()) . '/mudesk-nla-' . bin2
 file_put_contents($pem, $certPem . $keyPem);
 $pubKey = Der::subjectPublicKey(openssl_x509_read($certPem));
 $srv    = stream_socket_server('tcp://127.0.0.1:0', $en, $es, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN,
-    stream_context_create(['ssl' => ['local_cert' => $pem, 'verify_peer' => false]]));
+    stream_context_create(['ssl' => ['local_cert' => $pem, 'verify_peer' => false]
+        + ($tls10 ? ['security_level' => 0, 'ciphers' => 'AES128-SHA:@SECLEVEL=0'] : [])]));
 echo substr((string)strrchr((string)stream_socket_get_name($srv, false), ':'), 1), "\n";
 
 $readDer = static function ($c): string {
@@ -68,7 +71,7 @@ for ($last = time(); time() - $last < 60;) {                   // (on Windows an
     $cc = "\x0e\xd0\x00\x00\x12\x34\x00" . pack('CCvV', 2, 0, 8, 2);
     fwrite($c, "\x03\x00" . pack('n', 4 + strlen($cc)) . $cc);
     stream_set_blocking($c, true);
-    if (!@stream_socket_enable_crypto($c, true, STREAM_CRYPTO_METHOD_TLS_SERVER)) {
+    if (!@stream_socket_enable_crypto($c, true, $tls10 ? STREAM_CRYPTO_METHOD_TLSv1_0_SERVER : STREAM_CRYPTO_METHOD_TLS_SERVER)) {
         echo "tls\n";
         fclose($c);
         continue;

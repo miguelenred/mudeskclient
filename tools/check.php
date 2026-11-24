@@ -8,6 +8,17 @@ declare(strict_types=1);
  */
 const TOKEN = 'CAMBIAR';
 const MEMORIA = 128 << 20;      // memory_limit mínimo: exportar la auditoría (hasta 20 000 filas) y buscar en muchos días
+const CADUCA = 86400;           // segundos desde que se subió o se cambió: después no hace nada (por si se olvida borrarlo)
+
+// caducado (subido o cambiado hace más de un día) o con el token sin cambiar: ninguna prueba ni ningún formulario
+$subido = max((int)@filemtime(__FILE__), (int)@filectime(__FILE__));   // (un FTP que conserva la fecha: la de creación)
+if (time() - $subido > CADUCA || TOKEN === 'CAMBIAR') {
+    http_response_code(TOKEN === 'CAMBIAR' ? 403 : 410);
+    header('Content-Type: text/plain; charset=utf-8');
+    header('Cache-Control: no-store');
+    exit(TOKEN === 'CAMBIAR' ? "Cambia TOKEN en este fichero para usarlo, y bórralo al terminar.\n"
+        : "Este diagnóstico se subió hace más de un día y ya no funciona: bórralo del servidor (súbelo de nuevo si lo necesitas).\n");
+}
 
 if (isset($_GET['a'])) {
     if (TOKEN === 'CAMBIAR' || !hash_equals(TOKEN, (string)($_SERVER['HTTP_X_TOKEN'] ?? ''))) {

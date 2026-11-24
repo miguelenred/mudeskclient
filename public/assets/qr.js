@@ -128,10 +128,13 @@ export function qrMatrix(text) {
   return m;
 }
 
-/** SVG markup of the QR code. */
-export function qrSvg(text, px = 4) {
-  const m = qrMatrix(text), n = m.length + 8;
+/** The QR code as an SVG element, made of nodes (no markup parsed: the page sets no innerHTML anywhere). */
+export function qrSvg(text, px = 4, doc = document) {
+  const m = qrMatrix(text), n = m.length + 8, ns = 'http://www.w3.org/2000/svg';
   let d = '';
   m.forEach((row, y) => row.forEach((on, x) => { if (on) d += `M${x + 4} ${y + 4}h1v1h-1z`; }));
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${n} ${n}" width="${n * px}" height="${n * px}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#fff"/><path d="${d}" fill="#000"/></svg>`;
+  const make = (tag, attrs) => { const e = doc.createElementNS(ns, tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v)); return e; };
+  const svg = make('svg', { viewBox: `0 0 ${n} ${n}`, width: n * px, height: n * px, 'shape-rendering': 'crispEdges' });
+  svg.append(make('rect', { width: '100%', height: '100%', fill: '#fff' }), make('path', { d, fill: '#000' }));
+  return svg;
 }

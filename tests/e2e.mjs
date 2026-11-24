@@ -51,6 +51,9 @@ await s.goto(base + '/index.php' + href);
 await s.waitForSelector('.overlay form');                 // connect dialog with the session options
 log('connect dialog:', (await s.$$eval('.overlay form input[type=checkbox]', (l) => l.map((i) => i.name + '=' + i.checked))).join(' '));
 await s.click('.overlay form button.primary');
+// a computer never seen: its certificate's fingerprints shown first, trusted here (the test's own computer)
+await s.waitForSelector('.overlay.hidden, .overlay .cert-prints', { state: 'attached', timeout: 30000 }).catch(() => {});
+if (await s.$('.overlay:not(.hidden) .cert-prints')) await s.click('.overlay button.primary');
 await s.waitForSelector('.overlay.hidden', { state: 'attached', timeout: 30000 }).catch(async (e) => { await s.screenshot({ path: out + '/03-fail.png' }); console.log(await s.textContent('.overlay')); throw e; });
 log('session connected');
 await s.waitForTimeout(2500);

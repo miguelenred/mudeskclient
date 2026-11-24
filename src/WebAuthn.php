@@ -19,12 +19,13 @@ final class WebAuthn
 
     public static function rpId(): string
     {
-        return strtolower((string)preg_replace('/:\d+$/', '', (string)($_SERVER['HTTP_HOST'] ?? '')));
+        return Config::publicUrl()['host'] ?? strtolower((string)preg_replace('/:\d+$/', '', (string)($_SERVER['HTTP_HOST'] ?? '')));
     }
 
+    /** (public_url of config.php when set: never taken from the request) */
     private static function origin(): string
     {
-        return (Http::isHttps() ? 'https://' : 'http://') . strtolower((string)($_SERVER['HTTP_HOST'] ?? ''));
+        return Config::publicUrl()['origin'] ?? (Http::isHttps() ? 'https://' : 'http://') . strtolower((string)($_SERVER['HTTP_HOST'] ?? ''));
     }
 
     public static function b64u(string $s): string

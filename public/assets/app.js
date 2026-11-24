@@ -4,9 +4,12 @@
 
 import { t, setLang, getLang, browserLang, LANGS } from './i18n.js';
 import { qrSvg } from './qr.js';
+import { checkDataFolder } from './datacheck.js';
 import { RdpSession } from './session.js';
 import { ClipboardBridge } from './clipboard.js';
 import { AudioPlayer } from './audio.js';
+import { canMakeVideo, recordingVideo, videoEstimate } from './recvideo.js';
+import { loadPageVideo } from './pagerec.js';
 import { MicCapture } from './mic.js';
 import { CamCapture } from './camera.js';
 import { LocalFolder } from './localdrive.js';
@@ -60,6 +63,8 @@ const ICONS = {
   pause: 'M8 5v14M16 5v14',
   share: 'M18 8a3 3 0 1 0 0-6a3 3 0 0 0 0 6zM6 15a3 3 0 1 0 0-6a3 3 0 0 0 0 6zM18 22a3 3 0 1 0 0-6a3 3 0 0 0 0 6zM8.6 13.5l6.8 4M15.4 6.5l-6.8 4',
   eye: 'M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zM12 15a3 3 0 1 0 0-6a3 3 0 0 0 0 6z',
+  rec: 'M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18zM12 9a3 3 0 1 0 0 6a3 3 0 0 0 0-6z',
+  stop: 'M7 7h10v10H7z',
 };
 const icon = (name) => {
   const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -94,6 +99,8 @@ function h(tag, attrs = {}, ...children) {
 const fill = (el, ...children) => el.replaceChildren(...children.flat(9).filter((c) => c !== null && c !== undefined && c !== false));
 const btn = (label, onclick, cls = '', ic = null, title = null) =>
   h('button', { type: 'button', class: 'btn ' + cls, onclick, title }, ic && icon(ic), label);
+/** A certificate's fingerprint to compare by eye: upper case, in groups of four. */
+const fingerprint = (hex) => String(hex || '').toUpperCase().replace(/(.{4})(?=.)/g, '$1 ');
 const field = (label, input, hint = null) => h('label', { class: 'field' }, h('span', {}, label), input, hint && h('small', { class: 'muted' }, hint));
 const check = (label, attrs) => h('label', { class: 'check' }, h('input', { type: 'checkbox', ...attrs }), label);
 const select = (name, options, value) =>
@@ -297,24 +304,11 @@ function route() {
   return { view: parts[0] || 'conns', arg: parts.slice(1).join('/') };
 }
 
-// Is the data folder readable from the web (e.g. .htaccess ignored)? Checked once, warned to the administrator.
-// (once per browser session: the browser logs the expected 403/404 answers in its console)
-let exposed = null;
-function dataExposed() {
-  const known = tabPref('mudesk-data-check');
-  exposed ??= known !== null ? Promise.resolve(known === '1') : Promise.all(['../data/web-check.txt', 'data/web-check.txt'].map((u) =>
-    fetch(new URL(u, location.href), { cache: 'no-store', credentials: 'omit' })
-      .then(async (r) => r.ok && (await r.text()).startsWith('MuDeskClient data folder'), () => false)))
-    .then((a) => { const bad = a.includes(true); tabPref('mudesk-data-check', bad ? '1' : '0'); return bad; });
-  return exposed;
-}
-function warnExposed(where) {
-  dataExposed().then((bad) => { if (bad && where.isConnected) where.prepend(h('p', { class: 'error banner' }, t('data_exposed'))); });
-}
 
 /** The administrator requires a second factor and the user has none yet: only the profile, to add one. */
 const needSecond = () => S.user.totp_required && !S.user.totp && !S.user.passkeys.length;
 
+let recFrom = '';
 function render() {
   const r = route();
   if (!S) return;
@@ -322,12 +316,13 @@ function render() {
   // the session's view left by its address (Back, a link, a typed address): the remote session ends, instead of staying
   // connected where nobody sees it until the next session or signing out
   if (r.view !== 's' && currentRdp) endRdp();
-  if (S.setup) { authScreen(viewSetup()); return warnExposed(app.querySelector('.auth')); }
+  if (S.setup) return authScreen(viewSetup());
   if (!S.user) return authScreen(S.second ? viewSecond() : viewLogin());
   if (S.user.must_change) return authScreen(viewForcePassword());
   if (r.view === 's' && !needSecond()) return viewSession(r.arg);
-  if (r.view === 'rec' && ['admin', 'auditor'].includes(S.user.role) && !needSecond()) return viewRecording(r.arg);
-  const views = { conns: viewConns, files: viewFiles, profile: viewProfile, admin: viewAdmin };
+  if (r.view === 'rec' && !needSecond()) return viewRecording(r.arg);   // (the gateway gives each user only what they may watch)
+  recFrom = location.hash;                               // where a recording's player goes back to
+  const views = { conns: viewConns, files: viewFiles, recordings: viewMyRecordings, profile: viewProfile, admin: viewAdmin };
   const view = needSecond() ? 'profile' : (views[r.view] ? r.view : 'conns');
   layout(view, views[view](r.arg));
 }
@@ -340,6 +335,8 @@ function authScreen(content) {
 
 function layout(active, content) {
   const nav = [['conns', t('nav_conns')], ['files', t('nav_files')], ['profile', t('nav_profile')]];
+  // their own recordings, for every user (an administrator too: theirs here, every one in the administration)
+  nav.splice(2, 0, ['recordings', t('recordings')]);
   if (S.user.role === 'admin' || S.user.role === 'auditor') nav.push(['admin', t('nav_admin')]);   // an auditor: the audit and sessions
   const admin = S.user.role === 'admin' && active === 'admin';
   const langSel = select('lang', LANGS, getLang());              // saved in the profile, like the choice made there
@@ -359,18 +356,17 @@ function layout(active, content) {
         location.hash = '';
         render();
       }), 'small')),
-    h('main', { class: 'page' }, previousNotice(), admin && S.user.targets_all && h('p', { class: 'warn banner' }, t('targets_all_warn')), content),
+    h('main', { class: 'page' }, previousNotice(), admin && S.user.targets_all && h('p', { class: 'warn banner' }, t('targets_all_warn')),
+      admin && S.user.check_php && h('p', { class: 'error banner' }, t('check_php_left')), content),   // (tools/check.php copied there)
     h('footer', { class: 'project small' }, h('a', { href: 'https://miguelenred.es/mudeskclient', target: '_blank', rel: 'noopener' }, 'miguelenred.es/mudeskclient')));
-  if (admin) warnExposed(app.querySelector('main'));
 }
 
-/** After signing in, until closed: the previous sign-in and the failed attempts with this user name since then. */
+/** After signing in, until closed, only when there were some: the failed attempts with this user name since the last sign-in. */
 function previousNotice() {
   const p = S.previous;
-  if (!p || (!p.login && !p.failures)) return null;
-  const box = h('div', { class: 'banner row ' + (p.failures ? 'warn' : 'muted'), role: 'status' },
-    h('span', { class: 'spacer' }, p.login ? t('prev_login', fmtDate(p.login), p.ip || '-') : '',
-      p.failures ? [' ', t(p.partial ? 'prev_failures_partial' : p.failures === 1 ? 'prev_failure' : 'prev_failures', p.failures, fmtDate(p.failed.t), p.failed.ip)] : ''),
+  if (!p?.failures || !p.failed) return null;
+  const box = h('div', { class: 'banner row warn', role: 'status' },
+    h('span', { class: 'spacer' }, t(p.partial ? 'prev_failures_partial' : p.failures === 1 ? 'prev_failure' : 'prev_failures', p.failures, fmtDate(p.failed.t), p.failed.ip)),
     btn('', () => { S.previous = null; box.remove(); }, 'small', 'x', t('close')));
   return box;
 }
@@ -749,6 +745,20 @@ function editConn(c, keyboards, opts = {}) {
   c = c || { port: 3389, kbd: 0x040A, bpp: 16, gfx: 'auto', security: 'auto', resize: 'dynamic', clipboard: true, paste: 'auto', drive: true, audio: true, mic: false, printer: true, ask: true, perf: { smoothing: true } };
   const err = errBox();
   const kb = Object.fromEntries(keyboards.map((k) => [k, KB_NAMES[k] || '0x' + k.toString(16)]));
+  // an administrator's: the computer's certificate fixed for every connection to it (by its name or address), read now; it
+  // follows the computer: another name or port shows that one's (before, the first one's stayed, and was not fixed for the new)
+  const fixed = { certs: {}, shown: '' };
+  const fixedOf = (host, port) => fixed.certs[`rdp:${String(host || '').trim().toLowerCase()}:${+port || 3389}`]?.fp || '';
+  const fixedIn = S.user.role === 'admin' && !occasional && !locked
+    && h('input', { name: 'cert_fixed', maxlength: 100, autocomplete: 'off', spellcheck: 'false', placeholder: t('cert_fixed_placeholder') });
+  const fixedFollow = () => {
+    const now = fixedOf(form.querySelector('[name=host]')?.value, form.querySelector('[name=port]')?.value);
+    if (fixedIn.value.trim() === fixed.shown) fixedIn.value = now;   // (one typed in stays)
+    fixed.shown = now;
+  };
+  if (fixedIn) {
+    api('admin.certs').then((j) => { fixed.certs = j.certs || {}; fixedFollow(); }).catch(() => {});
+  }
   // wide, its fields and options in columns where they fit (one on a phone): less scrolling (app.css, .conn-edit)
   const form = h('form', { class: 'conn-edit', onsubmit: (e) => e.preventDefault() },
     opts.notes?.length > 0 && h('div', { class: 'notice small' }, opts.notes.map(([k, v]) => h('p', {}, t(k, v)))),
@@ -808,21 +818,24 @@ function editConn(c, keyboards, opts = {}) {
         check(t('mic'), { name: 'mic', checked: !!c.mic }),
         check(t('printer'), { name: 'printer', checked: c.printer }),
         h('div', {}, check(t('touch_multi'), { name: 'touch', checked: !!c.touch }), h('small', { class: 'muted' }, t('touch_multi_hint'))),
-        (admin || owner) && h('div', {}, check(t('record'), { name: 'record', checked: !!c.record }), h('small', { class: 'muted' }, t('record_hint'))),
+        // the administrator's to set: in their editors and in their own one (not a managed connection's, nor a manual one)
+        (admin || owner || (S.user.role === 'admin' && !locked && !occasional)) && h('div', {}, check(t('record'), { name: 'record', checked: !!c.record }), h('small', { class: 'muted' }, t('record_hint'))),
         !occasional && check(t('ask'), { name: 'ask', checked: c.ask })),
       h('p', { class: 'muted small', style: 'margin:.8rem 0 .4rem' }, t('perf')),
       h('div', { class: 'cols conn-perf' }, ['wallpaper', 'themes', 'smoothing', 'animations', 'drag'].map((k) => check(t('perf_' + k), { name: 'perf_' + k, checked: c.perf?.[k] }))),
+      fixedIn && field(t('cert_fixed'), fixedIn, t('cert_fixed_hint')),
       c.id && !admin && !owner && field(t('cert'), h('div', { class: 'row' }, h('span', { class: 'mono small' }, c.cert || t('cert_none')),
         (c.cert || Object.keys(c.certs || {}).length > 0) && btn(t('forget_cert'), (e) => attempt(async () => { await api('conns.forget_cert', { id: c.id }); e.target.closest('.row').firstChild.textContent = t('cert_none'); }), 'small')))),
     err);
   if (locked) form.querySelectorAll('input,select').forEach((el) => { if (!['password', 'forget'].includes(el.getAttribute('name'))) el.disabled = true; });
   else if (keepTarget) form.querySelectorAll('input,select').forEach((el) => { if (['host', 'port', 'user', 'domain', 'security', 'vm', 'wol', 'wol_ip', 'gw', 'lb'].includes(el.getAttribute('name'))) el.disabled = true; });
+  if (fixedIn) ['host', 'port'].forEach((n) => form.querySelector(`[name=${n}]`)?.addEventListener('input', fixedFollow));
   let saving = false;
   const values = (d) => ({
     id: c.id, name: d.name, group: d.group, host: d.host ?? c.host, port: +(d.port ?? c.port), user: d.user ?? c.user, domain: d.domain ?? c.domain, kbd: +d.kbd, bpp: +d.bpp,
     security: d.security ?? c.security, resize: d.resize, clipboard: !!d.clipboard, paste: d.paste, drive: !!d.drive, audio: !!d.audio, mic: !!d.mic, printer: !!d.printer, gfx: d.gfx, ask: occasional || !!d.ask,
     app: d.app || '', app_args: d.app_args || '', touch: !!d.touch, wol: (d.wol ?? c.wol ?? '').trim(), wol_ip: (d.wol_ip ?? c.wol_ip ?? '').trim(), vm: (d.vm ?? c.vm ?? '').trim(), vm_enhanced: !!d.vm_enhanced, gw: (d.gw ?? c.gw ?? '').trim(), lb: (d.lb ?? c.lb ?? '').trim(),
-    record: !!d.record,                                   // (only the administrator's editor has it: the gateway keeps it for the user's own)
+    record: !!d.record,                                   // (only an administrator's editors have it: the gateway takes it only from one)
     perf: Object.fromEntries(['wallpaper', 'themes', 'smoothing', 'animations', 'drag'].map((k) => [k, !!d['perf_' + k]])),
   });
   // a manual connection: kept in the web session by the gateway, its session opened in a new tab (that tab opened in the
@@ -865,7 +878,11 @@ function editConn(c, keyboards, opts = {}) {
       else if (d.forget && !owner) conn.password = '';
       const users = admin && (d.all_users ? ['*'] : admin.users.filter((u) => d['u_' + u.id]).map((u) => u.id));
       const save = opts.save ? () => opts.save(conn, admin ? users : !!d.forget) : () => api('conns.save', { conn });
-      once(async () => { await save(); toast(t('saved')); close(true); });
+      const fixedNow = fixedIn ? fixedIn.value.trim() : null;   // (the computer's: fixed first, refused before anything is saved)
+      once(async () => {
+        if (fixedNow !== null && fixedNow !== fixedOf(conn.host, conn.port)) await api('admin.cert.fix', { host: conn.host, port: conn.port, fingerprint: fixedNow });
+        await save(); toast(t('saved')); close(true);
+      });
     }, 'primary'),
   ]));
 }
@@ -1719,7 +1736,7 @@ function viewProfile() {
           const j = await api('totp.begin', { password: pw.value });
           const code = h('input', { inputmode: 'numeric', maxlength: 6, placeholder: '000000', autocomplete: 'one-time-code' });
           const qr = h('div', { class: 'qr' });
-          try { qr.innerHTML = qrSvg(j.uri, 5); } catch { /* too long for a QR code: the key below is typed in by hand */ }
+          try { qr.append(qrSvg(j.uri, 5)); } catch { /* too long for a QR code: the key below is typed in by hand */ }
           fill(twofa, h('p', {}, t('twofa_scan')), qr, h('p', { class: 'mono small' }, j.secret),
             field(t('code'), code), err, btn(t('verify'), () => attempt(async () => { await api('totp.enable', { code: code.value.trim() }); toast(t('saved')); render(); }, err), 'primary'));
         }, err), 'primary')), err);
@@ -1758,6 +1775,40 @@ function viewProfile() {
     profileActivity());
 }
 
+/**
+ * Recordings (#/recordings): the ones the user started in their own sessions, watched, downloaded as a video and deleted
+ * (after asking). In the menu of every user, administrators too (every one is in the administration); a user who may not
+ * record now is told so in a notice.
+ */
+function viewMyRecordings() {
+  const box = h('div', { class: 'table-wrap' }, t('loading'));
+  const err = errBox();
+  const load = () => attempt(async () => {
+    const { recordings: list } = await api('recordings.mine');
+    fill(box, list.length ? h('table', { class: 'list' },
+      h('thead', {}, h('tr', {}, [t('started'), t('conn_name'), t('rec_length'), t('size'), ''].map((x) => h('th', {}, x)))),
+      h('tbody', {}, list.map((r) => h('tr', {},
+        h('td', { class: 'small nowrap' }, fmtDate(r.started)), h('td', {}, r.conn),
+        h('td', { class: 'small nowrap' }, r.running ? h('span', { class: 'badge rec' }, t('rec_badge')) : r.ended ? clockText((r.seconds || 0) * 1000) : '—'),
+        h('td', { class: 'small nowrap' }, fmtSize(r.bytes || 0)),
+        h('td', { style: 'text-align:right;white-space:nowrap' },
+          btn('', () => { location.hash = '#/rec/' + r.id; }, 'small', 'play', t('rec_play')),
+          canDownload(r) && btn('', () => downloadRecordingVideo(r.id, r), 'small', 'download', t('rec_video')),
+          !r.running && btn('', () => attempt(async () => {   // (one left unclosed by a process killed: deleted too)
+            if (!await confirmDialog(t('rec_delete_q'))) return;
+            await api('recordings.delete', { id: r.id });
+            toast(t('rec_deleted'));
+            load();
+          }, err), 'small danger', 'trash', t('delete')))))))
+      : h('p', { class: 'muted' }, t('my_recs_none')), err);
+  }, err);
+  load();
+  // a user who may not record their sessions now (the setting off; an administrator always may): said in a notice
+  return h('div', {}, h('div', { class: 'toolbar' }, h('h1', {}, t('my_recs')), h('span', { class: 'spacer' }), btn('', load, 'small', 'refresh')),
+    !S.user.record_own && h('p', { class: 'warn banner', role: 'status' }, t('my_recs_off')),
+    h('div', { class: 'card' }, h('p', { class: 'muted small' }, t('my_recs_help')), box));
+}
+
 /** The user's own open remote sessions and trusted browsers, each one with a button to end or forget it. */
 function profileActivity() {
   const sessions = h('div', { class: 'table-wrap' }, t('loading'));
@@ -1789,12 +1840,212 @@ function profileActivity() {
 // ------------------------------------------------------------------ administration
 
 function viewAdmin(tab) {
-  const tabs = S.user.role === 'auditor' ? ['audit', 'sessions'] : ['users', 'conns', 'settings', 'sessions', 'audit', 'traces'];
+  const tabs = S.user.role === 'auditor' ? ['audit', 'sessions', 'recordings', 'status'] : ['users', 'conns', 'settings', 'sessions', 'recordings', 'audit', 'status', 'backup', 'traces'];
   tab = tabs.includes(tab) ? tab : tabs[0];
-  const body = { users: adminUsers, conns: adminConns, settings: adminSettings, sessions: adminSessions, audit: adminAudit, traces: adminTraces }[tab] || adminUsers;
+  const body = { users: adminUsers, conns: adminConns, settings: adminSettings, sessions: adminSessions, recordings: adminRecordings, audit: adminAudit,
+    status: adminStatus, backup: adminBackup, traces: adminTraces }[tab] || adminUsers;
   return h('div', {}, h('h1', {}, t('nav_admin')),
     h('nav', { class: 'tabs' }, tabs.map((k) => h('a', { href: '#/admin/' + k, class: k === tab ? 'active' : '' }, t(k)))),
     body());
+}
+
+/**
+ * The gateway's status: now (sessions, guests, recordings, the PHP processes and memory they take, the disk, the problems of
+ * yesterday and today, the server) and the use of the last 30 days (sessions a day, most at once, the computers used most),
+ * each chart with its table. Refreshed by hand; a refresh keeps what is shown, dimmed, until the answer comes.
+ */
+function adminStatus() {
+  const err = errBox();
+  const now = h('div', { class: 'status-now' }, t('loading'));
+  const use = h('div', { class: 'status-use' }, t('loading'));
+  const num = (n, d = 0) => Number(n).toLocaleString(getLang(), { maximumFractionDigits: d, minimumFractionDigits: d });
+  const tile = (label, value, note) => h('div', { class: 'tile' }, h('span', { class: 'tile-label' }, label), h('span', { class: 'tile-value' }, value),
+    note && h('span', { class: 'tile-note' }, note));
+  // a ratio against its limit: the fill's colour says how close (accent, then warning, then danger), the track the same hue
+  const meter = (label, used, total, text) => {
+    const r = total > 0 ? Math.min(1, used / total) : 0;
+    return h('div', { class: 'meter-row' }, h('span', { class: 'tile-label' }, label),
+      h('div', { class: 'meter' + (r >= 0.9 ? ' danger' : r >= 0.7 ? ' warn' : ''), role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': 100,
+        'aria-valuenow': Math.round(r * 100), 'aria-label': label }, h('span', { style: `width:${(r * 100).toFixed(1)}%` })),
+      h('span', { class: 'small muted' }, text));
+  };
+  const drawNow = (s) => {
+    const mem = s.memory, disk = s.disk;
+    fill(now,
+      h('div', { class: 'tiles' },
+        tile(t('st_sessions'), num(s.sessions), s.limit ? t('st_of_limit', num(s.limit)) : t('st_no_limit')),
+        tile(t('st_guests'), num(s.guests)), tile(t('st_recording'), num(s.recording)),
+        tile(t('st_processes'), num(s.processes), t('st_processes_note'))),
+      h('div', { class: 'meters' },
+        mem.limit > 0 ? meter(t('st_memory'), mem.largest, mem.limit, t('st_memory_text', fmtSize(mem.largest), fmtSize(mem.limit), fmtSize(mem.sessions)))
+          : h('p', { class: 'small muted' }, t('st_memory_unlimited', fmtSize(mem.sessions))),
+        disk.total ? meter(t('st_disk'), disk.total - disk.free, disk.total, t('st_disk_text', fmtSize(disk.free), fmtSize(disk.total), fmtSize(disk.recordings), num(disk.recordings_count)))
+          : h('p', { class: 'small muted' }, t('st_disk_unknown'))),
+      h('h3', {}, t('st_problems')),
+      h('div', { class: 'tiles' }, ['login_fail', 'session_error', 'cert_mismatch', 'access_denied'].map((k) => tile(t('st_' + k), num(s.problems[k])))),
+      h('h3', {}, t('st_server')),
+      h('table', { class: 'list kv' }, h('tbody', {}, [
+        [t('st_version'), s.server.version], ['PHP', `${s.server.php} (${s.server.sapi})`], [t('st_os'), s.server.os], ['OpenSSL', s.server.openssl],
+        [t('st_time_limit'), s.server.time_limit ? t('st_seconds', num(s.server.time_limit)) : t('st_no_limit')],
+        [t('st_housekeeping'), s.housekeeping ? fmtDate(s.housekeeping) : t('never')],
+        s.load && [t('st_load'), s.load.map((x) => num(x, 2)).join(' · ')],
+      ].filter(Boolean).map(([k, v]) => h('tr', {}, h('th', {}, k), h('td', {}, v))))));
+  };
+  // one tooltip for the charts: the value first, then what it is; on hover and on keyboard focus of each mark
+  const tip = h('div', { class: 'chart-tip', role: 'tooltip', hidden: true });
+  const showTip = (box, mark, lines) => {
+    fill(tip, lines.map(([v, l], i) => h('div', {}, h('strong', {}, v), ' ', h('span', { class: i ? 'muted' : '' }, l))));
+    tip.hidden = false;
+    box.append(tip);                                     // (in place first: its height is measured)
+    const b = box.getBoundingClientRect(), m = mark.getBoundingClientRect();
+    const above = m.top - b.top - tip.offsetHeight - 8;  // above the mark; beside its top where there is no room
+    const side = m.left - b.left + m.width + 8 + 180 <= b.width ? m.left - b.left + m.width + 8 : m.left - b.left - 188;
+    tip.style.left = `${above >= 0 ? Math.max(0, Math.min(b.width - 180, m.left - b.left + m.width / 2 - 90)) : Math.max(0, side)}px`;
+    tip.style.top = `${Math.max(0, above >= 0 ? above : m.top - b.top)}px`;
+  };
+  const hideTip = () => { tip.hidden = true; };
+  const NS = 'http://www.w3.org/2000/svg';
+  const svgEl = (tag, attrs) => { const e = document.createElementNS(NS, tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v)); return e; };
+  const niceMax = (v) => { if (v <= 4) return 4; const p = 10 ** Math.floor(Math.log10(v)); return [1, 2, 2.5, 5, 10].map((m) => m * p).find((m) => m >= v); };
+  const dayLabel = (d, o) => new Date(d + 'T12:00:00').toLocaleDateString(getLang(), o);
+  // columns a day, one hue; the y axis in round numbers, hairline grid; the highest one labelled; a limit drawn as a line
+  const columns = (days, key, label, describe, limit = 0) => {
+    const W = 640, H = 190, L = 34, R = 8, T = 14, B = 22, n = days.length, band = (W - L - R) / n, bw = Math.min(24, band * 0.62);
+    const max = niceMax(Math.max(1, limit, ...days.map((d) => d[key])));
+    const y = (v) => T + (H - T - B) * (1 - v / max);
+    const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}`, class: 'chart', role: 'img', 'aria-label': label });
+    for (let i = 0; i <= 4; i++) {
+      const v = (max / 4) * i, yy = Math.round(y(v)) + 0.5;
+      svg.append(svgEl('line', { x1: L, x2: W - R, y1: yy, y2: yy, class: 'grid' }));
+      const tx = svgEl('text', { x: L - 6, y: yy + 4, class: 'tick', 'text-anchor': 'end' });
+      tx.textContent = num(v, max < 4 ? 1 : 0);
+      svg.append(tx);
+    }
+    if (limit > 0) {
+      const ly = Math.round(y(limit)) + 0.5;
+      svg.append(svgEl('line', { x1: L, x2: W - R, y1: ly, y2: ly, class: 'limit' }));
+      const lt = svgEl('text', { x: W - R, y: ly - 4, class: 'tick', 'text-anchor': 'end' });
+      lt.textContent = t('st_limit_line', num(limit));
+      svg.append(lt);
+    }
+    const top = days.reduce((a, d, i) => (d[key] > days[a][key] ? i : a), 0);
+    const box = h('div', { class: 'chart-box' }, svg);
+    days.forEach((d, i) => {
+      const x = L + band * i + (band - bw) / 2, v = d[key], y0 = y(0), y1 = y(v), r = Math.min(4, y0 - y1);
+      const col = v > 0 && svgEl('path', { class: 'chart-col', d: `M${x},${y0}V${y1 + r}Q${x},${y1} ${x + r},${y1}H${x + bw - r}Q${x + bw},${y1} ${x + bw},${y1 + r}V${y0}Z` });   // its data end rounded, square at the baseline
+      col && svg.append(col);
+      if (i % 5 === (n - 1) % 5) {
+        const tx = svgEl('text', { x: x + bw / 2, y: H - 6, class: 'tick', 'text-anchor': 'middle' });
+        tx.textContent = dayLabel(d.day, { day: 'numeric', month: 'short' });
+        svg.append(tx);
+      }
+      if (i === top && v > 0) {
+        const tx = svgEl('text', { x: x + bw / 2, y: y1 - 4, class: 'value', 'text-anchor': 'middle' });
+        tx.textContent = num(v);
+        svg.append(tx);
+      }
+      const hit = svgEl('rect', { x: L + band * i, y: T, width: band, height: H - T - B, class: 'hit', tabindex: 0, 'aria-label': describe(d).map((p) => p.join(' ')).join(', ') });
+      const show = () => showTip(box, col || hit, describe(d));
+      hit.addEventListener('pointerenter', show);
+      hit.addEventListener('focus', show);
+      hit.addEventListener('pointerleave', hideTip);
+      hit.addEventListener('blur', hideTip);
+      svg.append(hit);
+    });
+    return box;
+  };
+  const table = (head, rows) => h('details', { class: 'chart-table' }, h('summary', {}, t('st_table')),
+    h('table', { class: 'list' }, h('thead', {}, h('tr', {}, head.map((x) => h('th', {}, x)))), h('tbody', {}, rows.map((r) => h('tr', {}, r.map((c) => h('td', {}, c)))))));
+  const drawUse = (u, limit) => {
+    const day = (d) => [[dayLabel(d.day, { weekday: 'short', day: 'numeric', month: 'short' }), ''], [num(d.sessions), t('st_t_sessions')],
+      [num(d.hours, 1), t('st_t_hours')], [num(d.peak), t('st_t_peak')]];
+    const any = u.days.some((d) => d.sessions || d.peak);
+    // the computers used most: ranked bars, one hue, the hours at each bar's end
+    const most = u.hosts[0]?.hours || 1;
+    const bars = h('div', { class: 'hbars' }, u.hosts.map((x) => {
+      const row = h('div', { class: 'hbar', tabindex: 0, 'aria-label': `${x.host}: ${num(x.hours, 1)} h, ${num(x.sessions)} ${t('st_t_sessions')}` },
+        h('span', { class: 'hbar-name', title: x.host }, x.host), h('span', { class: 'hbar-track' }, h('span', { class: 'hbar-fill', style: `width:${Math.max(1, (x.hours / most) * 100).toFixed(1)}%` })),
+        h('span', { class: 'hbar-value' }, num(x.hours, 1) + ' h'));
+      const show = () => showTip(bars, row.querySelector('.hbar-fill'), [[x.host, ''], [num(x.hours, 1), t('st_t_hours')], [num(x.sessions), t('st_t_sessions')]]);
+      row.addEventListener('pointerenter', show);
+      row.addEventListener('focus', show);
+      row.addEventListener('pointerleave', hideTip);
+      row.addEventListener('blur', hideTip);
+      return row;
+    }));
+    fill(use, !any ? h('p', { class: 'muted' }, t('st_no_use')) : [
+      h('h3', {}, t('st_per_day')), columns(u.days, 'sessions', t('st_per_day'), day),
+      h('h3', {}, t('st_peak')), columns(u.days, 'peak', t('st_peak'), day, limit),
+      table([t('st_h_day'), t('st_h_sessions'), t('st_h_hours'), t('st_h_peak')], u.days.slice().reverse().map((d) => [dayLabel(d.day, { weekday: 'short', day: 'numeric', month: 'short' }),
+        num(d.sessions), num(d.hours, 1), num(d.peak)])),
+      h('h3', {}, t('st_hosts')),
+      u.hosts.length ? bars : h('p', { class: 'muted' }, t('st_no_use')),
+      u.hosts.length > 0 && table([t('st_h_host'), t('st_h_hours'), t('st_h_sessions')], u.hosts.map((x) => [x.host, num(x.hours, 1), num(x.sessions)])),
+    ]);
+  };
+  const load = () => {
+    [now, use].forEach((e) => e.classList.add('refreshing'));
+    attempt(async () => {
+      try {
+        const [st, us] = await Promise.all([api('admin.status'), api('admin.usage')]);
+        drawNow(st.status);
+        drawUse(us, st.status.limit);
+      } finally {
+        [now, use].forEach((e) => e.classList.remove('refreshing'));
+      }
+    }, err);
+  };
+  load();
+  return h('div', {}, h('div', { class: 'toolbar' }, h('span', { class: 'spacer' }), btn('', load, 'small', 'refresh', t('refresh'))), err,
+    h('div', { class: 'card' }, h('h2', {}, t('st_now')), now), h('div', { class: 'card' }, h('h2', {}, t('st_usage')), use));
+}
+
+/**
+ * A backup of the installation, encrypted with a password of its own (downloaded as it is made), and its restore: the file
+ * sent in pieces, checked whole by the gateway, then put in place; every session ends (the users are the backup's).
+ */
+function adminBackup() {
+  const err = errBox(), rerr = errBox();
+  const pw = h('input', { type: 'password', autocomplete: 'new-password', minlength: 10 }), pw2 = h('input', { type: 'password', autocomplete: 'new-password' });
+  const files = h('input', { type: 'checkbox' }), recs = h('input', { type: 'checkbox' });
+  const make = () => attempt(async () => {
+    if (pw.value !== pw2.value) throw new ApiError('backup_mismatch');
+    const { id } = await api('admin.backup.prepare', { password: pw.value, with: [files.checked && 'files', recs.checked && 'recordings'].filter(Boolean) });
+    pw.value = pw2.value = '';
+    location.href = 'backup.php?a=download&id=' + id;   // (an attachment: the page stays)
+  }, err);
+  const file = h('input', { type: 'file', accept: '.mudeskbackup' });
+  const rpw = h('input', { type: 'password', autocomplete: 'off' });
+  const progress = h('p', { class: 'small muted', role: 'status' });
+  const restore = () => attempt(async () => {
+    const f = file.files?.[0];
+    if (!f) throw new ApiError('backup_format');
+    if (!await confirmDialog(t('bk_restore_q'))) return;
+    const id = [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, '0')).join('');
+    for (let o = 0; o < f.size || o === 0; o += 2 << 20) {   // in pieces of 2 MB: within the hosting's limits
+      fill(progress, t('bk_uploading', Math.floor((o / Math.max(1, f.size)) * 100)));
+      const r = await fetch(`backup.php?a=upload&id=${id}&o=${o}`, { method: 'POST', headers: { 'X-CSRF': S.csrf, 'Content-Type': 'application/octet-stream' },
+        body: f.slice(o, o + (2 << 20)) });
+      if (!r.ok) throw new ApiError((await r.json().catch(() => ({}))).error || 'internal');
+      if (f.size === 0) break;
+    }
+    fill(progress, t('bk_checking'));
+    try {
+      await api('admin.backup.restore', { id, password: rpw.value });
+    } finally {
+      fill(progress);
+    }
+    toast(t('bk_restored'));
+    setTimeout(() => location.reload(), 1500);           // (signed out: the users are the backup's)
+  }, rerr);
+  return h('div', {},
+    h('div', { class: 'card' }, h('h2', {}, t('bk_make_h')), h('p', { class: 'small muted' }, t('bk_make_help')),
+      h('div', { class: 'cols' }, field(t('bk_password'), pw), field(t('bk_password2'), pw2)),
+      h('label', { class: 'check' }, files, t('bk_files')), h('label', { class: 'check' }, recs, t('bk_recordings')),
+      err, h('div', { class: 'row end' }, btn(t('bk_download'), make, 'primary', 'download'))),
+    h('div', { class: 'card' }, h('h2', {}, t('bk_restore_h')), h('p', { class: 'small muted' }, t('bk_restore_help')),
+      h('div', { class: 'cols' }, field(t('bk_file'), file), field(t('bk_password'), rpw)),
+      progress, rerr, h('div', { class: 'row end' }, btn(t('bk_restore'), restore, 'danger'))));
 }
 
 function adminUsers() {
@@ -1912,8 +2163,8 @@ function adminSettings() {
       h('textarea', { name: k + '_list', rows: 5, class: 'mono', spellcheck: 'false' }, s[k].list.join('\n')),
       h('small', { class: 'muted' }, t('list_hint')));
     const nums = ['login_max_attempts', 'login_lock_minutes', 'login_global_max', 'session_idle_minutes', 'rdp_idle_minutes', 'max_sessions_per_user', 'max_sessions_total',
-      'reconnect_attempts', 'audit_retention_days', 'files_quota_mb', 'record_days'];
-    const help = { max_sessions_total: t('s_max_sessions_total_help') };
+      'reconnect_attempts', 'audit_retention_days', 'files_quota_mb', 'record_days', 'share_control_idle_minutes'];
+    const help = { max_sessions_total: t('s_max_sessions_total_help'), record_days: t('s_record_days_help'), share_control_idle_minutes: t('s_share_control_idle_minutes_help') };
     const form = h('form', { onsubmit: (e) => e.preventDefault() },
       list('clients'), list('targets'),
       h('div', { class: 'card' }, h('div', { class: 'cols' }, nums.map((k) => field(t('s_' + k), h('input', { name: k, type: 'number', value: s[k] }), help[k]))),
@@ -1921,6 +2172,7 @@ function adminSettings() {
         check(t('s_trace_all'), { name: 'trace_all', checked: s.trace_all }),
         check(t('s_save_passwords'), { name: 'save_passwords', checked: s.save_passwords }), h('small', { class: 'muted' }, t('s_save_passwords_help')),
         check(t('s_users_create_conns'), { name: 'users_create_conns', checked: !!s.users_create_conns }), h('small', { class: 'muted' }, t('s_users_create_conns_help')),
+        check(t('s_record_users'), { name: 'record_users', checked: !!s.record_users }), h('small', { class: 'muted' }, t('s_record_users_help')),
         check(t('s_kerberos_rc4'), { name: 'kerberos_rc4', checked: !!s.kerberos_rc4 }), h('small', { class: 'warn' }, t('s_kerberos_rc4_help')),
         field(t('s_timezone'), h('input', { name: 'timezone', value: s.timezone, list: 'tz-list', placeholder: serverTz, autocomplete: 'off', spellcheck: 'false' }), t('s_timezone_help', serverTz)),
         h('datalist', { id: 'tz-list' }, zones.map((z) => h('option', { value: z })))),
@@ -1949,6 +2201,7 @@ function adminSettings() {
         const settings = {
           clients: { mode: d.clients_mode, list: lines('clients') }, targets: { mode: d.targets_mode, list: lines('targets') },
           totp_required: !!d.totp_required, trace_all: !!d.trace_all, save_passwords: !!d.save_passwords, users_create_conns: !!d.users_create_conns,
+          record_users: !!d.record_users,
           kerberos_rc4: !!d.kerberos_rc4,
           timezone: (d.timezone || '').trim(),
           oidc_issuer: d.oidc_issuer.trim(), oidc_client_id: d.oidc_client_id.trim(), oidc_secret: d.oidc_secret, oidc_label: d.oidc_label.trim(),
@@ -1975,9 +2228,16 @@ function adminSessions() {
     const { sessions } = await api('admin.sessions');
     fill(box, sessions.length ? h('table', { class: 'list' },
       h('thead', {}, h('tr', {}, [t('username'), t('conn_name'), t('host'), t('origin'), t('started'), ''].map((x) => h('th', {}, x)))),
-      h('tbody', {}, sessions.map((s) => h('tr', {}, h('td', {}, s.user), h('td', {}, s.conn), h('td', { class: 'mono small' }, s.host),
+      h('tbody', {}, sessions.map((s) => h('tr', {}, h('td', {}, s.user),
+        h('td', {}, s.conn, s.record && [' ', h('span', { class: 'badge rec', title: t('rec_badge') }, t('rec_conn'))]), h('td', { class: 'mono small' }, s.host),
         h('td', { class: 'mono small' }, s.ip), h('td', { class: 'small' }, fmtDate(s.started)),
-        h('td', { style: 'text-align:right' }, S.user.role === 'admin' && btn(t('terminate'), () => attempt(async () => { await api('admin.sessions.kill', { sid: s.sid }); setTimeout(load, 1500); }), 'small danger')))))) : h('p', { class: 'muted' }, t('no_sessions')));
+        h('td', { style: 'text-align:right;white-space:nowrap' }, S.user.role === 'admin' && [
+          // (the session's page records it: the list read again once it said so)
+          (!s.app || s.record) && btn(t(s.record ? 'rec_stop' : 'rec_start'), () => attempt(async () => {   // (RemoteApp: only stopped)
+            await api('admin.sessions.record', { sid: s.sid, on: !s.record });
+            setTimeout(load, 1500);
+          }), 'small', s.record ? 'stop' : 'rec'), ' ',
+          btn(t('terminate'), () => attempt(async () => { await api('admin.sessions.kill', { sid: s.sid }); setTimeout(load, 1500); }), 'small danger')]))))) : h('p', { class: 'muted' }, t('no_sessions')));
   });
   load();
   return h('div', {}, h('div', { class: 'toolbar' }, h('span', { class: 'spacer' }), btn('', load, 'small', 'refresh')), box);
@@ -2001,7 +2261,7 @@ function adminAudit() {
     const { _d, _n, ...rec } = r;
     modal(r.event, h('div', {}, bad.has(_d + ':' + _n) && h('p', { class: 'error' }, t('audit_' + bad.get(_d + ':' + _n))),
       h('pre', { class: 'mono small audit-json' }, JSON.stringify(rec, null, 2)), h('p', { class: 'small muted' }, `${_d} · #${_n}`)),
-      (close) => [r.recording && r.sid && btn(t('rec_play'), () => { close(); location.hash = '#/rec/' + r.sid; }, 'primary', 'play'),
+      (close) => [r.recording && (r.rec || r.sid) && btn(t('rec_play'), () => { close(); location.hash = '#/rec/' + (r.rec || r.sid); }, 'primary', 'play'),
         btn(t('close'), () => close())].filter(Boolean));
   };
   const brief = (r) => Object.entries(r).filter(([k]) => !['t', 'ip', 'user', 'event', 'ok', 'ua', 'ws', 'p', 'h', '_d', '_n'].includes(k))
@@ -2014,7 +2274,7 @@ function adminAudit() {
         onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); detail(r); } } },
         h('td', { class: 'small nowrap' }, fmtDate(r.t)), h('td', {}, r.user || ''), h('td', { class: 'mono small nowrap' }, r.ip),
         h('td', { class: 'nowrap' }, h('span', { class: 'badge' + (r.ok === true ? ' on' : r.ok === false ? ' fail' : '') }, r.event),
-          r.recording && r.sid && [' ', h('span', { class: 'badge rec', title: t('rec_play') }, t('rec_conn'))]),
+          r.recording && (r.rec || r.sid) && [' ', h('span', { class: 'badge rec', title: t('rec_play') }, t('rec_conn'))]),
         h('td', { class: 'mono small audit-brief' }, brief(r)));
     })))
     : h('p', { class: 'muted' }, t('audit_none')),
@@ -2037,7 +2297,7 @@ function adminAudit() {
   // kept byte for byte in a ZIP (audit.json and audit.json.sig). The CSV is made here and not signed.
   const save = (fmt) => attempt(async () => {
     const r = await fetch('api.php', { method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/json', 'X-CSRF': S.csrf },
-      body: JSON.stringify({ action: 'admin.audit', filter: filter(), export: fmt }) });
+      body: JSON.stringify({ action: 'admin.audit', filter: filter(), export: fmt === 'json' ? 'json' : 'rows' }) });
     if (!r.ok) throw new ApiError((await r.json().catch(() => ({}))).error || 'internal');
     const bytes = new Uint8Array(await r.arrayBuffer());
     const end = fmt === 'json' ? bytes.lastIndexOf(10) + 1 : bytes.length;   // the file ends with a line break
@@ -2082,6 +2342,31 @@ function adminAudit() {
       h('span', { class: 'spacer' }), btn('CSV', () => save('csv'), 'small', 'download', t('audit_export')), btn('JSON', () => save('json'), 'small', 'download', t('audit_export_signed')),
       btn(t('audit_verify'), verify, 'small', 'lock')), keyInfo),
     integrity, sum, box);
+}
+
+/** Every recording, the newest first (administrators and auditors): who, which connection, who started it; watched and downloaded. */
+function adminRecordings() {
+  const box = h('div', { class: 'card table-wrap' }, t('loading'));
+  const who = (r) => r.started_as === 'admin' ? t('rec_by_admin', r.by || '') : t('rec_by_' + (r.started_as === 'owner' ? 'owner' : 'policy'));
+  const load = () => attempt(async () => {
+    const { recordings: list, keep_days: days } = await api('admin.recordings');
+    fill(box, h('p', { class: 'small muted' }, days > 0 ? t('recs_hint', days) : t('recs_hint_kept')), list.length ? h('table', { class: 'list' },
+      h('thead', {}, h('tr', {}, [t('started'), t('username'), t('conn_name'), t('rec_who'), t('rec_length'), t('size'), ''].map((x) => h('th', {}, x)))),
+      h('tbody', {}, list.map((r) => h('tr', {},
+        h('td', { class: 'small nowrap' }, fmtDate(r.started)), h('td', {}, r.user || ''), h('td', {}, r.conn || ''), h('td', { class: 'small' }, who(r)),
+        h('td', { class: 'small nowrap' }, r.running ? h('span', { class: 'badge rec' }, t('rec_badge')) : r.ended ? clockText((r.seconds || 0) * 1000) : '—'),
+        h('td', { class: 'small nowrap' }, fmtSize(r.bytes || 0)),
+        h('td', { style: 'text-align:right;white-space:nowrap' }, btn('', () => { location.hash = '#/rec/' + r.id; }, 'small', 'play', t('rec_play')),
+          canDownload(r) && btn('', () => downloadRecordingVideo(r.id, r), 'small', 'download', t('rec_video')),
+          S.user.role === 'admin' && !r.running && btn('', () => attempt(async () => {   // (an auditor only reads)
+            if (!await confirmDialog(t('rec_delete_q'))) return;
+            await api('admin.recordings.delete', { id: r.id });
+            toast(t('rec_deleted'));
+            load();
+          }), 'small danger', 'trash', t('delete'))))))) : h('p', { class: 'muted' }, t('recs_none')));
+  });
+  load();
+  return h('div', {}, h('div', { class: 'toolbar' }, h('span', { class: 'spacer' }), btn('', load, 'small', 'refresh')), box);
 }
 
 function adminTraces() {
@@ -2132,10 +2417,28 @@ async function viewSession(id) {
   const mainFull = fullOnStart(canvas, window, root, () => s.focus());
   let startFull = false;
   const s = new RdpSession({ container: root, canvas, keyboard, conn, csrf: S.csrf, retries: S.user.reconnect ?? 10, onState });
-  // recorded by the administrator: said while the session lasts
+  // recorded (by the connection, an administrator or the user): said while it lasts; the bar's button follows it
   const recBadge = h('div', { class: 'rec-badge hidden', role: 'status' }, t('rec_badge'));
   root.append(recBadge);
-  s.onRecording = (on) => recBadge.classList.toggle('hidden', !on);
+  let recOn = false, recBy = null, recBtn = null;
+  const drawRec = () => {
+    if (!recBtn) return;
+    // (one recorded by the connection or by an administrator: only an administrator stops it)
+    recBtn.hidden = recOn && recBy !== 'owner' && S.user.role !== 'admin';
+    const title = t(recOn ? 'rec_stop' : 'rec_start');
+    recBtn.replaceChildren(icon(recOn ? 'stop' : 'rec'));
+    recBtn.setAttribute('title', title);
+    recBtn.setAttribute('aria-label', title);
+    recBtn.classList.add('rec');
+    recBtn.classList.toggle('on', recOn);
+  };
+  s.onRecording = (on, by, error) => {
+    recOn = on;
+    recBy = by || null;
+    recBadge.classList.toggle('hidden', !on);
+    drawRec();
+    if (error) toast(errText(error), true);
+  };
   // a message of the Remote Desktop Gateway: one to accept before connecting (its consent message: declined, no connection),
   // or one to read (a service message, also during the session). One window at a time; a text already waiting, or more than
   // three, left out (a gateway sending many stacked windows without end); closed, as declined, when the session ends or
@@ -2154,7 +2457,7 @@ async function viewSession(id) {
   // shared with links: how many guests watch, always in sight while any does
   const watching = h('div', { class: 'watch-badge owner hidden', role: 'status' });
   root.append(watching);
-  let watchers = 0, shares = [], made = null, shareMode = 'view';   // the session's links; the one just made, with its address
+  let watchers = 0, shares = [], made = null, shareMode = 'view', shareFor = 0;   // the session's links; the one just made, with its address
   s.onViewers = (n) => {
     watchers = n;
     fill(watching, icon('eye'), ' ', t('share_viewers', n));
@@ -2330,9 +2633,12 @@ async function viewSession(id) {
     }
     const mode = h('select', { 'aria-label': t('share_mode'), onchange: () => { shareMode = mode.value; } },
       h('option', { value: 'view', selected: shareMode === 'view' }, t('share_view')), h('option', { value: 'control', selected: shareMode === 'control' }, t('share_control')));
+    // how long the link lasts: as long as the session, or less
+    const until = h('select', { 'aria-label': t('share_expiry'), onchange: () => { shareFor = +until.value; } },
+      [0, 15, 60, 240].map((m) => h('option', { value: m, selected: shareFor === m }, t('share_exp_' + m))));
     const url = (link) => location.href.split('#')[0] + '#/watch/' + link;
     const make = () => attempt(async () => {
-      const j = await api('session.share', { sid: s.sid, mode: mode.value });
+      const j = await api('session.share', { sid: s.sid, mode: mode.value, minutes: +until.value });
       ({ shares } = j);
       made = { id: j.id, url: url(j.link), mode: j.mode };
       showShare();
@@ -2344,12 +2650,13 @@ async function viewSession(id) {
       showShare();
     });
     fill(panel, panelHead(t('share')), h('p', { class: 'small muted' }, t('share_hint')),
-      h('div', { class: 'row' }, mode, btn(t('share_make'), make, 'small primary', 'share')),
+      h('div', { class: 'row' }, mode, until, btn(t('share_make'), make, 'small primary', 'share')),
       made && h('div', { class: 'row share-made' }, h('input', { readonly: true, value: made.url, 'aria-label': t('share_link'), onfocus: (e) => e.target.select() }),
         btn('', () => navigator.clipboard?.writeText(made.url).then(() => toast(t('share_copied')), () => toast(t('clip_denied'), true)), 'small', 'copy', t('copy'))),
       h('p', { class: 'small' }, icon('eye'), ' ', t('share_viewers', watchers)),
       shares.length ? h('ul', { class: 'share-list' }, shares.map((x) => h('li', {},
-        h('span', { class: 'spacer' }, t(x.mode === 'control' ? 'share_control' : 'share_view'), h('span', { class: 'small muted' }, ' · ', fmtDate(x.created))),
+        h('span', { class: 'spacer' }, t(x.mode === 'control' ? 'share_control' : 'share_view'), h('span', { class: 'small muted' }, ' · ', fmtDate(x.created),
+          x.expires && [' · ', t('share_expires', new Date(x.expires).toLocaleTimeString(getLang(), { hour: '2-digit', minute: '2-digit' }))])),
         btn(t('share_revoke'), () => revoke(x.id), 'small danger', 'x'))))
         : h('p', { class: 'small muted' }, t('share_none')));
   }
@@ -2636,7 +2943,7 @@ async function viewSession(id) {
       onRefused: () => toast(t('local_folder_refused'), true, 10000),
     }) : null;
     if (s.audio || s.mic) {
-      const unlock = () => { s.audio?.unlock(); s.mic?.unlock(); };   // touch screens allow sound from pointerup / touchend, not pointerdown
+      const unlock = () => { s.audio?.unlock(); s.mic?.unlock(); s.recorder?.unlock(); };   // touch screens allow sound from pointerup / touchend, not pointerdown
       for (const type of ['pointerdown', 'pointerup', 'touchend', 'keydown']) root.addEventListener(type, unlock, true);
     }
     const muteBtn = s.audio && barBtn('sound', t('mute'), (e) => {
@@ -2687,9 +2994,14 @@ async function viewSession(id) {
       clip && barBtn('clip', t('clipboard_panel'), () => toggle('clip', showClip), 'clip'),
       (clip || s.folder) && barBtn('folder', t('files_panel'), () => toggle('files', showFiles), 'files'),
       !conn.app && barBtn('share', t('share'), () => toggle('share', () => showShare(true)), 'share'),
+      (recBtn = S.user.record_own && !conn.app ? barBtn('rec', t('rec_start'), () => attempt(async () => {
+        if (!s.sid) return;
+        await api('session.record', { sid: s.sid, on: !recOn });
+      })) : null),
       barBtn('power', t('disconnect'), () => { s.stop(); }),
       barBtn('up', t('hide_toolbar'), () => bar.classList.toggle('tucked')),
       h('button', { type: 'button', class: 'handle', 'aria-label': t('show_toolbar'), onclick: () => bar.classList.remove('tucked') }, icon('down')));
+    drawRec();
     placeBar();                                          // where it was left (its width known now)
     if (clip) {
       root.dataset.drop = t('drop_hint');                  // shown while files are dragged over the session
@@ -2933,9 +3245,17 @@ async function viewSession(id) {
     if (state === 'connecting' || state === 'reconnecting') return box(h('div', { class: 'spinner' }), state === 'connecting' ? t('connecting') : t('reconnecting', info.attempt, S.user.reconnect));
     if (state === 'waking') return box(h('div', { class: 'spinner' }), t('waking'));
     // ended
-    if (info.end === 'cert_changed') {
-      return box(h('h2', {}, info.host ? t('r_cert_changed_host', info.host) : t('r_cert_changed')), h('p', {}, t('cert_changed')), h('p', { class: 'small' }, t('cert_new')), h('p', { class: 'mono small' }, info.detail),
-        h('div', { class: 'row end' }, btn(t('cancel'), closeTab), btn(t('accept_cert'), () => { extra.trust = info.detail; s.start(extra); }, 'primary')));
+    // a certificate: never seen (the user compares its fingerprints and trusts it), changed, or not the one set in the connection
+    // (no way on but its maker's); its SHA-1 as Windows shows it
+    if (['cert_new', 'cert_changed', 'cert_unexpected'].includes(info.end)) {
+      const k = info.end.slice(5), prints = h('div', { class: 'cert-prints' }, h('p', { class: 'small' }, t('cert_sha256')), h('p', { class: 'mono small' }, fingerprint(info.detail)),
+        info.sha1 && h('p', { class: 'small' }, t('cert_sha1')), info.sha1 && h('p', { class: 'mono small' }, fingerprint(info.sha1)));
+      // an administrator trusts it for every user of this computer (a renewed one in place of the one fixed: only so)
+      const all = S.user.role === 'admin' && !info.host && h('input', { type: 'checkbox', checked: true, disabled: info.end === 'cert_unexpected' });
+      return box(h('h2', {}, info.host ? t(`r_cert_${k}_host`, info.host) : t(`r_cert_${k}`)), h('p', {}, t(`cert_${k}_text`)), prints,
+        all && h('label', { class: 'check' }, all, t('cert_all')),
+        h('div', { class: 'row end' }, info.end === 'cert_unexpected' && !all ? btn(t('close'), closeTab, 'primary')
+          : [btn(t('cancel'), closeTab), btn(t('accept_cert'), () => { extra.trust = info.detail; extra.trust_all = !!all?.checked; s.start(extra); }, 'primary')]));
     }
     if (['auth_failed', 'gateway_auth'].includes(info.end) && !conn.has_pass) return askCredentials();   // (the gateway's: the same password)
     const ei = info.errorInfo && t('ei_' + info.errorInfo) !== 'ei_' + info.errorInfo ? t('ei_' + info.errorInfo) : null;
@@ -2962,17 +3282,117 @@ const clockText = (ms) => {
   return hh ? `${hh}:${String(mm).padStart(2, '0')}:${ss}` : `${mm}:${ss}`;
 };
 
-/** A session's recording (#/rec/<sid>), for administrators and auditors: played with the session's own decoders. */
+/**
+ * The video (WebM) of recording `sid` ({conn, started, seconds, sound, width, height} of its details: info), made in this
+ * browser as fast as it goes and saved, once the user said yes to the room it may take (by how long it lasts); a window
+ * shows how far it got, its Cancel stops it.
+ */
+async function downloadRecordingVideo(sid, info) {
+  if (info.kind === 'video') return downloadPageVideo(sid, info);
+  const room = videoEstimate(info);
+  const go = await modal(t('rec_video'), h('p', {}, t('rec_video_size', fmtSize(room.most), fmtSize(room.about))),
+    (close) => [btn(t('cancel'), () => close(false)), btn(t('download'), () => close(true), 'primary', 'download')]);
+  if (!go) return;
+  const total = info.ended ? (info.seconds || 0) * 1000 : Math.max(1000, Date.now() - (Date.parse(info.started) || Date.now()));
+  const ctrl = new AbortController();
+  const done = h('progress', { max: Math.max(1000, total), value: 0 });
+  const at = h('span', { class: 'small muted' }, clockText(0) + ' / ' + clockText(total));
+  let closeIt = null;
+  modal(t('rec_video'), h('div', { class: 'rec-video' }, h('p', { class: 'small' }, t('rec_video_making')), done, at),
+    (close) => { closeIt = close; return [btn(t('cancel'), () => close(null))]; }).then(() => ctrl.abort());
+  const name = recFileName(info, 'webm');
+  recordingVideo({ sid, info, csrf: S.csrf, signal: ctrl.signal, onProgress: (ms) => { done.value = ms; at.textContent = clockText(ms) + ' / ' + clockText(total); } })
+    .then((blob) => { saveBlob(blob, name); closeIt?.(true); }, (e) => {
+      if (e?.message === 'stopped') return;
+      closeIt?.(false);
+      const known = ['video_unsupported', 'recording_damaged', 'not_found', 'forbidden'];
+      toast(errText(known.includes(e?.message) ? e.message : 'video_failed'), true);
+    });
+}
+
+/** A recording's file name: mudesk-<connection>-<when it started>.<ext>. */
+const recFileName = (info, ext) => ('mudesk-' + (info.conn || 'session') + '-' + String(info.started || '').slice(0, 16)).replace(/[^\w.-]+/g, '_') + '.' + ext;
+
+/** Whether this browser downloads recording r as a video: one made in the page is one already; another is made here (WebCodecs). */
+const canDownload = (r) => r.kind === 'video' || canMakeVideo();
+
+/**
+ * The video of a recording made in the page (WebM, or MP4 from Safari), saved once the user said yes to its size: read
+ * from the gateway (blob: already read by the player), a window showing how far it got, its Cancel stopping it.
+ */
+async function downloadPageVideo(sid, info, blob = null) {
+  const go = await modal(t('rec_video'), h('p', {}, t('rec_file_size', fmtSize(info.bytes || 0))),
+    (close) => [btn(t('cancel'), () => close(false)), btn(t('download'), () => close(true), 'primary', 'download')]);
+  if (!go) return;
+  const name = recFileName(info, info.mime === 'video/mp4' ? 'mp4' : 'webm');
+  if (blob) { saveBlob(blob, name); return; }
+  const ctrl = new AbortController();
+  const done = h('progress', { max: Math.max(1, info.bytes || 1), value: 0 });
+  let closeIt = null;
+  modal(t('rec_video'), h('div', { class: 'rec-video' }, h('p', { class: 'small' }, t('rec_loading')), done),
+    (close) => { closeIt = close; return [btn(t('cancel'), () => close(null))]; }).then(() => ctrl.abort());
+  loadPageVideo({ sid, csrf: S.csrf, mime: info.mime, signal: ctrl.signal, onProgress: (n) => { done.value = n; } })
+    .then((b) => { saveBlob(b, name); closeIt?.(true); }, (e) => {
+      if (ctrl.signal.aborted) return;
+      closeIt?.(false);
+      if (e?.blob) saveBlob(e.blob, name);               // (what could be read of it)
+      toast(errText(['not_found', 'forbidden'].includes(e?.message) ? e.message : 'recording_damaged'), true);
+    });
+}
+
+/**
+ * A recording made in the page (#/rec/<sid>, kind "video"): its video read whole from the gateway, then played by the
+ * browser's own player (pause, position, speed, full screen), and downloaded as it is.
+ */
+function viewPageVideo(sid, info, back) {
+  const video = h('video', { class: 'rec-play', controls: true, playsinline: true });
+  const overlay = h('div', { class: 'overlay' });
+  const box = (...c) => fill(overlay, h('div', { class: 'box' }, ...c));
+  let blob = null, url = null;
+  const dl = h('button', { type: 'button', title: t('rec_video'), 'aria-label': t('rec_video'), disabled: true, onclick: () => downloadPageVideo(sid, info, blob) }, icon('download'));
+  const bar = h('div', { class: 'rec-bar' }, h('a', { href: back, title: t('back'), 'aria-label': t('back') }, icon('x')), dl,
+    h('span', { class: 'rec-who' }, `${info.user || ''} · ${info.conn || ''} · ${fmtDate(info.started)}`, info.truncated ? ' · ' + t('rec_cut') : ''));
+  fill(app, h('div', { class: 'session rec' }, video, overlay, bar));
+  endRdp();                                              // a session left by a previous view of this page
+  const ctrl = new AbortController();
+  currentRdp = { stop: () => { ctrl.abort(); video.removeAttribute('src'); if (url) URL.revokeObjectURL(url); } };   // (let go when the page is left)
+  const got = h('progress', { max: Math.max(1, info.bytes || 1), value: 0 });
+  box(h('p', {}, t('rec_loading')), got);
+  const show = (b) => {
+    blob = b;
+    url = URL.createObjectURL(b);
+    video.src = url;
+    dl.disabled = false;
+    overlay.classList.add('hidden');
+    video.play().catch(() => {});                        // (a browser that does not play on its own: its play button)
+  };
+  loadPageVideo({ sid, csrf: S.csrf, mime: info.mime, signal: ctrl.signal, onProgress: (n) => { got.value = n; } }).then(show, (e) => {
+    if (ctrl.signal.aborted) return;
+    if (e?.blob?.size) { show(e.blob); toast(errText('recording_damaged'), true); return; }   // (what could be read of it)
+    if (['auth', 'csrf'].includes(e?.message)) { sessionEnded(); return; }
+    box(h('p', { class: 'error' }, errText(['not_found', 'forbidden'].includes(e?.message) ? e.message : 'recording_damaged')),
+      h('div', { class: 'row end' }, h('a', { class: 'btn', href: back }, t('back'))));
+  });
+}
+
+/**
+ * A session's recording (#/rec/<sid>): played with the session's own decoders, for administrators and auditors (from the
+ * administration) and for its user when they started it (from their recordings); one made in the page with the browser's
+ * player.
+ */
 async function viewRecording(sid) {
   document.title = t('app');
   fill(app, h('div', { class: 'center muted' }, t('loading')));
-  const info = (await attempt(() => api('admin.recording', { sid })))?.recording;
+  const info = (await attempt(() => api('recording.info', { sid })))?.recording;
   if (route().view !== 'rec' || route().arg !== sid) return;     // the user went elsewhere meanwhile
+  const back = ['#/admin/recordings', '#/admin/audit', '#/recordings'].includes(recFrom) ? recFrom
+    : ['admin', 'auditor'].includes(S.user.role) ? '#/admin/recordings' : '#/recordings';
   if (!info) {
-    fill(app, h('div', { class: 'center' }, h('div', { class: 'auth' }, h('p', {}, errText('not_found')), h('a', { class: 'btn', href: '#/admin/audit' }, t('back')))));
+    fill(app, h('div', { class: 'center' }, h('div', { class: 'auth' }, h('p', {}, errText('not_found')), h('a', { class: 'btn', href: back }, t('back')))));
     return;
   }
   document.title = (info.conn || '') + ' · ' + t('rec_title') + ' · ' + t('app');
+  if (info.kind === 'video') return viewPageVideo(sid, info, back);
   // a session still running has no length yet: up to now
   const total = info.ended ? (info.seconds || 0) * 1000 : Math.max(1000, Date.now() - (Date.parse(info.started) || Date.now()));
   const canvas = h('canvas', { width: 1024, height: 768, tabindex: -1 });
@@ -2985,8 +3405,10 @@ async function viewRecording(sid) {
   const toggle = h('button', { type: 'button', onclick: () => { paused = !paused; s.replayCmd(paused ? 'pause' : 'play'); drawToggle(); } });
   const drawToggle = () => { fill(toggle, icon(paused ? 'play' : 'pause')); toggle.setAttribute('title', t(paused ? 'rec_resume' : 'rec_pause')); toggle.setAttribute('aria-label', t(paused ? 'rec_resume' : 'rec_pause')); };
   drawToggle();
+  // its video (WebM), made in this browser from the recording: as fast as it goes, while it is watched or not
   const bar = h('div', { class: 'rec-bar' },
-    h('a', { href: '#/admin/audit', title: t('back'), 'aria-label': t('back') }, icon('x')), toggle, time, seek, speed,
+    h('a', { href: back, title: t('back'), 'aria-label': t('back') }, icon('x')), toggle, time, seek, speed,
+    canDownload(info) && h('button', { type: 'button', title: t('rec_video'), 'aria-label': t('rec_video'), onclick: () => downloadRecordingVideo(sid, info) }, icon('download')),
     h('span', { class: 'rec-who' }, `${info.user || ''} · ${info.conn || ''} · ${fmtDate(info.started)}`, info.truncated ? ' · ' + t('rec_cut') : ''));
   const root = h('div', { class: 'session rec' }, canvas, keyboard, overlay, bar);
   fill(app, root);
@@ -2994,6 +3416,12 @@ async function viewRecording(sid) {
   const s = new RdpSession({ container: root, canvas, keyboard, conn: { id: '', name: '' }, csrf: S.csrf, retries: 0, replay: { sid, from: 0, speed: 1 }, onState });
   endRdp();                                              // a session left by a previous view of this page
   currentRdp = s;
+  // its sound, at normal speed (the click that opened it lets the page play it; any other click or key too)
+  s.audio = info.sound ? new AudioPlayer() : null;
+  if (s.audio) {
+    s.audio.unlock();
+    for (const type of ['pointerdown', 'pointerup', 'touchend', 'keydown']) root.addEventListener(type, () => s.audio.unlock(), true);
+  }
   s.onReplayPos = (ms, done) => {
     const at = done ? Math.max(ms, total) : ms;            // (nothing is recorded while the screen stays still: at its end, all of it)
     time.textContent = clockText(at) + ' / ' + clockText(total);
@@ -3002,12 +3430,12 @@ async function viewRecording(sid) {
   const from = (ms) => { s.replay.from = ms; paused = false; drawToggle(); overlay.classList.add('hidden'); s.start(); };
   seek.addEventListener('input', () => { seeking = true; });
   seek.addEventListener('change', () => { seeking = false; from(+seek.value); });   // played again up to there, then at its pace
-  speed.addEventListener('change', () => { s.replay.speed = +speed.value; s.replayCmd('speed', +speed.value); });
+  speed.addEventListener('change', () => { s.replay.speed = +speed.value; s.replayCmd('speed', +speed.value); s.audio?.setMuted(+speed.value !== 1); });
   function onState(state, info) {
     if (state !== 'ended') return;
     if (['auth', 'csrf'].includes(info.end)) { sessionEnded(info.reason); return; }   // the web session is over
     const why = info.end && !['network', 'user'].includes(info.end) ? h('p', { class: 'error' }, errText(info.end)) : null;   // (refused: not found, forbidden...)
-    box(h('h2', {}, t('rec_end')), why, h('div', { class: 'row end' }, h('a', { class: 'btn', href: '#/admin/audit' }, t('back')), btn(t('rec_again'), () => from(0), 'primary')));
+    box(h('h2', {}, t('rec_end')), why, h('div', { class: 'row end' }, h('a', { class: 'btn', href: back }, t('back')), btn(t('rec_again'), () => from(0), 'primary')));
     overlay.classList.remove('hidden');
   }
   s.start();
@@ -3035,6 +3463,7 @@ function viewWatch(link) {
     if (state === 'connected') {
       document.title = info.conn + ' · ' + t('app');
       fill(badge, icon('eye'), ' ', t(info.watch === 'control' ? 'share_watching_control' : 'share_watching', info.owner, info.conn));
+      if (info.control_ended) toast(t('share_control_idle'));   // (not used for the administrator's minutes: watching on)
       badge.classList.remove('hidden', 'faded');
       setTimeout(() => badge.classList.add('faded'), 6000);   // then out of the way of the desktop
       if (info.watch === 'control') s.focus();
@@ -3050,7 +3479,7 @@ function viewWatch(link) {
 // ------------------------------------------------------------------ start
 
 // the server cannot answer: what happened, in the browser's language, and a way to try again
-loadState().then(render, (e) => {
+loadState().then(() => { render(); checkDataFolder({ api, pref: tabPref, reload: () => location.reload() }); }, (e) => {
   setLang(browserLang());
   authScreen(h('div', {}, h('p', { class: 'error' }, e instanceof ApiError ? errText(e.message) : t('r_network')),
     h('div', { class: 'row end' }, btn(t('retry'), () => location.reload(), 'primary'))));

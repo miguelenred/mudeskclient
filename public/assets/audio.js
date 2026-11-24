@@ -82,11 +82,21 @@ export function decodeAudio(fmt, u8) {
   return out;
 }
 
+/** The microphone's format of a frame 13 (F_MIC: 1, u32 rate, u8 channels; 16-bit PCM), or null (0: it stopped). */
+export function micFormat(d) {
+  if (d[0] !== 1 || d.length < 6) return null;
+  const rate = new DataView(d.buffer, d.byteOffset, d.byteLength).getUint32(1, true), ch = d[5];
+  return ch >= 1 && ch <= 2 && rate >= 8000 && rate <= 192000 ? { tag: 1, ch, rate, bits: 16, align: 2 * ch } : null;
+}
+
 export class AudioPlayer {
   constructor() {
     this.ctx = null;
     this.formats = [];
     this.next = 0;
+    this.micFmt = null;                                  // a recording played: the user's microphone, heard with the session
+    this.micNext = 0;
+    this.out = null;                                     // where it plays (a recording made in the page: its own line), else the speakers
     this.muted = false;
   }
 
@@ -105,9 +115,21 @@ export class AudioPlayer {
     const fmt = this.formats[d[1] | (d[2] << 8)];
     // the gateway only takes formats the page plays (1-2 channels, 8-192 kHz); a chunk of any other is dropped, never thrown
     if (!fmt || !(fmt.ch >= 1 && fmt.ch <= 2) || !(fmt.rate >= 8000 && fmt.rate <= 192000)) return;
+    this.#play(fmt, d.subarray(3), 'next');
+  }
+
+  /** A recording played: the microphone's format (frame 13), then what it sent (frame 32, see Recording::MIC). */
+  micFormat(d) { this.micFmt = micFormat(d); }
+
+  micData(d) {
+    if (this.micFmt && !this.muted && this.ctx?.state === 'running') this.#play(this.micFmt, d, 'micNext');
+  }
+
+  /** Decoded and played right after the piece before on its own line (`cursor`), or soon after a lag. */
+  #play(fmt, bytes, cursor) {
     let buf;
     try {
-      const chans = decodeAudio(fmt, d.subarray(3));
+      const chans = decodeAudio(fmt, bytes);
       if (!chans[0]?.length) return;
       buf = this.ctx.createBuffer(chans.length, chans[0].length, fmt.rate);
       chans.forEach((c, i) => buf.copyToChannel(c, i));
@@ -115,16 +137,22 @@ export class AudioPlayer {
       return;
     }
     const now = this.ctx.currentTime;
-    if (this.next < now + 0.02 || this.next > now + 0.5) this.next = now + 0.06;   // start or resync after lag
+    if (this[cursor] < now + 0.02 || this[cursor] > now + 0.5) this[cursor] = now + 0.06;   // start or resync after lag
     const src = this.ctx.createBufferSource();
     src.buffer = buf;
-    src.connect(this.ctx.destination);
-    src.start(this.next);
-    this.next += buf.duration;
+    src.connect(this.out ?? this.ctx.destination);
+    src.start(this[cursor]);
+    this[cursor] += buf.duration;
   }
 
   setMuted(m) {
     this.muted = m;
-    if (m) this.next = 0;
+    if (m) this.next = this.micNext = 0;
+  }
+
+  /** The page is done with it: its audio context closed (browsers keep only so many). */
+  close() {
+    this.ctx?.close().catch(() => {});
+    this.ctx = null;
   }
 }

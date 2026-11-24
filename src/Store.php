@@ -27,8 +27,8 @@ final class Store
         return $h;
     }
 
-    /** Stores that can start again empty when their file is damaged (failed sign-ins): the others stop with an error. */
-    private const REBUILT = ['ratelimit'];
+    /** Stores that can start again empty when their file is damaged (failed sign-ins, how TLS went with each computer): the others stop with an error. */
+    private const REBUILT = ['ratelimit', 'tls'];
 
     /** Stores written often (failed sign-ins, refused requests): compact JSON. */
     private const COMPACT = ['ratelimit', 'auditlimit'];
@@ -111,7 +111,7 @@ final class Store
             }
             $ok = file_put_contents($tmp, $json) === strlen($json);   // (a full disk: a part written is no store)
             @chmod($tmp, 0600);                       // before it takes the file's place: never readable by others, even for a moment
-            if (!$ok || !rename($tmp, $file)) {
+            if (!$ok || !@rename($tmp, $file)) {          // (said by the exception below, not by a warning as well)
                 @unlink($tmp);
                 throw new RuntimeException('Cannot write store');
             }

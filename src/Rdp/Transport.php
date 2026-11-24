@@ -29,6 +29,82 @@ final class Transport
     /** The Remote Desktop Gateway this connection goes through (its socket is then the client's end of a loopback pair) */
     public ?Gateway $gw = null;
 
+    /*
+     * TLS offered: 1.2 or later without triple DES first; TLS 1.0 and 1.1 too, triple DES last ("legacy": Windows Server 2003
+     * to 2008 R2 without updates; 2003's TLS has no AES), only to a computer never seen with the first (see tlsSeen()):
+     * someone in between who made the first handshake fail took any computer back to the weaker ones. The certificate is
+     * checked by its pinned fingerprint (OpenSSL's security level 0: a SHA-1 or 1024-bit certificate of those Windows).
+     */
+    private const TLS_STORE = 'tls';                 // data/tls.json: how TLS went with each computer and gateway
+    private const TLS_KEEP  = 5000;                  // computers remembered (the latest)
+    private const TLS_AGAIN = 86400;                 // seconds: a computer seen with TLS 1.0 only is offered TLS 1.2 first again after a day
+    private const TLS_DAYS  = 365;                   // days a computer seen with TLS 1.2 is remembered after its last use
+
+    /** The TLS versions offered (for stream_socket_enable_crypto()): 1.2 and 1.3, and 1.0 and 1.1 when legacy. */
+    public static function tlsMethods(bool $legacy): int
+    {
+        return STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT | (defined('STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT') ? STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT : 0)
+            | ($legacy ? STREAM_CRYPTO_METHOD_TLSv1_0_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_1_CLIENT : 0);
+    }
+
+    /** The cipher suites offered (OpenSSL's list): without triple DES, or with it last when legacy (where OpenSSL has it). */
+    public static function tlsCiphers(bool $legacy): string
+    {
+        return $legacy ? 'DEFAULT:DES-CBC3-SHA' : 'DEFAULT:!3DES';
+    }
+
+    /**
+     * How TLS went with $key (a computer's "host:port", a gateway's "gw:host:port"): 'modern' (TLS 1.2 or later seen there:
+     * never offered less), 'legacy' (only TLS 1.0 there, within a day: offered at once, not after a failed handshake each
+     * time), or null (not known: TLS 1.2 first, and TLS 1.0 if that fails).
+     */
+    public static function tlsSeen(string $key): ?string
+    {
+        try {
+            $e = \MuDesk\Store::read(self::TLS_STORE)[$key] ?? null;
+        } catch (\RuntimeException $x) {            // (its file cannot be read: as never seen, no connection refused for it)
+            error_log('MuDeskClient: ' . $x->getMessage());
+            return null;
+        }
+        if (!is_array($e) || !is_int($e[1] ?? null)) {
+            return null;
+        }
+        return match ($e[0] ?? null) {
+            'modern' => time() - $e[1] < self::TLS_DAYS * 86400 ? 'modern' : null,
+            'legacy' => time() - $e[1] < self::TLS_AGAIN ? 'legacy' : null,
+            default  => null,
+        };
+    }
+
+    /**
+     * Remembers how TLS went with $key: $protocol, the version agreed (TLSv1.2 or TLSv1.3: "modern", even when TLS 1.0 was
+     * offered too after a handshake that failed). Written when it changed, or once a day: not on every connection; never
+     * a reason for a connection to fail (a file that cannot be written: logged).
+     */
+    public static function tlsWorked(string $key, string $protocol): void
+    {
+        $kind = in_array($protocol, ['TLSv1.2', 'TLSv1.3'], true) ? 'modern' : 'legacy';
+        try {
+            $e = \MuDesk\Store::read(self::TLS_STORE)[$key] ?? null;
+            if (is_array($e) && ($e[0] ?? null) === $kind && is_int($e[1] ?? null) && time() - $e[1] < 86400) {
+                return;
+            }
+            \MuDesk\Store::update(self::TLS_STORE, static function (array &$d) use ($key, $kind): void {
+                unset($d[$key]);                      // (last: those kept are the latest)
+                $d[$key] = [$kind, time()];
+                $d       = array_slice($d, -self::TLS_KEEP, null, true);
+            });
+        } catch (\RuntimeException $x) {
+            error_log('MuDeskClient: ' . $x->getMessage());
+        }
+    }
+
+    /** The TLS version agreed on a stream ('?' when none). */
+    public static function tlsProtocol($stream): string
+    {
+        return (string)(stream_get_meta_data($stream)['crypto']['protocol'] ?? '?');
+    }
+
     /** A connection through a Remote Desktop Gateway already open to the remote computer. */
     public static function through(Gateway $gw): self
     {
@@ -63,10 +139,7 @@ final class Transport
     {
         $ctx  = stream_context_create(['socket' => ['tcp_nodelay' => true], 'ssl' => [
             'verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true,
-            'capture_peer_cert' => true, 'security_level' => 0, 'SNI_enabled' => false,
-            // (triple DES last, where OpenSSL has it: Windows Server 2003's TLS has no AES; without it, Client falls back to
-            // Standard RDP Security)
-            'ciphers' => 'DEFAULT:DES-CBC3-SHA',
+            'capture_peer_cert' => true, 'security_level' => 0, 'SNI_enabled' => false,   // (the ciphers: startTls())
         ]]);
         $addr = str_contains($ip, ':') ? "[$ip]" : $ip;
         // the timeout also limits the TLS handshake (PHP applies a client's connection timeout to it)
@@ -89,10 +162,11 @@ final class Transport
         return true;
     }
 
-    public function startTls(): \OpenSSLCertificate
+    /** The TLS handshake: TLS 1.2 or later without triple DES, or with $legacy TLS 1.0 on and triple DES last (see tlsSeen()). */
+    public function startTls(bool $legacy = false): \OpenSSLCertificate
     {
-        $m = STREAM_CRYPTO_METHOD_TLSv1_0_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_1_CLIENT | STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT
-           | (defined('STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT') ? STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT : 0);
+        $m = self::tlsMethods($legacy);
+        stream_context_set_option($this->sock, 'ssl', 'ciphers', self::tlsCiphers($legacy));
         if ($this->gw !== null) {
             // through a gateway: the handshake goes through pump(), so it is made step by step (blocking, nothing pumped it)
             $end = microtime(true) + self::WAIT;
@@ -124,7 +198,7 @@ final class Transport
     public function tlsInfo(): array
     {
         $c = stream_get_meta_data($this->sock)['crypto'] ?? [];
-        return ['protocol' => $c['protocol'] ?? '?', 'cipher' => $c['cipher_name'] ?? '?'];
+        return ['protocol' => $c['protocol'] ?? '?', 'cipher' => $c['cipher_name'] ?? '?'];   // (see tlsProtocol())
     }
 
     public function send(string $data): void

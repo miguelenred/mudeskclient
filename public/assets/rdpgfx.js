@@ -479,6 +479,8 @@ export class GfxPipeline {
     this.slots = new Map();                         // cache slot -> its bytes (CACHE_MAX in all)
     this.cached = 0;
     this.queue = [];                                // ordered ops waiting for asynchronous video frames
+    this.idlers = [];                               // idle() waiting for that queue to empty
+    this.software = false;                          // H.264 decoded in software (a recording made into a video: every picture out at once)
     this.ts = 0;
     this.stats = null;                              // diagnostic mode: message and codec counts
   }
@@ -493,6 +495,12 @@ export class GfxPipeline {
       const { op, transfer } = this.queue.shift();
       this.emit(op, transfer);
     }
+    if (!this.queue.length) for (const r of this.idlers.splice(0)) r();
+  }
+
+  /** Once every operation given so far went out (the video frames being decoded among them). */
+  idle() {
+    return this.queue.length ? new Promise((r) => this.idlers.push(r)) : Promise.resolve();
   }
 
   /** One message of the graphics channel (RDP_SEGMENTED_DATA). */
@@ -691,7 +699,7 @@ export class GfxPipeline {
           this.#flush();
         },
       });
-      d.dec.configure({ codec, optimizeForLatency: true, colorSpace: BT709 });
+      d.dec.configure({ codec, optimizeForLatency: true, colorSpace: BT709, ...(this.software ? { hardwareAcceleration: 'prefer-software' } : {}) });
       this.decoders.set(id, d);
     }
     const entry = { op: { op: 'video', id, rects }, transfer: [], ready: false };

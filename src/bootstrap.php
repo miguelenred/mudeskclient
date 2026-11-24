@@ -6,7 +6,7 @@ namespace MuDesk;
 
 ini_set('zend.exception_ignore_args', '1');   // no arguments (a password) in the stack traces of the error log
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 
 spl_autoload_register(static function (string $class): void {
     if (strncmp($class, 'MuDesk\\', 7) === 0) {

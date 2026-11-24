@@ -6,8 +6,8 @@ This is the technical reference. For a step-by-step guide for every level (a hos
 
 ## Before deploying: `tools/check.php`
 
-1. Edit `TOKEN` at the top of `tools/check.php`.
-2. Copy it into `public/` on the hosting (the `tools/` folder is denied to the web) and open it in the browser.
+1. Edit `TOKEN` at the top of `tools/check.php` (with `CAMBIAR`, as it comes, it does nothing).
+2. Copy it into `public/` on the hosting (the `tools/` folder is denied to the web) and open it in the browser. It works for a day after it was copied (or changed): then it refuses, in case it was forgotten there; copy it again to use it again.
 3. Run the six tests:
    - **PHP environment**: version, OpenSSL, disabled functions, limits, Unix sockets. It warns about PHP outside 8.1–8.5, `display_errors` on and `memory_limit` below 128M.
    - **Outgoing RDP**: connects to a real remote computer and reports TLS/NLA, TLS version and certificate.
@@ -15,7 +15,7 @@ This is the technical reference. For a step-by-step guide for every level (a hos
    - **Latency**: round trip to the hosting.
    - **Data folder reachable from the web**: writes a test file in the data folder and tries to download it through the web; it must fail.
    - **PHP processes at once**: sends requests of 1 s at once (20 by default) and counts how many the server handled together (N); `max_sessions_total` must be N − 2 at most (see *Capacity*). Over HTTP/1.1 the browser opens 6 connections at most, so it cannot measure more.
-4. **Delete the file** afterwards.
+4. **Delete the file** afterwards. While `public/check.php` is there, the administration says so in red.
 
 ## Requirements
 
@@ -40,7 +40,7 @@ Two layouts work. Only `public/` has to be reachable from the web.
 /home/account/public_html/mudesk/data        writable by PHP
 ```
 
-The project's `.htaccess` files (and `web.config` for IIS) keep everything except `public/` out of reach: the root one sends every request to `public/`, and `data/`, `src/`, `tests/`, `tools/` and `docs/` each deny all access and listings (Apache 2.2 and 2.4). If the `.htaccess` of `data/` is deleted, the application writes it again. Check after uploading (each must answer **403**): `/mudesk/data/web-check.txt`, `/mudesk/config.php`, `/mudesk/src/bootstrap.php`. When the server ignores `.htaccess` (`AllowOverride None`), the application shows a red warning on the first-run screen and in the administration section, because the data folder can be downloaded.
+The project's `.htaccess` files (and `web.config` for IIS) keep everything except `public/` out of reach: the root one sends every request to `public/`, and `data/`, `src/`, `tests/`, `tools/` and `docs/` each deny all access and listings (Apache 2.2 and 2.4). If the `.htaccess` of `data/` is deleted, the application writes it again. Check after uploading (each must answer **403**): `/mudesk/data/web-check.txt`, `/mudesk/config.php`, `/mudesk/src/bootstrap.php`. When the server ignores `.htaccess` (`AllowOverride None`), the data folder can be downloaded, and the application stops: every page says so ("The data folder can be downloaded") until it is protected.
 
 **B. Only `public/` in the web root** (safest when the hosting allows it):
 
@@ -51,11 +51,11 @@ The project's `.htaccess` files (and `web.config` for IIS) keep everything excep
 /home/account/public_html          <- contents of public/
 ```
 
-If `public_html` is not next to `src/`, as here, change the first `require` of `index.php`, `api.php`, `rdp.php` and `files.php` (here to `require __DIR__ . '/../mudesk/src/bootstrap.php';`).
+If `public_html` is not next to `src/`, as here, change the first `require` of `index.php`, `api.php`, `rdp.php`, `files.php`, `oidc.php`, `backup.php` and `health.php` (here to `require __DIR__ . '/../mudesk/src/bootstrap.php';`).
 
 ### Protecting the private folders, per web server
 
-Only `public/` may be served. Check after deploying: `data/web-check.txt`, `config.php` and `src/bootstrap.php` must answer **403** (or 404), never 200; the application also warns the administrator when the data folder can be read.
+Only `public/` may be served. Check after deploying: `data/web-check.txt`, `config.php` and `src/bootstrap.php` must answer **403** (or 404), never 200. The application checks the data folder by itself: while it can be read from the web, nothing works and every page says so ("The data folder can be downloaded"), until it is protected (checked again every 30 s meanwhile, or 5 minutes after a browser found it). The server asks itself for it at the address and port the request came to, and again where it found it readable (a request with another site's name or another path never finds it protected alone); where it cannot (PHP's built-in server, a hosting that does not let it reach itself) the browsers check it, proving it with a random code of the file, new each time it is looked at (every 10 minutes on PHP's built-in server).
 
 - **Apache** (2.2 and 2.4): the bundled `.htaccess` files do it; they need `AllowOverride All` (or at least `AuthConfig FileInfo Indexes Limit Options`; the root one uses `DirectoryIndex`). Tested.
 - **LiteSpeed Enterprise** (most shared hostings with cPanel/LiteSpeed): reads `.htaccess` like Apache; nothing else to do.
@@ -100,11 +100,18 @@ When it cannot go on, whoever opens the address sees a page with the look of the
 - PHP not supported or without OpenSSL;
 - HTTPS required;
 - IP not allowed;
+- the data folder can be downloaded (503, until it is protected);
+- a backup being restored (503, a few seconds);
+- `trusted_proxies` with an entry that is not an IP address (a range or a name);
 - internal error, out of memory included.
 
 The interface's own requests get `{"error": key}` and show the same reason with "Try again".
 
 Even if the data folder were ever served, the server key is stored in `data/secret.php`, which starts with `<?php exit; ?>`: PHP shows nothing. RDP passwords are encrypted with a key that only opens with each user's password, and login passwords are bcrypt hashes.
+
+### Temporary files
+
+The application removes its own temporary files: a session's files when it ends, clipboard files and print jobs with their session. What a write cut off or a PHP process killed by the hosting leaves (a write never finished, `*.tmp` of over an hour; the files, folder and socket of a session that ended without its cleanup; expired web sessions, also where the hosting's PHP never collects them; the locks of deleted users) is removed once an hour at most, with the requests (there is no background process). The `*.lock` files stay: they are the locks themselves (empty, one per data file and per user).
 
 ## Web server notes
 
@@ -128,23 +135,29 @@ The session stream must not be buffered or compressed.
 
   This assumes `root` points to `public/`; with the whole project under `/mudesk/`, use `location = /mudesk/public/rdp.php` and `$document_root/mudesk/public/rdp.php`, and deny the private folders as in *Protecting the private folders* above. `rdp.php` also sends `X-Accel-Buffering: no`.
 - **IIS** (not tested yet): the PHP FastCGI handler must not buffer the stream (`responseBufferLimit="0"`) and the FastCGI application's `requestTimeout` and `activityTimeout` must allow long requests.
-- **Reverse proxy / CDN** (Cloudflare and similar): long requests are cut (≈100 s on Cloudflare). The client reconnects by itself, but a direct connection is better. Behind your own proxy, list its IP in `trusted_proxies`. A proxy on the same machine (127.0.0.1) must also send `X-Forwarded-Proto: https`: once listed it is no longer taken as a local request, so HTTPS is required through it as from anywhere else (before, requests through it skipped the HTTPS check).
+- **Reverse proxy / CDN** (Cloudflare and similar): long requests are cut (≈100 s on Cloudflare). The client reconnects by itself, but a direct connection is better. Behind your own proxy, list its IP in `trusted_proxies`: only the exact addresses of your own proxies, never a range or an address shared with clients that connect directly (whoever sends from there could pass any address in `X-Forwarded-For` and get past the allowed clients and the sign-in locks). A proxy that does not pass the site's public name on (its `Host`): set the site's address in `public_url` of `config.php` (for example `https://rdp.example.com/mudesk`), which signing in with OpenID Connect and passkeys then use. A proxy on the same machine (127.0.0.1) must also send `X-Forwarded-Proto: https`: once listed it is no longer taken as a local request, so HTTPS is required through it as from anywhere else (before, requests through it skipped the HTTPS check).
 - **PHP limits**: the stream calls `set_time_limit(0)`; check that the web server or FPM (`request_terminate_timeout`) does not kill long requests. Downloads and ZIPs of the shared folder (`files.php`, up to 4 GB) are long requests too.
 - **Installable app**: the manifest (`manifest.webmanifest`) must be served as `application/manifest+json`. Apache and LiteSpeed: `public/.htaccess` does it; IIS: `public/web.config`. Nginx: if its `mime.types` does not know `.webmanifest`, add `application/manifest+json webmanifest;` to it.
 - **Scripts and styles after an update**: the page asks for `app.js` and `app.css` with a fingerprint of the page's files in their address (it changes with any of them), but the modules they import are addressed without it, so the web server must have them revalidated on every load (a 304 when unchanged). Apache and LiteSpeed: `public/.htaccess` does it (with `mod_headers`; without it the rule is skipped); IIS: `public/web.config` and `public/assets/web.config` (not tested on a real IIS yet); Nginx: add `location ~* \.(js|css)$ { add_header Cache-Control "no-cache"; }` to the `server` block. A page left open while MuDesk is updated says so on its next sign-in and offers to reload.
 
 ## Capacity
 
+- Each sign-in attempt takes 1 s, whatever its answer (so its time says nothing about the account): many at once hold that many PHP processes for that second. The locks per address, per user and in all count failures; a locked address is refused at once, without writing anything more (its lock says nothing about the users).
 - Each open session keeps **one PHP process** busy for its whole duration (a php-fpm child or an Apache process). A remote computer that does not answer holds it up to 8 s per handshake step.
-- While typing or moving the mouse, a session adds up to **four short requests at a time**; while a remote program records from the microphone, about ten a second (pieces of 100 ms, within those four); while a program there uses the camera or this computer's folder, up to two more at a time on a lane of their own.
+- While typing or moving the mouse, a session adds up to **four short requests at a time**; while a remote program records from the microphone, about ten a second (pieces of 100 ms, within those four); while a program there uses the camera or this computer's folder, or the session is recorded in the browser, up to two more at a time on a lane of their own.
 - Each guest watching a shared session keeps **one more PHP process** busy while it watches (at most 5 per session).
 - `memory_limit`: a channel message larger than about a sixth of what the limit leaves free (a clipboard copy of a 4K screenshot is 33 MB) is left out, not pasted, and logged, instead of ending the session with a PHP fatal error; 256M or more lets such copies through.
-- Recorded connections write to `data/recordings/` while their sessions last (some tens of MB an hour for an office desktop; much more with video), kept the days of the settings: leave room on the disk.
+- Recorded sessions write to `data/recordings/` while they are recorded (some tens of MB an hour for an office desktop, 35 to 110 MB for one started in the session; much more with video), kept until deleted by hand (or the days of the settings): leave room on the disk. One started in the session also takes the user's upload while it records (10 to 30 KB/s for an office desktop, up to 0.5–6 Mbit/s with video).
 - Set *Administration → Settings → RDP sessions at once (all users)* (`max_sessions_total`, 20 by default, 0 = no limit) below the PHP processes available: with PHP-FPM, `pm.max_children` ≥ `max_sessions_total` + what the web needs (2 at the very least, as `tools/check.php` counts; about 10 to be comfortable). At the limit a new session gets "server busy" at once, without connecting. `tools/check.php` measures the processes at once: `max_sessions_total` N − 2 at most.
 - If you can, serve `rdp.php` from a PHP-FPM pool of its own (its own socket in the `location = /rdp.php` block above), so long sessions never take the processes of the web.
 - PHP's built-in server (`php -S`) handles one request at a time: one session blocks everything. Only for tests; `PHP_CLI_SERVER_WORKERS` (several workers) is not supported on Windows.
 - Hostings with an "entry processes" limit (for example CloudLinux) must allow at least `5 × concurrent sessions`.
+- Users are kept in one file (`data/users.json`), read whole when someone signs in and on each request: up to about a thousand users it takes a few milliseconds (7 ms with 1,000 on a desktop computer); 49 ms with 5,000 and 243 ms with 20,000.
 - Bandwidth from the web server to the browser: from a few KB/s (office work) to 2–3 MB/s (full-screen changes at 16 bits). From the browser to the web server, the input is a few KB/s; the microphone adds about 176 KB/s while a remote program records, and the camera about 150–185 KB/s with the tests' simulated cameras (an estimated 0.5–1.5 MB/s for a real one) while a program uses it.
+
+## Monitoring
+
+`public/health.php` answers `{"status":"ok"}` (200) while the gateway works, or 503 with what does not: `{"status":"error","problem":...}` (`data`: its data folder cannot be written; `store`: its users or settings cannot be read), or, as every entry point, `{"error":"data_exposed"}` (its data folder can be read from the web) and `{"error":"restoring"}` (a backup being restored). It tells nothing else of the installation. The allowed clients apply: list the monitor's address when they are a list. *Administration → Status* shows the sessions, processes, memory, disk and recent problems, and the use of the last 30 days.
 
 ## Host names (DNS)
 

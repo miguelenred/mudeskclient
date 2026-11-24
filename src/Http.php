@@ -9,11 +9,18 @@ final class Http
     /** json_encode flags of every answer. */
     public const JSON = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE;
 
+    /**
+     * Browser features the pages never use, denied to them and to anything in them (the camera, microphone, clipboard,
+     * full screen, the screens and passkeys, which they use, are left as the browser has them).
+     */
+    public const PERMISSIONS = 'accelerometer=(), bluetooth=(), browsing-topics=(), geolocation=(), gyroscope=(), hid=(), magnetometer=(), '
+        . 'midi=(), payment=(), serial=(), usb=(), xr-spatial-tracking=()';
+
     public static function clientIp(): string
     {
         $ip      = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
         $proxies = (array)Config::get('trusted_proxies');
-        if (in_array($ip, $proxies, true) && !empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        if (self::fromProxy() && !empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
             // each proxy appends the address it saw: the client is the right-most one that is not a trusted proxy
             // (what is further left was sent by the client itself)
             foreach (array_reverse(explode(',', (string)$_SERVER['HTTP_X_FORWARDED_FOR'])) as $fwd) {
@@ -22,7 +29,7 @@ final class Http
                     break;
                 }
                 $ip = $fwd;
-                if (!in_array($fwd, $proxies, true)) {
+                if (!in_array(self::canon($fwd), $proxies, true)) {
                     break;
                 }
             }
@@ -57,8 +64,20 @@ final class Http
     public static function isHttps(): bool
     {
         return ($_SERVER['HTTPS'] ?? '') !== '' && $_SERVER['HTTPS'] !== 'off'
-            || (in_array($_SERVER['REMOTE_ADDR'] ?? '', (array)Config::get('trusted_proxies'), true)
-                && strtolower($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+            || (self::fromProxy() && strtolower($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+    }
+
+    /** Whether the request came from a trusted proxy (its address compared as an address, however it is written). */
+    private static function fromProxy(): bool
+    {
+        return in_array(self::canon($_SERVER['REMOTE_ADDR'] ?? ''), (array)Config::get('trusted_proxies'), true);
+    }
+
+    /** An IP address as PHP writes it (IPv6 in lower case and shortened); anything else as it is. */
+    private static function canon(string $ip): string
+    {
+        $b = @inet_pton($ip);
+        return $b === false ? $ip : (string)inet_ntop($b);
     }
 
     /** Common headers, HTTPS enforcement and client allow-list. Call first in every entry point. */
@@ -67,10 +86,11 @@ final class Http
         header('X-Content-Type-Options: nosniff');
         header('Referrer-Policy: no-referrer');
         header('X-Frame-Options: DENY');
-        header("Content-Security-Policy: default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+        header('Permissions-Policy: ' . self::PERMISSIONS);
+        header('Cross-Origin-Resource-Policy: same-origin');   // (its answers, files and downloads not taken in by another site)
+        header("Content-Security-Policy: default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
         // this computer itself (development) needs no HTTPS, but not a proxy on it: every client would count as local
-        $local = in_array($_SERVER['REMOTE_ADDR'] ?? '', ['127.0.0.1', '::1'], true)
-            && !in_array($_SERVER['REMOTE_ADDR'] ?? '', (array)Config::get('trusted_proxies'), true);
+        $local = in_array($_SERVER['REMOTE_ADDR'] ?? '', ['127.0.0.1', '::1'], true) && !self::fromProxy();
         if (Config::get('force_https') && !self::isHttps() && !$local) {
             Audit::anonymous() && Audit::log('access_denied', ['reason' => 'http_not_https', 'uri' => self::uri()], null, false);
             ErrorPage::send(403, 'https');
@@ -81,6 +101,10 @@ final class Http
         if (!Access::clientAllowed(self::clientIp())) {
             Audit::anonymous() && Audit::log('access_denied', ['reason' => 'client_ip_not_allowed', 'uri' => self::uri()], null, false);
             ErrorPage::send(403, 'client_ip');
+        }
+        Exposure::guard();                       // nothing works while the data folder can be read from the web
+        if (Backup::restoring()) {               // (a backup being put in place: a few seconds)
+            ErrorPage::send(503, 'restoring');
         }
     }
 

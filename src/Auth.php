@@ -107,16 +107,22 @@ final class Auth
         return $u;
     }
 
-    /**
-     * Like require(), for what an auditor may read too: the audit log and the active sessions (an administrator or an
-     * auditor; an auditor changes nothing).
-     */
     /** Whether the user makes connections of their own (and imports .rdp files): administrators, and others when allowed. */
     public static function createsConns(array $u): bool
     {
         return $u['role'] === 'admin' || Settings::get('users_create_conns');
     }
 
+    /** Whether the user starts and stops recordings of their own sessions: administrators, and others when allowed. */
+    public static function recordsOwn(array $u): bool
+    {
+        return $u['role'] === 'admin' || Settings::get('record_users');
+    }
+
+    /**
+     * Like require(), for what an auditor may read too: the audit log and the active sessions (an administrator or an
+     * auditor; an auditor changes nothing).
+     */
     public static function requireAuditor(): array
     {
         $u = self::require();
@@ -308,25 +314,50 @@ final class Auth
     // ---- first run: the administrator needs the one-time code of data/setup-code.php ----
 
     private const SETUP_FILE = 'setup-code.php';
+    /**
+     * Seconds a setup code works: then another one takes its place in the same file (a copy of data/ that went astray
+     * before the installation was finished, a backup say, gave whoever had it the administrator for good).
+     */
+    private const SETUP_TTL = 86400;
 
-    /** Creates the code file if needed (only while there are no users). */
+    /** Creates the code file if needed (only while there are no users), or a new code once the old one has expired. */
     public static function setupCode(): void
     {
         $file = Config::dir(self::SETUP_FILE);
-        if (!is_file($file)) {
+        clearstatcache(true, $file);
+        if (!is_file($file) || time() - (int)filemtime($file) >= self::SETUP_TTL) {
             $code = implode('-', str_split(strtoupper(bin2hex(random_bytes(10))), 5));
-            file_put_contents($file, "<?php exit; ?>\n" . $code . "\n", LOCK_EX);
-            @chmod($file, 0600);
+            $tmp  = $file . '.' . bin2hex(random_bytes(4)) . '.tmp';
+            $old  = umask(0077);
+            try {
+                $ok = file_put_contents($tmp, "<?php exit; ?>\n" . $code . "\n") !== false;
+            } finally {
+                umask($old);
+            }
+            @chmod($tmp, 0600);
+            if (!$ok || !@rename($tmp, $file)) {        // (whole, never a part of it: two requests made it at once)
+                @unlink($tmp);
+            }
         }
     }
 
-    /** Checks the code; a wrong one counts as a login failure of the IP. */
+    /**
+     * Checks the code; a wrong one counts as a login failure of the IP. An address already locked is refused without
+     * writing anything (each refused request wrote the store of failures again).
+     */
     public static function setupAllowed(string $code): bool
     {
         $keys = ['ip:' . Http::clientIp(), 'u:#setup'];
+        if (self::lockedFor($keys) !== null) {
+            Audit::anonymous() && Audit::log('setup_fail', ['reason' => 'locked'], null, false);
+            return false;
+        }
+        self::setupCode();                             // (an expired code: a new one, and this one refused)
         $file = Config::dir(self::SETUP_FILE);
-        $want = is_file($file) ? trim(substr((string)file_get_contents($file), 15)) : '';
-        if (self::lockedFor($keys) !== null || $want === '' || !hash_equals($want, strtoupper(trim($code)))) {
+        clearstatcache(true, $file);
+        // (still the expired one: a new one could not be written, a read-only folder say; refused all the same)
+        $want = is_file($file) && time() - (int)filemtime($file) < self::SETUP_TTL ? trim(substr((string)file_get_contents($file), 15)) : '';
+        if ($want === '' || !hash_equals($want, strtoupper(trim($code)))) {
             self::failure($keys);
             Audit::log('setup_fail', ['reason' => $want === '' ? 'no_code_file' : 'bad_code'], null, false);
             return false;

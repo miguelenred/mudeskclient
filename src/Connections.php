@@ -133,6 +133,66 @@ final class Connections
         });
     }
 
+    /**
+     * The certificate an administrator fixed for a computer (its SHA-256, or SHA-1 as Windows shows it), for any connection to
+     * it: by its name, or by its address ($ip, what the connection's name resolved to: one fixed for "pc" holds for 10.0.0.5
+     * too, and the other way round). Null: none fixed (each user confirms it the first time).
+     */
+    public static function fixedCert(string $host, int $port, string $ip = ''): ?string
+    {
+        $host  = strtolower(trim($host, ' []'));
+        $other = [];
+        foreach (Store::read('certs') as $k => $e) {
+            if (!preg_match('~^rdp:(.+):(\d+)$~D', (string)$k, $m) || (int)$m[2] !== $port || !is_string($e['fp'] ?? null)) {
+                continue;
+            }
+            if ($m[1] === $host) {
+                return $e['fp'];
+            }
+            $other[$m[1]] = $e['fp'];
+        }
+        // resolved only when no entry has the name itself, for 5 s at most (a slow DNS never holds the connection up: those
+        // not resolved by then match nothing, and the user's own certificate applies)
+        $until = microtime(true) + 5;
+        foreach ($ip !== '' ? $other : [] as $name => $fp) {
+            if (in_array($ip, Access::addresses((string)$name), true)) {
+                return $fp;
+            }
+            if (microtime(true) > $until) {
+                break;
+            }
+        }
+        return null;
+    }
+
+    /** Every certificate fixed: "rdp:host:port" => [fp, by, at]. */
+    public static function fixedCerts(): array
+    {
+        return Store::read('certs');
+    }
+
+    /**
+     * Fixes (or with '' forgets) the certificate of computer $host:$port for every connection to it, as administrator $by:
+     * its SHA-256 or SHA-1 in hex, any case, with or without separators. Returns the fingerprint kept, or 'cert_fixed' when it
+     * is neither.
+     */
+    public static function fixCert(string $host, int $port, string $fp, string $by): string
+    {
+        $host = strtolower(trim($host, ' []'));
+        $fp   = strtolower((string)preg_replace('~[\s:-]~', '', $fp));
+        if (($fp !== '' && !preg_match('~^([0-9a-f]{40}|[0-9a-f]{64})$~D', $fp)) || $host === '' || $port < 1 || $port > 65535) {
+            return 'cert_fixed';
+        }
+        Store::update('certs', static function (array &$d) use ($host, $port, $fp, $by): void {
+            if ($fp === '') {
+                unset($d["rdp:$host:$port"]);
+            } else {
+                $d["rdp:$host:$port"] = ['fp' => $fp, 'by' => $by, 'at' => date('c')];
+            }
+        });
+        return $fp;
+    }
+
     /** Defaults for fields added in later versions. */
     private static function defaults(array $c): array
     {
@@ -188,17 +248,39 @@ final class Connections
     }
 
     /**
-     * Whether $conn's computer is recorded for the user: a connection to the same host and port that the administrator
-     * records (another connection to it, made by the user, would be a way around the recording).
+     * Whether $conn's computer is recorded for the user: a connection to the same computer and port that the administrator
+     * records (another connection to it, made by the user, would be a way around the recording), by its name or by its
+     * addresses (the same computer reached through its IP address or another name was not recorded).
      */
     public static function recordedTarget(string $uid, array $conn): bool
     {
+        $mine = null;                            // its addresses: resolved once, only when some connection is recorded
         foreach (self::all($uid) as $c) {
-            if (!empty($c['record']) && strcasecmp((string)$c['host'], (string)$conn['host']) === 0 && (int)$c['port'] === (int)$conn['port']) {
+            if (empty($c['record']) || (int)$c['port'] !== (int)$conn['port']) {
+                continue;
+            }
+            if (strcasecmp((string)$c['host'], (string)$conn['host']) === 0) {
+                return true;
+            }
+            $mine ??= self::ips((string)$conn['host']);
+            if ($mine !== [] && array_intersect($mine, self::ips((string)$c['host'])) !== []) {
                 return true;
             }
         }
         return false;
+    }
+
+    /** A host's addresses in binary, an IPv4 one inside IPv6 (::ffff:a.b.c.d) as the IPv4 one, to compare them. */
+    private static function ips(string $host): array
+    {
+        $out = [];
+        foreach (Access::addresses($host) as $ip) {
+            $b = @inet_pton($ip);
+            if ($b !== false) {
+                $out[] = strlen($b) === 16 && str_starts_with($b, str_repeat("\0", 10) . "\xff\xff") ? substr($b, 12) : $b;
+            }
+        }
+        return $out;
     }
 
     /**
@@ -226,14 +308,13 @@ final class Connections
     }
 
     /**
-     * Returns the stored connection or an error key ('invalid_input': a JSON list or object where text or a number goes).
-     * A connection of the administrator keeps only the user's password here ('managed' for anything else).
+     * A user's own connection made or changed (or their password for one of the administrator's). Returns the stored
+     * connection or an error key ('invalid_input': a JSON list or object where text or a number goes). A connection of the
+     * administrator keeps only the user's password here ('managed' for anything else). With $create false (the administrator
+     * does not let users create connections) no new one is made and none changes its target: 'conns_locked'. With $record
+     * (the one saving it is an administrator) "Record the sessions" is taken from $in when it has it; else it stays.
      */
-    /**
-     * A user's own connection made or changed (or their password for one of the administrator's). With $create false (the
-     * administrator does not let users create connections) no new one is made and none changes its target: 'conns_locked'.
-     */
-    public static function save(string $uid, array $in, ?string $dek, bool $create = true): array|string
+    public static function save(string $uid, array $in, ?string $dek, bool $create = true, bool $record = false): array|string
     {
         foreach (['id', 'name', 'group', 'host', 'port', 'user', 'domain', 'password', 'kbd', 'bpp'] as $k) {
             if (is_array($in[$k] ?? null)) {
@@ -264,7 +345,8 @@ final class Connections
         if (is_string($c)) {
             return $c;
         }
-        return Store::update('connections/' . $uid, static function (array &$d) use ($c, $id, $password, $dek, $create): array|string {
+        $setRecord = $record && array_key_exists('record', $in);
+        return Store::update('connections/' . $uid, static function (array &$d) use ($c, $id, $password, $dek, $create, $setRecord): array|string {
             if ($id !== '' && !isset($d[$id])) {
                 return 'not_found';
             }
@@ -278,7 +360,8 @@ final class Connections
             $c['pass'] = $moved ? null : $old['pass'] ?? null;
             $c['cert'] = $moved ? '' : $old['cert'] ?? '';
             $c['certs'] = $moved ? [] : $old['certs'] ?? [];   // (its gateway's and its broker's computers': lost on every save)
-            $c['record'] = (bool)($old['record'] ?? false);   // the administrator's to set: the user cannot stop it
+            // the administrator's to set (also in their own editor): a user cannot start or stop it
+            $c['record'] = $setRecord ? (bool)$c['record'] : (bool)($old['record'] ?? false);
             $c['full']   = (bool)($old['full'] ?? true);     // "Start in full screen": set in the connect dialog only
             $c['multi']  = (bool)($old['multi'] ?? true);    // "Use all my screens": the same
             if ($password !== null) {

@@ -91,13 +91,13 @@ If uploading a file shows "PHP cannot write to its temporary folder", ask the ho
 
 1. Open **`https://your-domain/mudesk/`** in the browser.
 2. The screen asks for a **setup code**. It is in the file `mudesk/data/setup-code.php`, made at that moment. Open it with the File Manager (**View** or **Edit**; do not open it in the browser: it would show nothing). Its second line is the code, which looks like `1A2B3-C4D5E-F6A7B-8C9D0`. Copy it.
-3. Type the code, the administrator's name and a password of **at least 12 characters** (4 different ones at least; not a common password and not containing the name). The code works only once, and the file is removed when done.
+3. Type the code, the administrator's name and a password of **at least 12 characters** (4 different ones at least; not a common password and not containing the name). The code works only once, and the file is removed when done. It works for a day: after that a new code takes its place in the same file (open it again).
 
 The code is there so that nobody else can take over a freshly copied installation before you do.
 
 ### 3.5 Check that the data is protected
 
-Open **`https://your-domain/mudesk/data/web-check.txt`**. It must give a **403 (Forbidden)** or **404 (Not Found)** error. If you see a text starting with "MuDeskClient data folder" instead, your hosting does not apply the `.htaccess` files and the data folder can be downloaded; the application also warns the administrator in red. Then ask the provider to enable `AllowOverride` for your site, or use layout B of [HOSTING](HOSTING.md) (only `public` inside the web folder).
+Open **`https://your-domain/mudesk/data/web-check.txt`**. It must give a **403 (Forbidden)** or **404 (Not Found)** error. If you see a text starting with "MuDeskClient data folder" instead, your hosting does not apply the `.htaccess` files and the data folder can be downloaded; the application finds it too, and does not work meanwhile (every page says "The data folder can be downloaded"). Then ask the provider to enable `AllowOverride` for your site, or use layout B of [HOSTING](HOSTING.md) (only `public` inside the web folder).
 
 ### 3.6 Check that the hosting reaches your computers
 
@@ -107,7 +107,7 @@ Some hostings **do not allow outgoing connections** to other ports, the Remote D
 2. Copy that file into the `mudesk/public/` folder.
 3. Open `https://your-domain/mudesk/public/check.php`, type your secret word in *Token* and, in the outgoing RDP test, the address of your remote computer and **its port** (3389 unless it was changed; if your computer uses another one, type that one). Run the test.
 4. If it cannot connect, see [section 7, firewalls](#7-firewalls-that-must-let-it-through).
-5. **Delete `public/check.php` when done.**
+5. **Delete `public/check.php` when done.** It works for a day after it was copied, and while it is there the administration says so in red.
 
 ## 4. Option B: on a Windows PC of the local network (XAMPP)
 
@@ -217,7 +217,7 @@ When a connection fails with "Cannot reach the remote computer", it is almost al
 
 1. Sign in to MuDeskClient as the administrator.
 2. **Connections → New connection**: a name, the computer's address, its **port** and the Windows user. Save.
-3. Press **Connect**, type the Windows password, and that's it.
+3. Press **Connect** and type the Windows password. The first time, the computer's certificate fingerprints are shown ("First connection to this computer"): compare them with the computer's and press **Trust and connect** (an administrator's box *Valid for every user* fixes it for everyone).
 
 For more users: *Administration → Users → New user*. The **Administrator rights** box makes the user an administrator; there can be several. The full guide is [USAGE](USAGE.md).
 
@@ -229,7 +229,7 @@ For more users: *Administration → Users → New user*. The **Administrator rig
 
 ## 10. Backups
 
-Everything of yours is in the **`data`** folder: users, connections, audit, shared files and the server's key (`data/secret.php`). Copy it whole, regularly, to a safe place. **Without `secret.php`** the codes of authenticator apps stop working and the audit cannot be verified. Keep that copy confidential.
+Everything of yours is in the **`data`** folder: users, connections, audit, shared files and the server's key (`data/secret.php`). *Administration → Backup* downloads it encrypted with a password you choose (the users' folders and recordings when ticked) and restores it; or copy the folder whole. Do it regularly, to a safe place. **Without `secret.php`** the codes of authenticator apps stop working and the audit cannot be verified. Keep that copy, and the backup's password, confidential.
 
 ## 11. Common problems
 
@@ -239,7 +239,7 @@ Everything of yours is in the **`data`** folder: users, connections, audit, shar
 | "PHP cannot write to its temporary folder" | Let PHP write to its temporary folder ([3.3](#33-permissions-of-the-data-folder)); on a hosting, ask the provider |
 | "A secure connection is required" | Open the address with `https://`. On a hosting, turn on the free certificate; on the local network, XAMPP and Linux already have one |
 | "PHP version not supported" | Choose PHP 8.1 to 8.5 in the hosting's panel |
-| Red warning: the data folder can be downloaded | Your server does not apply `.htaccess`: [3.5](#35-check-that-the-data-is-protected) |
+| "The data folder can be downloaded", and nothing works | Your server does not apply `.htaccess`: [3.5](#35-check-that-the-data-is-protected) |
 | "Wrong setup code." | Copy the whole second line of `data/setup-code.php`, with its hyphens |
 | "Cannot reach the remote computer" | Computer on, address, **port** and [firewalls](#7-firewalls-that-must-let-it-through) |
 | "Wrong remote username or password." | The **Windows** user and password of the remote computer (not the MuDeskClient ones). For a local account, type `.\user`; for a domain account, `DOMAIN\user` (a domain that blocks NTLM needs Kerberos: the domain by its DNS name; README, *Limitations*) |
@@ -269,12 +269,12 @@ docker run -d --name mudesk --restart unless-stopped -p 8443:443 -v mudesk-data:
 docker compose up -d
 ```
 
-The setup code: `docker compose exec mudesk cat /var/www/mudesk/data/setup-code.php`. Updating: `docker compose pull`, then `docker compose up -d`. It runs the published image; to build the image from the code of that folder instead, uncomment the line `build: .` in `compose.yaml` and start it with `docker compose up -d --build`. The name for the certificate (`MUDESK_HOSTNAME`) and your own certificate are set in that file too.
+The setup code: `docker compose exec mudesk cat /var/www/mudesk/data/setup-code.php`. `compose.yaml` names the image of its version (`ghcr.io/miguelenred/mudeskclient:1.2.0`, say), which does not change by itself. Updating: put the new version's number there, then `docker compose pull` and `docker compose up -d`. It runs the published image; to build the image from the code of that folder instead, uncomment the line `build: .` in `compose.yaml` and start it with `docker compose up -d --build`. The name for the certificate (`MUDESK_HOSTNAME`) and your own certificate are set in that file too.
 
 Options:
 
 - **Your own certificate**: mount a folder with `cert.pem` and `key.pem` at `/etc/mudesk/tls` (`-v /path/to/tls:/etc/mudesk/tls:ro`). Without one, `-e MUDESK_HOSTNAME=name` puts that name in the self-signed certificate (also as its subjectAltName, which browsers check). That folder is a volume of its own, so the self-signed certificate stays when the container is made again for an update (give it a name, `-v mudesk-tls:/etc/mudesk/tls`, to keep it with `docker rm`). The code is read-only for the web server (only `data/` is its to write), and OPcache is on.
 - **Behind your reverse proxy** (Nginx, Caddy, Traefik): point it to `https://container:443`. Put its address in `trusted_proxies` of a `config.php` mounted at `/var/www/mudesk/config.php`, and keep long requests open (see [HOSTING](HOSTING.md)).
-- **A version**: `ghcr.io/miguelenred/mudeskclient:1.1.0` instead of the latest.
+- **A version**: `ghcr.io/miguelenred/mudeskclient:1.2.0` instead of the latest.
 
 The container must reach the RDP port of the remote computers; Wake-on-LAN broadcasts only leave it with `--network host` (Linux).

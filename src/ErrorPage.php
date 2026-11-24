@@ -47,6 +47,24 @@ final class ErrorPage
             'en' => ['Access not allowed', 'MuDeskClient does not accept connections from the IP address of this device.',
                 'If you need to sign in from here, ask the administrator to add it in Administration → Settings → IPs allowed to use the web app.'],
         ],
+        'data_exposed' => [
+            'es' => ['La carpeta de datos se puede descargar',
+                'El servidor web deja que cualquiera descargue la carpeta data de MuDeskClient (usuarios, conexiones, auditoría…). Por seguridad, MuDeskClient no funciona hasta que esté protegida.',
+                'Para el administrador: el servidor web no aplica la protección de la carpeta data (Nginx no lee los .htaccess; en Apache hace falta AllowOverride, y en IIS el web.config). Sirve solo la carpeta public, o niega el acceso a data como explica docs/es/HOSTING.md, «Proteger las carpetas privadas», y vuelve a cargar la página: se comprueba de nuevo en unos segundos.'],
+            'en' => ['The data folder can be downloaded',
+                'The web server lets anyone download the data folder of MuDeskClient (users, connections, the audit…). For safety, MuDeskClient does not work until it is protected.',
+                'For the administrator: the web server does not apply the protection of the data folder (Nginx does not read .htaccess files; Apache needs AllowOverride, and IIS the web.config). Serve only the public folder, or deny access to data as docs/HOSTING.md explains in “Protecting the private folders”, then reload the page: it is checked again within seconds.'],
+        ],
+        'restoring' => [
+            'es' => ['Restaurando una copia de seguridad', 'Un administrador está restaurando una copia de seguridad de MuDeskClient.', 'Vuelve a cargar la página dentro de un momento.'],
+            'en' => ['Restoring a backup', 'An administrator is restoring a backup of MuDeskClient.', 'Reload the page in a moment.'],
+        ],
+        'config_proxies' => [
+            'es' => ['Error en la configuración', 'En config.php, trusted_proxies tiene algo que no es una dirección IP: no se puede saber la dirección real de quien entra a través del proxy.',
+                'Para el administrador: pon en trusted_proxies solo las direcciones IP de los proxies (sin rangos ni nombres) y vuelve a cargar la página. El detalle está en el registro de errores del servidor.'],
+            'en' => ['Configuration error', 'In config.php, trusted_proxies has something that is not an IP address: the real address of whoever comes through the proxy cannot be known.',
+                'For the administrator: put only the proxies\' IP addresses in trusted_proxies (no ranges or names), then reload the page. The details are in the server error log.'],
+        ],
         'internal'  => [
             'es' => ['Algo ha fallado', 'El servidor no ha podido completar la petición.',
                 'Vuelve a intentarlo dentro de un momento. Si se repite, el administrador encontrará el detalle en el registro de errores del servidor.'],
@@ -81,6 +99,7 @@ final class ErrorPage
             header('Cache-Control: no-store');
             header('X-Content-Type-Options: nosniff');
             header('Referrer-Policy: no-referrer');
+            header('Cross-Origin-Resource-Policy: same-origin');
             header("Content-Security-Policy: default-src 'none'; style-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
         }
         echo $html ? self::html($status, $error, I18n::accept((string)($_SERVER['HTTP_ACCEPT_LANGUAGE'] ?? ''))) : '{"error":"' . $error . '"}';
@@ -94,7 +113,7 @@ final class ErrorPage
         };
         $error = isset(self::TEXT[$error]) ? $error : 'internal';
         $t     = self::TEXT[$error][$lang];
-        $retry = in_array($error, ['data_dir', 'php', 'internal'], true)
+        $retry = in_array($error, ['data_dir', 'php', 'internal', 'data_exposed', 'restoring'], true)
             ? '<p class="row end"><a class="btn primary" href="">' . self::RETRY[$lang] . '</a></p>' : '';
         return '<!doctype html><html lang="' . $lang . '"><head><meta charset="utf-8">'
             . '<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark">'

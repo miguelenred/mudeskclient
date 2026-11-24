@@ -6,8 +6,8 @@ Esta es la referencia técnica. Para una guía paso a paso para todos los nivele
 
 ## Antes de desplegar: `tools/check.php`
 
-1. Cambia `TOKEN` al principio de `tools/check.php`.
-2. Cópialo dentro de `public/` en el hosting (la carpeta `tools/` está cerrada a la web) y ábrelo en el navegador.
+1. Cambia `TOKEN` al principio de `tools/check.php` (con `CAMBIAR`, como viene, no hace nada).
+2. Cópialo dentro de `public/` en el hosting (la carpeta `tools/` está cerrada a la web) y ábrelo en el navegador. Funciona durante un día desde que se copió (o se cambió): después se niega, por si se olvidó allí; cópialo de nuevo para volver a usarlo.
 3. Ejecuta las seis pruebas:
    - **Entorno PHP**: versión, OpenSSL, funciones desactivadas, límites, sockets Unix. Avisa si PHP no es 8.1–8.5, si `display_errors` está activo y si `memory_limit` es menor de 128M.
    - **RDP saliente**: conecta con un equipo remoto real e informa de TLS/NLA, versión de TLS y certificado.
@@ -15,7 +15,7 @@ Esta es la referencia técnica. Para una guía paso a paso para todos los nivele
    - **Latencia**: ida y vuelta al hosting.
    - **Carpeta de datos accesible desde la web**: escribe un fichero de prueba en la carpeta de datos e intenta descargarlo por la web; no debe poder.
    - **Procesos PHP a la vez**: lanza peticiones de 1 s a la vez (20 por defecto) y cuenta cuántas atendió el servidor juntas (N); `max_sessions_total` debe ser como mucho N − 2 (ver *Capacidad*). Con HTTP/1.1 el navegador abre como mucho 6 conexiones, así que no puede medir más.
-4. **Borra el fichero** después.
+4. **Borra el fichero** después. Mientras `public/check.php` esté allí, la administración lo dice en rojo.
 
 ## Requisitos
 
@@ -40,7 +40,7 @@ Valen dos disposiciones. Solo `public/` tiene que ser accesible desde la web.
 /home/cuenta/public_html/mudesk/data        con escritura para PHP
 ```
 
-Los `.htaccess` del proyecto (y los `web.config` para IIS) dejan fuera de alcance todo salvo `public/`: el de la raíz manda cada petición a `public/`, y `data/`, `src/`, `tests/`, `tools/` y `docs/` niegan cualquier acceso y el listado (Apache 2.2 y 2.4). Si se borra el `.htaccess` de `data/`, la aplicación lo vuelve a escribir. Tras subirlo comprueba (cada uno debe responder **403**): `/mudesk/data/web-check.txt`, `/mudesk/config.php`, `/mudesk/src/bootstrap.php`. Si el servidor no aplica `.htaccess` (`AllowOverride None`), la aplicación muestra un aviso en rojo en la pantalla de instalación y en la sección de administración, porque la carpeta de datos se podría descargar.
+Los `.htaccess` del proyecto (y los `web.config` para IIS) dejan fuera de alcance todo salvo `public/`: el de la raíz manda cada petición a `public/`, y `data/`, `src/`, `tests/`, `tools/` y `docs/` niegan cualquier acceso y el listado (Apache 2.2 y 2.4). Si se borra el `.htaccess` de `data/`, la aplicación lo vuelve a escribir. Tras subirlo comprueba (cada uno debe responder **403**): `/mudesk/data/web-check.txt`, `/mudesk/config.php`, `/mudesk/src/bootstrap.php`. Si el servidor no aplica `.htaccess` (`AllowOverride None`), la carpeta de datos se puede descargar, y la aplicación se para: cada página lo dice («La carpeta de datos se puede descargar») hasta que se protege.
 
 **B. Solo `public/` en la raíz web** (lo más seguro si el hosting lo permite):
 
@@ -51,11 +51,11 @@ Los `.htaccess` del proyecto (y los `web.config` para IIS) dejan fuera de alcanc
 /home/cuenta/public_html          <- contenido de public/
 ```
 
-Si `public_html` no está junto a `src/`, como aquí, cambia el primer `require` de `index.php`, `api.php`, `rdp.php` y `files.php` (aquí por `require __DIR__ . '/../mudesk/src/bootstrap.php';`).
+Si `public_html` no está junto a `src/`, como aquí, cambia el primer `require` de `index.php`, `api.php`, `rdp.php`, `files.php`, `oidc.php`, `backup.php` y `health.php` (aquí por `require __DIR__ . '/../mudesk/src/bootstrap.php';`).
 
 ### Proteger las carpetas privadas según el servidor web
 
-Solo `public/` se puede servir. Compruébalo tras desplegar: `data/web-check.txt`, `config.php` y `src/bootstrap.php` deben responder **403** (o 404), nunca 200; además la aplicación avisa al administrador si la carpeta de datos se puede leer.
+Solo `public/` se puede servir. Compruébalo tras desplegar: `data/web-check.txt`, `config.php` y `src/bootstrap.php` deben responder **403** (o 404), nunca 200. La aplicación comprueba la carpeta de datos por su cuenta: mientras se puede leer desde la web, nada funciona y cada página lo dice («La carpeta de datos se puede descargar»), hasta que se protege (mientras tanto se comprueba de nuevo cada 30 s, o 5 minutos después de que la encontrara un navegador). El servidor se la pide a sí mismo en la dirección y el puerto por los que llegó la petición, y también donde la encontró legible (una petición con el nombre de otro sitio u otra ruta nunca la da por protegida ella sola); donde no puede (el servidor integrado de PHP, un hosting que no le deja llegar a sí mismo) la comprueban los navegadores, que lo demuestran con un código aleatorio del archivo, nuevo cada vez que se mira (cada 10 minutos en el servidor integrado de PHP).
 
 - **Apache** (2.2 y 2.4): lo hacen los `.htaccess` incluidos; necesitan `AllowOverride All` (o al menos `AuthConfig FileInfo Indexes Limit Options`; el de la raíz usa `DirectoryIndex`). Probado.
 - **LiteSpeed Enterprise** (la mayoría de hostings compartidos con cPanel/LiteSpeed): lee los `.htaccess` como Apache; no hay que hacer nada más.
@@ -100,11 +100,18 @@ Cuando no puede seguir, quien abre la dirección ve una página con el aspecto d
 - PHP no admitido o sin OpenSSL;
 - HTTPS obligatorio;
 - IP no permitida;
+- la carpeta de datos se puede descargar (503, hasta que se protege);
+- una copia de seguridad restaurándose (503, unos segundos);
+- `trusted_proxies` con una entrada que no es una dirección IP (un rango o un nombre);
 - error interno, incluido quedarse sin memoria.
 
 Las peticiones de la propia interfaz reciben `{"error": clave}` y muestran el mismo motivo con «Volver a intentarlo».
 
 Aunque la carpeta de datos llegara a servirse, la clave del servidor se guarda en `data/secret.php`, que empieza por `<?php exit; ?>`: PHP no muestra nada. Las contraseñas RDP van cifradas con una clave que solo se abre con la contraseña de cada usuario, y las de acceso son hashes bcrypt.
+
+### Archivos temporales
+
+La aplicación borra sus propios archivos temporales: los de una sesión al terminar, los ficheros del portapapeles y los trabajos de impresión con su sesión. Lo que deja una escritura cortada o un proceso PHP que el hosting mata (una escritura sin terminar, `*.tmp` de más de una hora; los ficheros, la carpeta y el socket de una sesión que terminó sin su limpieza; las sesiones web caducadas, también donde el PHP del hosting nunca las recoge; los bloqueos de usuarios borrados) se borra como mucho una vez por hora, con las peticiones (no hay ningún proceso en segundo plano). Los ficheros `*.lock` se quedan: son los propios bloqueos (vacíos, uno por fichero de datos y por usuario).
 
 ## Servidor web
 
@@ -128,23 +135,29 @@ El flujo de la sesión no puede acumularse ni comprimirse.
 
   Esto supone que `root` apunta a `public/`; con todo el proyecto bajo `/mudesk/`, usa `location = /mudesk/public/rdp.php` y `$document_root/mudesk/public/rdp.php`, y deniega las carpetas privadas como en *Proteger las carpetas privadas*, más arriba. `rdp.php` envía además `X-Accel-Buffering: no`.
 - **IIS** (aún sin probar): el manejador FastCGI de PHP no debe acumular el flujo (`responseBufferLimit="0"`) y `requestTimeout` y `activityTimeout` de la aplicación FastCGI deben permitir peticiones largas.
-- **Proxy inverso / CDN** (Cloudflare y similares): cortan las peticiones largas (≈100 s en Cloudflare). El cliente reconecta solo, pero es mejor conexión directa. Detrás de un proxy propio, pon su IP en `trusted_proxies`. Un proxy en la misma máquina (127.0.0.1) debe enviar además `X-Forwarded-Proto: https`: al ponerlo en la lista deja de tomarse como petición local, así que a través de él se exige HTTPS como desde cualquier otro sitio (antes, las peticiones a través de él no pasaban la comprobación de HTTPS).
+- **Proxy inverso / CDN** (Cloudflare y similares): cortan las peticiones largas (≈100 s en Cloudflare). El cliente reconecta solo, pero es mejor conexión directa. Detrás de un proxy propio, pon su IP en `trusted_proxies`: solo las direcciones exactas de tus proxies, nunca un rango ni una dirección compartida con clientes que conectan directamente (quien envíe desde allí podría poner cualquier dirección en `X-Forwarded-For` y saltarse la lista de clientes permitidos y los bloqueos de acceso). Un proxy que no pasa el nombre público del sitio (su `Host`): pon la dirección del sitio en `public_url` de `config.php` (por ejemplo `https://rdp.ejemplo.com/mudesk`), que usan entonces el inicio de sesión con OpenID Connect y las llaves de acceso. Un proxy en la misma máquina (127.0.0.1) debe enviar además `X-Forwarded-Proto: https`: al ponerlo en la lista deja de tomarse como petición local, así que a través de él se exige HTTPS como desde cualquier otro sitio (antes, las peticiones a través de él no pasaban la comprobación de HTTPS).
 - **Límites de PHP**: el flujo llama a `set_time_limit(0)`; comprueba que el servidor web o FPM (`request_terminate_timeout`) no corten peticiones largas. Las descargas y los ZIP de la carpeta compartida (`files.php`, hasta 4 GB) también son peticiones largas.
 - **App instalable**: el manifiesto (`manifest.webmanifest`) debe servirse como `application/manifest+json`. Apache y LiteSpeed: lo hace `public/.htaccess`; IIS: `public/web.config`. Nginx: si su `mime.types` no conoce `.webmanifest`, añade en él `application/manifest+json webmanifest;`.
 - **Scripts y estilos tras una actualización**: la página pide `app.js` y `app.css` con una huella de sus archivos en la dirección (cambia con cualquiera de ellos), pero los módulos que importan van sin ella, así que el servidor web debe hacer que se revaliden en cada carga (un 304 si no han cambiado). Apache y LiteSpeed: lo hace `public/.htaccess` (con `mod_headers`; sin él, la regla se salta); IIS: `public/web.config` y `public/assets/web.config` (aún sin probar en un IIS real); Nginx: añade al bloque `server` `location ~* \.(js|css)$ { add_header Cache-Control "no-cache"; }`. Una página abierta mientras se actualiza MuDesk lo dice la próxima vez que se entra en ella y ofrece recargar.
 
 ## Capacidad
 
+- Cada intento de inicio de sesión tarda 1 s, sea cual sea la respuesta (así su tiempo no dice nada de la cuenta): muchos a la vez ocupan otros tantos procesos PHP ese segundo. Los bloqueos por dirección, por usuario y en total cuentan los fallos; una dirección bloqueada se rechaza al momento, sin escribir nada más (su bloqueo no dice nada de los usuarios).
 - Cada sesión abierta ocupa **un proceso PHP** todo el tiempo (un hijo de php-fpm o un proceso de Apache). Un equipo remoto que no responde lo retiene hasta 8 s por cada paso del saludo.
-- Mientras se escribe o se mueve el ratón, una sesión añade hasta **cuatro peticiones cortas a la vez**; mientras un programa remoto graba del micrófono, unas diez por segundo (trozos de 100 ms, dentro de esas cuatro); mientras un programa de allí usa la cámara o la carpeta de este equipo, hasta dos más a la vez por un carril propio.
+- Mientras se escribe o se mueve el ratón, una sesión añade hasta **cuatro peticiones cortas a la vez**; mientras un programa remoto graba del micrófono, unas diez por segundo (trozos de 100 ms, dentro de esas cuatro); mientras un programa de allí usa la cámara o la carpeta de este equipo, o la sesión se graba en el navegador, hasta dos más a la vez por un carril propio.
 - Cada invitado que ve una sesión compartida ocupa **un proceso PHP más** mientras mira (como mucho 5 por sesión).
 - `memory_limit`: un mensaje de un canal mayor que una sexta parte de lo que el límite deja libre (copiar una captura 4K son 33 MB) se deja fuera, sin pegarse, y queda en el registro de errores, en vez de terminar la sesión con un error fatal de PHP; con 256M o más pasan esas copias.
-- Las conexiones grabadas escriben en `data/recordings/` mientras duran sus sesiones (unas decenas de MB por hora en un escritorio de oficina; mucho más con vídeo), guardadas los días de los ajustes: deja sitio en el disco.
+- Las sesiones grabadas escriben en `data/recordings/` mientras se graban (unas decenas de MB por hora en un escritorio de oficina, de 35 a 110 MB la empezada en la sesión; mucho más con vídeo), guardadas hasta que se eliminan a mano (o los días de los ajustes): deja sitio en el disco. La empezada en la sesión ocupa además la subida del usuario mientras se graba (de 10 a 30 KB/s en un escritorio de oficina, hasta 0,5–6 Mbit/s con vídeo).
 - Pon *Administración → Ajustes → Sesiones RDP a la vez (todos los usuarios)* (`max_sessions_total`, 20 por defecto, 0 = sin límite) por debajo de los procesos PHP disponibles: con PHP-FPM, `pm.max_children` ≥ `max_sessions_total` + los que necesita la web (2 como mínimo, como cuenta `tools/check.php`; unos 10 para ir holgado). Al llegar al límite, una sesión nueva recibe al momento «servidor ocupado», sin conectar. `tools/check.php` mide los procesos a la vez: `max_sessions_total` como mucho N − 2.
 - Si es posible, sirve `rdp.php` desde un pool de PHP-FPM propio (su propio socket en el bloque `location = /rdp.php` de arriba), así las sesiones largas nunca ocupan los procesos de la web.
 - El servidor integrado de PHP (`php -S`) atiende de una en una: una sesión bloquea todo. Solo para pruebas; `PHP_CLI_SERVER_WORKERS` (varios procesos) no funciona en Windows.
 - En hostings con límite de "entry processes" (por ejemplo CloudLinux) hace falta al menos `5 × sesiones simultáneas`.
+- Los usuarios se guardan en un archivo (`data/users.json`), que se lee entero al entrar y en cada petición: hasta unos mil usuarios tarda pocos milisegundos (7 ms con 1.000 en un ordenador de sobremesa); 49 ms con 5.000 y 243 ms con 20.000.
 - Ancho de banda del servidor web al navegador: desde pocos KB/s (trabajo de oficina) hasta 2–3 MB/s (cambios a pantalla completa a 16 bits). Del navegador al servidor web, la entrada son pocos KB/s; el micrófono añade unos 176 KB/s mientras un programa remoto graba, y la cámara unos 150–185 KB/s con las cámaras simuladas de las pruebas (unos 0,5–1,5 MB/s una real, según una estimación) mientras un programa la usa.
+
+## Supervisión
+
+`public/health.php` responde `{"status":"ok"}` (200) mientras la pasarela funciona, o 503 con lo que no: `{"status":"error","problem":...}` (`data`: no se puede escribir en su carpeta de datos; `store`: no se pueden leer sus usuarios o ajustes), o, como todas las entradas, `{"error":"data_exposed"}` (su carpeta de datos se puede leer desde la web) y `{"error":"restoring"}` (una copia de seguridad restaurándose). No dice nada más de la instalación. Se aplican los clientes permitidos: pon la dirección del monitor cuando son una lista. *Administración → Estado* muestra las sesiones, los procesos, la memoria, el disco y los problemas recientes, y el uso de los últimos 30 días.
 
 ## Nombres de equipo (DNS)
 

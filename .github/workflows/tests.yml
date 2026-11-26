@@ -136,7 +136,7 @@ jobs:
           grep -q 'subPath: config.php' all.yaml
           grep -q 'externalTrafficPolicy: Local' all.yaml
           grep -A1 'name: MUDESK_WORKERS' all.yaml | grep -c '"300"' > /dev/null
-      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
+      - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
       - name: Installed in a cluster from the image of this code; the pod becomes ready (health.php) and answers with the setup screen
         run: |
           docker build -t mudesk:ci .

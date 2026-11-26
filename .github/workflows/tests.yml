@@ -50,8 +50,10 @@ jobs:
           docker build -t mudesk .
           docker run -d --name mudesk -p 8443:443 mudesk
           for i in $(seq 1 30); do curl -sk -o /dev/null https://localhost:8443/ && break; sleep 1; done
-          curl -sk https://localhost:8443/ | grep -q '<title>MuDeskClient</title>'
-          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost:8443/api.php | grep -q '"setup":true'
+          # (grep -c, not grep -q, after a pipe: grep -q stops at the first match, and the command writing into it then failed
+          # with SIGPIPE, which pipefail made the step's failure, by chance)
+          curl -sk https://localhost:8443/ | grep -c '<title>MuDeskClient</title>' > /dev/null
+          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost:8443/api.php | grep -c '"setup":true' > /dev/null
           test "$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/data/web-check.txt)" = 404
           test "$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8443/src/bootstrap.php)" = 404
           test "$(head -c 9000000 /dev/zero | curl -sk -o /dev/null -w '%{http_code}' -H 'Content-Type: application/octet-stream' --data-binary @- 'https://localhost:8443/rdp.php?a=send&sid=x')" = 413
@@ -59,19 +61,19 @@ jobs:
           docker exec mudesk test ! -e /var/www/mudesk/config.php
           docker exec mudesk test ! -e /var/www/mudesk/tests
           docker exec mudesk sh -c 'test "$(stat -c %U /var/www/mudesk/data)" = www-data'
-          docker logs mudesk 2>&1 | grep -q 'self-signed certificate made'
+          docker logs mudesk 2>&1 | grep -c 'self-signed certificate made' > /dev/null
       - name: Its health (health.php from inside) becomes healthy; Apache's processes at once from MUDESK_WORKERS, 256 when missing or out of range
         run: |
           for i in $(seq 1 60); do test "$(docker inspect -f '{{.State.Health.Status}}' mudesk)" = healthy && break; sleep 2; done
           test "$(docker inspect -f '{{.State.Health.Status}}' mudesk)" = healthy
-          docker logs mudesk 2>&1 | grep -q 'up to 256 Apache processes at once'
+          docker logs mudesk 2>&1 | grep -c 'up to 256 Apache processes at once' > /dev/null
           docker run -d --name mudesk-w300 -e MUDESK_WORKERS=300 -p 8444:443 mudesk
           docker run -d --name mudesk-w5 -e MUDESK_WORKERS=5 -p 8445:443 mudesk
           for p in 8444 8445; do for i in $(seq 1 30); do curl -sk -o /dev/null https://localhost:$p/ && break; sleep 1; done; done
-          curl -sk https://localhost:8444/ | grep -q '<title>MuDeskClient</title>'
-          curl -sk https://localhost:8445/ | grep -q '<title>MuDeskClient</title>'
-          docker logs mudesk-w300 2>&1 | grep -q 'up to 300 Apache processes at once'
-          docker logs mudesk-w5 2>&1 | grep -q 'MUDESK_WORKERS must be from 10 to 20000; 256 taken'
+          curl -sk https://localhost:8444/ | grep -c '<title>MuDeskClient</title>' > /dev/null
+          curl -sk https://localhost:8445/ | grep -c '<title>MuDeskClient</title>' > /dev/null
+          docker logs mudesk-w300 2>&1 | grep -c 'up to 300 Apache processes at once' > /dev/null
+          docker logs mudesk-w5 2>&1 | grep -c 'MUDESK_WORKERS must be from 10 to 20000; 256 taken' > /dev/null
           docker rm -f mudesk-w300 mudesk-w5
       - name: The WebSocket service answers through Apache (/ws), only to the site's own pages; config.php's websocket => false turns it off
         run: |
@@ -81,16 +83,16 @@ jobs:
           for i in $(seq 1 20); do test "$(ws https://localhost:8443/ws https://localhost:8443)" = 101 && break; sleep 1; done
           test "$(ws https://localhost:8443/ws https://localhost:8443)" = 101
           test "$(ws https://localhost:8443/ws https://evil.example)" = 403
-          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost:8443/api.php | grep -q '"ws":"ws"'
-          docker logs mudesk 2>&1 | grep -q 'MuDeskClient WebSocket: listening on 127.0.0.1:8091'
+          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost:8443/api.php | grep -c '"ws":"ws"' > /dev/null
+          docker logs mudesk 2>&1 | grep -c 'MuDeskClient WebSocket: listening on 127.0.0.1:8091' > /dev/null
           docker exec mudesk php -r 'exit(function_exists("pcntl_fork") && function_exists("posix_kill") ? 0 : 1);'   # (each session a copy of the service)
           printf '%s\n' '<?php return ["websocket" => false];' > nows.php
           docker run -d --name mudesk-nows -v "$PWD/nows.php:/var/www/mudesk/config.php:ro" -p 8446:443 mudesk
           for i in $(seq 1 30); do curl -sk -o /dev/null https://localhost:8446/ && break; sleep 1; done
           sleep 2
           test "$(ws https://localhost:8446/ws https://localhost:8446)" = 503
-          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost:8446/api.php | grep -q '"ws":null'
-          docker logs mudesk-nows 2>&1 | grep -q 'MuDeskClient WebSocket: off'
+          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost:8446/api.php | grep -c '"ws":null' > /dev/null
+          docker logs mudesk-nows 2>&1 | grep -c 'MuDeskClient WebSocket: off' > /dev/null
           docker rm -f mudesk-nows
       - name: The same with Docker Compose (compose.yaml, its image built from this code)
         run: |
@@ -99,16 +101,16 @@ jobs:
           grep -q '^    build: \.$' compose.yaml
           docker compose up -d --build
           for i in $(seq 1 30); do curl -sk -o /dev/null https://localhost:8443/ && break; sleep 1; done
-          curl -sk https://localhost:8443/ | grep -q '<title>MuDeskClient</title>'
-          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost:8443/api.php | grep -q '"setup":true'
+          curl -sk https://localhost:8443/ | grep -c '<title>MuDeskClient</title>' > /dev/null
+          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost:8443/api.php | grep -c '"setup":true' > /dev/null
           docker compose exec -T mudesk test -s /var/www/mudesk/data/setup-code.php
           docker compose exec -T mudesk test ! -e /var/www/mudesk/compose.yaml
-          docker volume ls --format '{{.Name}}' | grep -q 'mudesk-data$'
+          docker volume ls --format '{{.Name}}' | grep -c 'mudesk-data$' > /dev/null
           # healthy, its logs rotated, no privilege gained inside
           for i in $(seq 1 60); do test "$(docker inspect -f '{{.State.Health.Status}}' mudesk)" = healthy && break; sleep 2; done
           test "$(docker inspect -f '{{.State.Health.Status}}' mudesk)" = healthy
-          docker inspect -f '{{json .HostConfig.LogConfig}}' mudesk | grep -q '"max-size":"10m"'
-          docker inspect -f '{{json .HostConfig.SecurityOpt}}' mudesk | grep -q 'no-new-privileges:true'
+          docker inspect -f '{{json .HostConfig.LogConfig}}' mudesk | grep -c '"max-size":"10m"' > /dev/null
+          docker inspect -f '{{json .HostConfig.SecurityOpt}}' mudesk | grep -c 'no-new-privileges:true' > /dev/null
           docker compose down
       - name: Container log
         if: always()
@@ -133,7 +135,7 @@ jobs:
           if grep -q 'claimName: m-mudeskclient-tls' all.yaml; then exit 1; fi
           grep -q 'subPath: config.php' all.yaml
           grep -q 'externalTrafficPolicy: Local' all.yaml
-          grep -A1 'name: MUDESK_WORKERS' all.yaml | grep -q '"300"'
+          grep -A1 'name: MUDESK_WORKERS' all.yaml | grep -c '"300"' > /dev/null
       - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
       - name: Installed in a cluster from the image of this code; the pod becomes ready (health.php) and answers with the setup screen
         run: |
@@ -142,9 +144,9 @@ jobs:
           helm install m deploy/helm/mudeskclient --set image.repository=mudesk --set image.tag=ci --set image.pullPolicy=Never --wait --timeout 5m
           kubectl port-forward svc/m-mudeskclient 8443:443 > /dev/null 2>&1 &
           for i in $(seq 1 30); do curl -sk -o /dev/null https://localhost:8443/ && break; sleep 1; done
-          curl -sk https://localhost:8443/ | grep -q '<title>MuDeskClient</title>'
+          curl -sk https://localhost:8443/ | grep -c '<title>MuDeskClient</title>' > /dev/null
           test "$(curl -sk https://localhost:8443/health.php)" = '{"status":"ok"}'
-          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost:8443/api.php | grep -q '"setup":true'
+          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost:8443/api.php | grep -c '"setup":true' > /dev/null
           kubectl exec deploy/m-mudeskclient -- test -s /var/www/mudesk/data/setup-code.php
       - name: Pod log
         if: always()
@@ -157,8 +159,8 @@ jobs:
       - name: deploy/lxc/install.sh on Ubuntu (systemd) answers over HTTPS with the setup screen, serves only public/, sends plain HTTP to HTTPS; run again, it keeps the data
         run: |
           sudo bash deploy/lxc/install.sh --from "$PWD" --hostname ci.test --workers 300
-          curl -sk https://localhost/ | grep -q '<title>MuDeskClient</title>'
-          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost/api.php | grep -q '"setup":true'
+          curl -sk https://localhost/ | grep -c '<title>MuDeskClient</title>' > /dev/null
+          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost/api.php | grep -c '"setup":true' > /dev/null
           test "$(curl -sk -o /dev/null -w '%{http_code}' https://localhost/src/bootstrap.php)" = 404
           test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost/)" = 301
           test "$(curl -sk https://localhost/health.php)" = '{"status":"ok"}'
@@ -177,13 +179,13 @@ jobs:
           test -n "$code"
           sudo bash deploy/lxc/install.sh --from "$PWD" --hostname ci.test
           test "$(sudo sed -n 2p /var/www/mudesk/data/setup-code.php)" = "$code"
-          curl -sk https://localhost/ | grep -q '<title>MuDeskClient</title>'
+          curl -sk https://localhost/ | grep -c '<title>MuDeskClient</title>' > /dev/null
           for i in $(seq 1 20); do test "$(ws https://localhost)" = 101 && break; sleep 1; done
           test "$(ws https://localhost)" = 101
       - name: The same in Debian 12 without systemd
         run: |
           docker run --rm -v "$PWD:/src:ro" debian:12 bash -c 'set -e; bash /src/deploy/lxc/install.sh --from /src --hostname ci.test
-            curl -sk https://127.0.0.1/ | grep -q "<title>MuDeskClient</title>"
+            curl -sk https://127.0.0.1/ | grep -c "<title>MuDeskClient</title>" > /dev/null
             test -s /var/www/mudesk/data/setup-code.php
             test "$(curl -sk https://127.0.0.1/health.php)" = "{\"status\":\"ok\"}"
             ws() { curl -sk --http1.1 -o /dev/null -w "%{http_code}" --max-time 3 -H "Connection: Upgrade" -H "Upgrade: websocket" \

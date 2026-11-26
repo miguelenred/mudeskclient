@@ -144,6 +144,7 @@ jobs:
           for i in $(seq 1 30); do curl -sk -o /dev/null https://localhost:8443/ && break; sleep 1; done
           curl -sk https://localhost:8443/ | grep -q '<title>MuDeskClient</title>'
           test "$(curl -sk https://localhost:8443/health.php)" = '{"status":"ok"}'
+          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost:8443/api.php | grep -q '"setup":true'
           kubectl exec deploy/m-mudeskclient -- test -s /var/www/mudesk/data/setup-code.php
       - name: Pod log
         if: always()

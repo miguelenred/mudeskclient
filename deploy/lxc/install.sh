@@ -35,9 +35,18 @@ TLS=/etc/mudesk/tls
 echo "MuDeskClient: installing Apache and PHP"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-apt-get install -y -q --no-install-recommends apache2 libapache2-mod-php php-cli php-opcache ca-certificates curl unzip openssl
+apt-get install -y -q --no-install-recommends apache2 libapache2-mod-php php-cli ca-certificates curl unzip openssl
 php -r 'exit(PHP_VERSION_ID >= 80100 && extension_loaded("openssl") ? 0 : 1);' \
     || fail "PHP 8.1 or later with OpenSSL needed: this system has $(php -r 'echo PHP_VERSION;') (Debian 12 or Ubuntu 22.04 or later)"
+# OPcache: built into PHP 8.5; up to 8.4 the package of that version (php8.x-opcache). Before, php-opcache was asked for,
+# a name systems with PHP 8.5 no longer have: the install stopped there
+PHPV="$(php -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;')"
+if ! php -r 'exit(extension_loaded("Zend OPcache") ? 0 : 1);'; then
+    case "$(apt-cache policy "php$PHPV-opcache" 2> /dev/null | awk '/Candidate:/ {print $2}')" in
+        ''|'(none)') echo "MuDeskClient: no OPcache package for PHP $PHPV: it works without it, a little slower" ;;
+        *) apt-get install -y -q --no-install-recommends "php$PHPV-opcache" ;;
+    esac
+fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf -- "${WORK:?}"' EXIT
@@ -140,7 +149,9 @@ else
     setsid runuser -u www-data -- "$PHP" "$DEST/tools/ws-server.php" > /dev/null 2>&1 < /dev/null &
 fi
 
-curl -sk -o /dev/null https://127.0.0.1/ || true   # (the first page makes the setup code)
+# the setup code made as the page's first request makes it, to be shown below (before, the page alone was asked for, which
+# does not make it: the code was never shown)
+curl -sk -o /dev/null -H 'Content-Type: application/json' -d '{"action":"state"}' https://127.0.0.1/api.php || true
 ADDR="$( { hostname -I 2> /dev/null || true; } | awk '{print $1}')"
 echo
 echo "MuDeskClient is installed: open https://${ADDR:-$NAME}/ (the browser warns once about the self-signed certificate)"

@@ -1,9 +1,6 @@
 {{- /* MuDeskClient - https://miguelenred.es/mudeskclient - Apache License 2.0 */ -}}
 MuDeskClient {{ .Values.image.tag | default .Chart.AppVersion }} is starting (one pod; its data on the volume {{ .Values.persistence.data.existingClaim | default (printf "%s-data" (include "mudesk.fullname" .)) }}).
 
-The setup code, for the first run (its second line):
-  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "mudesk.fullname" . }} -- cat /var/www/mudesk/data/setup-code.php
-
 {{- if .Values.ingress.enabled }}
 
 Open https://{{ .Values.ingress.host }}
@@ -16,5 +13,8 @@ then open https://localhost:8443
 
 Open https://<the service's address>:{{ .Values.service.port }}
 {{- end }}
+
+Once the page is open, the setup code for the first run (its second line; the page makes it):
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "mudesk.fullname" . }} -- cat /var/www/mudesk/data/setup-code.php
 
 The pod must reach the RDP port of the remote computers. Wake-on-LAN does not leave a pod's network.

@@ -8861,7 +8861,8 @@ file_put_contents("$cdir/old.php", str_replace(["const TOKEN = 'CAMBIAR';", 'con
 $cprobe = stream_socket_server('tcp://127.0.0.1:0');
 $cport  = (int)substr((string)strrchr((string)stream_socket_get_name($cprobe, false), ':'), 1);
 fclose($cprobe);
-$cweb = proc_open([PHP_BINARY, '-d', "error_log=$cdir/php.log", '-S', "127.0.0.1:$cport", '-t', $cdir], [1 => ['file', $nul, 'w'], 2 => ['file', $nul, 'w']], $cpipes);
+// (the path quoted: a short Windows name like RUNNER~1 unquoted is read as the ~ operator, and the log went elsewhere at GitHub)
+$cweb = proc_open([PHP_BINARY, '-d', "error_log=\"$cdir/php.log\"", '-S', "127.0.0.1:$cport", '-t', $cdir], [1 => ['file', $nul, 'w'], 2 => ['file', $nul, 'w']], $cpipes);
 for ($i = 0; $i < 100 && !($cs = @fsockopen('127.0.0.1', $cport)); $i++) {
     usleep(50000);
 }

@@ -291,11 +291,11 @@ El chart está en `deploy/helm/mudeskclient` (en el zip y en el repositorio). Ej
 
 ```bash
 helm install mudesk deploy/helm/mudeskclient
-kubectl exec deploy/mudesk-mudeskclient -- cat /var/www/mudesk/data/setup-code.php
 kubectl port-forward svc/mudesk-mudeskclient 8443:443
+kubectl exec deploy/mudesk-mudeskclient -- cat /var/www/mudesk/data/setup-code.php
 ```
 
-Después abre `https://localhost:8443` y escribe el código de instalación (su segunda línea). Los valores (`deploy/helm/mudeskclient/values.yaml`) fijan:
+Abre `https://localhost:8443` mientras el puerto está redirigido, lee después el código de instalación en otra terminal (su segunda línea: la página lo crea al abrirse por primera vez) y escríbelo. Los valores (`deploy/helm/mudeskclient/values.yaml`) fijan:
 
 - **Cómo se llega a él**: `service.type` `LoadBalancer` con `service.externalTrafficPolicy: Local` conserva la dirección de cada cliente (la usan los bloqueos de acceso y los clientes permitidos). Con `ingress.enabled` el chart crea un Ingress con lo que una sesión necesita de ingress-nginx (HTTPS hasta el pod, peticiones abiertas durante horas, nada acumulado, cuerpos de hasta 8 MB; los WebSocket pasan tal cual, para el servicio WebSocket de la imagen); entonces pon las direcciones del controlador de ingress en `trusted_proxies`, o todos los clientes cuentan como una sola dirección.
 - **Tu certificado**: `tls.existingSecret`, un secreto de tipo `kubernetes.io/tls`; sin él, se crea un certificado autofirmado al primer arranque y se guarda en un pequeño volumen propio.

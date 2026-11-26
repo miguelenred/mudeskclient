@@ -49,6 +49,29 @@ final class Files
         return implode('/', $parts);
     }
 
+    /**
+     * Where an upload writes a file that replaces another (files.php): beside it, under a name of its own, put in its place
+     * by a rename at the last chunk.
+     */
+    public static function partOf(string $path): string
+    {
+        return dirname($path) . '/.mudesk-upload-' . substr(hash('sha256', basename($path)), 0, 16);
+    }
+
+    /**
+     * The part of an upload started for the user's file $rel, noted (tmp/upload-<uid>.parts, a path of the folder a line) so
+     * that one left half way (the browser closed, the network gone) is found by the housekeeping without walking the user's
+     * folder (Maintenance::run). Under the user's upload lock.
+     */
+    public static function notePart(string $uid, string $rel): void
+    {
+        $f    = Config::dir("tmp/upload-$uid.parts");
+        $list = is_file($f) ? explode("\n", (string)@file_get_contents($f)) : [];
+        if (!in_array($rel, $list, true)) {
+            file_put_contents($f, "$rel\n", FILE_APPEND);
+        }
+    }
+
     public static function path(string $uid, string $rel): ?string
     {
         $rel  = self::clean($rel);
@@ -61,7 +84,8 @@ final class Files
      * Whether $path, inside $root by its name, stays inside it once links are followed (symbolic links, Windows junctions).
      * Nothing of MuDeskClient makes one, but one put into a user's folder by something else (a restored backup, a program
      * on the server) must not lead out of it. The deepest part of $path that exists is resolved; a link that leads nowhere
-     * is refused too (writing through it would create its target).
+     * is refused too (writing through it would create its target). At most 64 folders that are not there are walked up
+     * (more is refused): each step goes over the whole path, and a server's path of thousands of them took seconds.
      */
     public static function confined(string $root, string $path): bool
     {
@@ -69,8 +93,10 @@ final class Files
         if ($base === false) {
             return false;
         }
-        for ($p = $path; ($real = realpath($p)) === false; $p = dirname($p)) {
-            if (is_link($p) || $p === dirname($p) || strlen($p) < strlen($root)) {
+        // (something there that does not resolve is a link that leads nowhere: lstat() sees a Windows junction to a target
+        // that is gone, which is_link() does not; before, such a junction was walked past, and a write created its target)
+        for ($p = $path, $up = 0; ($real = realpath($p)) === false; $p = dirname($p)) {
+            if (is_link($p) || @lstat($p) !== false || $p === dirname($p) || strlen($p) < strlen($root) || ++$up > 64) {
                 return false;
             }
         }
@@ -223,10 +249,10 @@ final class Files
                 return;
             }
             if (!is_dir($path)) {
-                $out[] = [$name, $path, (int)@filesize($path)];   // (gone meanwhile: 0, not a warning)
+                $out[] = [self::zipName($name) ?: '_', $path, (int)@filesize($path)];   // (gone meanwhile: 0, not a warning)
                 return;
             }
-            $out[] = [$name . '/', null, 0];
+            $out[] = [(self::zipName($name) ?: '_') . '/', null, 0];
             $names = array_values(array_diff(@scandir($path) ?: [], ['.', '..']));
             usort($names, 'strnatcasecmp');
             foreach ($names as $n) {
@@ -241,6 +267,26 @@ final class Files
             $walk("$root/$n", $n);
         }
         return $over ? false : $out;
+    }
+
+    /**
+     * A path made safe as a name inside a ZIP, whatever unzips it and on whatever system: each name without control
+     * characters, without what Windows refuses (< > : " | ? *, a trailing dot or space, a device such as CON or COM1) and
+     * without the look-alikes of / \ : . (full-width and others) that unzippers using Windows' older text functions turn into
+     * the real ones, so that an extraction went outside its folder (reported against other RDP clients' clipboards); each
+     * of them made "_", "." and ".." left out, "/" between names. Used for the names a remote computer gives (clipboard
+     * files) and the shared folder's (which that computer writes too).
+     */
+    public static function zipName(string $path): string
+    {
+        $parts = [];
+        foreach (preg_split('~[\\\\/]+~', $path, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $p) {
+            $p = rtrim(preg_replace('~[\x00-\x1F\x7F<>:"|?*\x{FF0E}\x{FF0F}\x{FF3C}\x{FF1A}\x{2215}\x{2044}\x{FE68}\x{A5}\x{20A9}]~u', '_', $p) ?? '_', '. ');
+            if ($p !== '') {
+                $parts[] = preg_match('~^(CON|PRN|AUX|NUL|COM[0-9\x{B9}\x{B2}\x{B3}]|LPT[0-9\x{B9}\x{B2}\x{B3}]|CONIN\$|CONOUT\$|CLOCK\$)(\..*)?$~iu', $p) ? "_$p" : $p;
+            }
+        }
+        return implode('/', $parts);
     }
 
     /** Bytes of a file, or of all the files in a folder. */

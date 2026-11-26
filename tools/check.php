@@ -3,25 +3,28 @@
 declare(strict_types=1);
 /*
  * MuDeskClient - diagnóstico del hosting.
- * 1) Cambia TOKEN.  2) Súbelo a public/ y ábrelo en el navegador.  3) BORRA el fichero al terminar.
+ * 1) Cambia TOKEN (16 caracteres o más).  2) Súbelo a public/ y ábrelo en el navegador.  3) BORRA el fichero al terminar.
  * Sin sintaxis de PHP 8: en un PHP antiguo también se abre y avisa de la versión.
  */
 const TOKEN = 'CAMBIAR';
 const MEMORIA = 128 << 20;      // memory_limit mínimo: exportar la auditoría (hasta 20 000 filas) y buscar en muchos días
 const CADUCA = 86400;           // segundos desde que se subió o se cambió: después no hace nada (por si se olvida borrarlo)
+const TOKEN_MIN = 16;           // caracteres del token como mínimo: lo elige quien copia el fichero y no hay límite de intentos
 
-// caducado (subido o cambiado hace más de un día) o con el token sin cambiar: ninguna prueba ni ningún formulario
+// caducado (subido o cambiado hace más de un día), con el token sin cambiar o con uno corto (antes, cualquiera: sin límite
+// de intentos, uno corto se adivinaba): ninguna prueba ni ningún formulario
 $subido = max((int)@filemtime(__FILE__), (int)@filectime(__FILE__));   // (un FTP que conserva la fecha: la de creación)
-if (time() - $subido > CADUCA || TOKEN === 'CAMBIAR') {
-    http_response_code(TOKEN === 'CAMBIAR' ? 403 : 410);
+$malo   = TOKEN === 'CAMBIAR' || strlen(TOKEN) < TOKEN_MIN;
+if (time() - $subido > CADUCA || $malo) {
+    http_response_code($malo ? 403 : 410);
     header('Content-Type: text/plain; charset=utf-8');
     header('Cache-Control: no-store');
-    exit(TOKEN === 'CAMBIAR' ? "Cambia TOKEN en este fichero para usarlo, y bórralo al terminar.\n"
+    exit($malo ? 'Cambia TOKEN en este fichero por uno de ' . TOKEN_MIN . " caracteres o más para usarlo, y bórralo al terminar.\n"
         : "Este diagnóstico se subió hace más de un día y ya no funciona: bórralo del servidor (súbelo de nuevo si lo necesitas).\n");
 }
 
 if (isset($_GET['a'])) {
-    if (TOKEN === 'CAMBIAR' || !hash_equals(TOKEN, (string)($_SERVER['HTTP_X_TOKEN'] ?? ''))) {
+    if ($malo || !hash_equals(TOKEN, (string)($_SERVER['HTTP_X_TOKEN'] ?? ''))) {
         http_response_code(403);
         exit('Token no válido o sin cambiar');
     }
@@ -181,6 +184,42 @@ function readn($s, int $n): string
     return $b;
 }
 
+/** Direcciones IPv4 e IPv6 de un nombre ([] si no tiene o no es un nombre). */
+function direcciones(string $name): array
+{
+    if (!preg_match('~^[a-z0-9.-]+$~', $name)) {
+        return [];
+    }
+    $ips = gethostbynamel($name) ?: [];
+    if ($ips === []) {
+        foreach (@dns_get_record($name, DNS_AAAA) ?: [] as $rec) {
+            $ips[] = $rec['ipv6'];
+        }
+    }
+    return $ips;
+}
+
+/**
+ * Si es una dirección a la que la aplicación no se conecta con todos los equipos permitidos (Access::unsafe): este mismo
+ * servidor (loopback, 0.0.0.0/8, ::), enlace local (169.254.0.0/16 con los metadatos de la nube, fe80::/10) y los metadatos
+ * de otras nubes (100.100.100.200, fd00:ec2::254), también como IPv4 dentro de IPv6.
+ */
+function inseguro(string $ip): bool
+{
+    $b = (string)@inet_pton($ip);
+    $p = substr($b, 0, 12);
+    if (strlen($b) === 16 && ($p === "\0\0\0\0\0\0\0\0\0\0\xff\xff" || $p === "\0\x64\xff\x9b\0\0\0\0\0\0\0\0" || $p === str_repeat("\0", 12))) {
+        $b = substr($b, 12);
+    }
+    if ($b === inet_pton('fd00:ec2::254')) {
+        return true;
+    }
+    if (strlen($b) === 4) {
+        return $b[0] === "\0" || $b[0] === "\x7f" || substr($b, 0, 2) === "\xa9\xfe" || $b === "\x64\x64\x64\xc8";
+    }
+    return strlen($b) !== 16 || ltrim($b, "\0") === '' || ltrim($b, "\0") === "\1" || ($b[0] === "\xfe" && (ord($b[1]) & 0xc0) === 0x80);
+}
+
 function rdp(): void
 {
     $host = trim((string)($_GET['h'] ?? ''));
@@ -190,9 +229,27 @@ function rdp(): void
         json($r + ['error' => 'Host o puerto no válido']);
         return;
     }
-    $ctx = stream_context_create(['ssl' => ['verify_peer' => false, 'verify_peer_name' => false, 'capture_peer_cert' => true]]);
+    // la dirección, comprobada como la comprueba la aplicación con todos los equipos permitidos (lo predeterminado), y la
+    // misma la que se usa (un DNS que cambiara entre comprobar y conectar no lleva a otra). Antes cualquier destino: quien
+    // tuviera el token podía sondear desde el hosting este mismo servidor y los metadatos de la nube. Cada prueba queda
+    // en el registro de errores de PHP, con quién la pidió
+    $name = strtolower(trim($host, ' []'));
+    $ips  = @inet_pton($name) !== false ? [$name] : direcciones($name);
+    $deny = array_values(array_filter($ips, 'inseguro'));
+    error_log("MuDeskClient check.php: prueba de RDP saliente a $host:$port pedida desde " . ($_SERVER['REMOTE_ADDR'] ?? '?')
+        . ($ips === [] ? ' (nombre no encontrado)' : ($deny !== [] ? ' (rechazada: ' . implode(', ', $deny) . ')' : '')));
+    if ($ips === []) {
+        json($r + ['error' => 'No se encuentra la dirección de ese nombre (DNS)']);
+        return;
+    }
+    if ($deny !== []) {
+        json($r + ['error' => 'Dirección no permitida: ' . implode(', ', $deny) . ' (este mismo servidor, enlace local o metadatos de la nube; la aplicación tampoco se conecta a ella)']);
+        return;
+    }
+    $ssl = ['verify_peer' => false, 'verify_peer_name' => false, 'capture_peer_cert' => true];
+    $ctx = stream_context_create(['ssl' => $ssl + ($ips[0] === $name ? [] : ['peer_name' => $name])]);
     $t   = microtime(true);
-    $s   = @stream_socket_client("tcp://$host:$port", $en, $es, 5, STREAM_CLIENT_CONNECT, $ctx);
+    $s   = @stream_socket_client('tcp://' . (strpos($ips[0], ':') !== false ? "[$ips[0]]" : $ips[0]) . ":$port", $en, $es, 5, STREAM_CLIENT_CONNECT, $ctx);
     if (!$s) {
         json($r + ['error' => "TCP: $es ($en)", 'pista' => 'Comprueba que el equipo está encendido, la dirección y el puerto (el que use ese equipo: 3389 si no se cambió), '
             . 'y que ningún cortafuegos lo bloquea: el de Windows en el equipo remoto, el del router o la red de la empresa, '
@@ -347,9 +404,27 @@ const tests = {
   async procesos() {
     const n = Math.max(2, Math.min(64, +$('n').value || 20));
     show(`Lanzando ${n} peticiones de 1 s a la vez…`);
-    const r = await Promise.all(Array.from({length: n}, () => get('espera', '&ms=1000')));
+    // las que el servidor rechaza sin ejecutarlas (508: el límite de procesos de entrada de CloudLinux; 503, 429), que no
+    // esperan turno: el límite es el de las que atendió a la vez (antes, la prueba acababa en error, sin cifra)
+    const all = await Promise.all(Array.from({length: n}, async () => {
+      const x = await req('espera', '&ms=1000');
+      if ([429, 503, 508].includes(x.status)) return {rechazada: x.status};
+      if (!x.ok) throw new Error(`HTTP ${x.status}: ${await x.text()}`);
+      return x.json();
+    }));
+    const r = all.filter(x => !x.rechazada), codes = [...new Set(all.filter(x => x.rechazada).map(x => x.rechazada))].join(', ');
     let cur = 0, max = 0;                           // las que el servidor atendió a la vez (con su reloj)
     for (const [, d] of r.flatMap(x => [[x.inicio, 1], [x.fin, -1]]).sort((a, b) => a[0] - b[0] || a[1] - b[1])) max = Math.max(max, cur += d);
+    if (codes) {
+      // cada sesión RDP necesita hasta 5 a la vez: la suya y hasta 4 del teclado y el ratón (docs/es/HOSTING.md, Capacidad)
+      const keep = Math.floor(max / 5);
+      warn('procesos', [keep < 1
+        ? `El servidor rechaza peticiones PHP (HTTP ${codes}) al pasar de ${max} a la vez: no alcanza ni para una sesión RDP, que necesita hasta 5 a la vez (la suya y las del teclado y el ratón). Pide al hosting más procesos de entrada (entry processes).`
+        : `El servidor rechaza peticiones PHP (HTTP ${codes}) al pasar de ${max} a la vez: pon «Sesiones RDP a la vez» (max_sessions_total, en Administración → Ajustes) como mucho en ${keep}. Cada sesión RDP necesita hasta 5 peticiones a la vez (la suya y las del teclado y el ratón), y las que el servidor rechaza esperan a reintentarse.`]);
+      show(`Peticiones a la vez: ${max} de ${n}; rechazadas sin ejecutarse: ${all.length - r.length} (HTTP ${codes})\n`
+        + (keep < 1 ? 'No alcanza para MuDeskClient.' : `max_sessions_total: como mucho ${keep}.`));
+      return;
+    }
     const h1 = r.some(x => /^HTTP\/1/.test(x.protocolo)), limited = max >= n || (h1 && max >= 6);
     const keep = max - 2;                           // cada sesión ocupa un proceso; el teclado, el ratón y la web necesitan alguno libre
     warn('procesos', limited ? [] : [keep < 1

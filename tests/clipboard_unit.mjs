@@ -1,6 +1,7 @@
 // MuDeskClient - https://miguelenred.es/mudeskclient - Apache License 2.0
 // Clipboard unit tests: node tests/clipboard_unit.mjs
 import { ClipboardBridge, cfHtml, fromCfHtml, HISTORY, HISTORY_TEXT } from '../public/assets/clipboard.js';
+import { zipBlob, zipName } from '../public/assets/zip.js';
 
 let failed = 0;
 const check = (name, ok, info = '') => { console.log((ok ? 'OK   ' : 'FAIL ') + name + (info ? ' ' + info : '')); if (!ok) failed++; };
@@ -32,13 +33,14 @@ check('CF_HTML: broken header gives nothing', fromCfHtml(new TextEncoder().encod
 // messages from the gateway, with minimal stand-ins for the browser's clipboard, canvas and DOM parser
 let local = null;                                       // what the local clipboard holds
 const uploads = [];
+const bitmaps = { closed: 0 };                          // images decoded for the remote clipboard, closed once drawn
 const ctx = { putImageData() {}, drawImage() {}, getImageData: (x, y, w, h) => ({ data: new Uint8ClampedArray(w * h * 4) }) };
 Object.assign(globalThis, {
   window: { ClipboardItem: true },
   ClipboardItem: class { constructor(o) { this.o = o; this.types = Object.keys(o); } async getType(t) { return this.o[t]; } },
   document: { createElement: () => ({ getContext: () => ctx, toBlob: (cb) => cb(new Blob(['png'], { type: 'image/png' })) }) },
   ImageData: class { constructor(w, h) { this.data = new Uint8ClampedArray(w * h * 4); } },
-  createImageBitmap: async () => ({ width: 1, height: 1 }),
+  createImageBitmap: async () => ({ width: 1, height: 1, close() { bitmaps.closed++; } }),
   DOMParser: class { parseFromString(h) { return { body: { textContent: h.replace(/<[^>]*>/g, '') } }; } },
   fetch: async (url) => { uploads.push(url); return { ok: true }; },
 });
@@ -99,7 +101,7 @@ check('remote image not sent back when the window gets the focus', uploads.lengt
 // an image whose upload failed (network, quota) was never sent again: pasted again, it was taken for the one already on the
 // remote clipboard, and the remote Ctrl+V pasted the old content without a word
 {
-  const fetch0 = globalThis.fetch;
+  const fetch0 = globalThis.fetch, closed0 = bitmaps.closed;
   let fail = true, ups = 0;
   globalThis.fetch = async () => { ups++; return { ok: !fail }; };
   const sentB = [];
@@ -111,6 +113,27 @@ check('remote image not sent back when the window gets the focus', uploads.lengt
   globalThis.fetch = fetch0;
   check('an image whose upload failed is sent again when pasted again', r1 === 'failed' && r2 === 'ok' && ups === 2 && sentB.includes('B'),
     JSON.stringify({ r1, r2, ups, sentB }));
+  // each image decoded to be sent (an ImageBitmap) closed once drawn: its memory held until the collector took it
+  check('an image sent to the remote clipboard: its decoded bitmap closed', bitmaps.closed - closed0 === 2, String(bitmaps.closed - closed0));
+}
+
+// files pasted with Ctrl+V whose upload failed: said so to the session (false), which then presses no V (it pasted what
+// the remote clipboard had before); the session's view left: the history's images and the remote image freed
+{
+  const fetch0 = globalThis.fetch, revoked = [], revoke = URL.revokeObjectURL;
+  globalThis.fetch = async () => ({ ok: false });
+  URL.revokeObjectURL = (u) => { revoked.push(u); revoke(u); };
+  const b = new ClipboardBridge({ sid: 's', csrf: 'c', sendClip() {} }, { toast() {}, t: (k) => k, onChange() {} });
+  const pasted = await b.fromPasteEvent({ files: [new File(['abc'], 'a.txt', { type: 'text/plain' })], getData: () => '' });
+  globalThis.fetch = fetch0;
+  b.onMessage(msg('I', dib));                             // the remote side copies an image
+  await tick();
+  const urls = [b.remoteImage, ...b.history.map((x) => x.url)];
+  b.dispose?.();
+  URL.revokeObjectURL = revoke;
+  check('files pasted whose upload failed: said to the session; its view left, the clipboard\'s images freed',
+    pasted === false && urls.length === 2 && urls.every((u) => u && revoked.includes(u)) && b.history.length === 0 && b.remoteImage === null,
+    JSON.stringify({ pasted, urls, revoked }));
 }
 
 // a remote image whose row length, in 32 bits, overflowed to a negative number (2^26 pixels of 32 bits) passed the check
@@ -257,6 +280,16 @@ check('remote image not sent back when the window gets the focus', uploads.lengt
     && states[1].startsWith('files_sent_ready:2') && states[2].startsWith('files_sent_replaced:2') && states[3].startsWith('files_sent_pasted:1')
     && states[3].includes('tres.txt') && states[4].startsWith('files_sent_pasted:1') && states[4].includes('cinco.txt')
     && states[5].startsWith('files_sent_failed:1'), JSON.stringify(states));
+}
+
+// the ZIP of a remote copy: its names safe whatever unzips it (the gateway made them so, the page once more): no "..", no
+// look-alikes of / \ : . (some unzippers turn them into the real ones), no streams, devices or what Windows refuses
+{
+  const names = ['..\\..\\Startup\\run.bat', '\uff0e\uff0e\uff0f\uff0e\uff0e\u2215evil.exe\uff1aZone', 'a/CON.txt/b:stream', 'x\u0007y|z?.lnk. ', '...', '\u65e5\u672c/a.txt'];
+  const zip = new Uint8Array(await zipBlob(names.map((name) => ({ name, parts: [new Uint8Array(1)], crc: 0 }))).arrayBuffer());
+  const text = new TextDecoder().decode(zip);
+  check('clipboard ZIP: names safe whatever unzips it', JSON.stringify(names.map(zipName)) === JSON.stringify(['Startup/run.bat', '______evil.exe_Zone', 'a/_CON.txt/b_stream', 'x_y_z_.lnk', '', '\u65e5\u672c/a.txt'])
+    && !text.includes('..') && text.includes('Startup/run.bat') && text.includes('a/_CON.txt/b_stream'), JSON.stringify(names.map(zipName)));
 }
 
 console.log(failed ? `\n${failed} failed` : '\nAll tests passed');

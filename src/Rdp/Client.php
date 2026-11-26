@@ -86,6 +86,11 @@ final class Client
     private array $railCaps = [];              // RemoteApp: the server's capability sets 23 and 24 (Demand Active)
     private array $chanTotal = [];             // channel id -> size the first chunk of a message announced
     private const CHANNEL_MAX = 67108864;      // largest channel message (a 4K screenshot copied is 33 MB)
+    /**
+     * A desktop's largest side (RDP's) and area, in pixels (8192 x 8192; four 4K monitors are half of it): the page has the
+     * same (rdpgfx.js OUTPUT_MAX and DESKTOP_MAX, session.js, stream-worker.js), compared by tests/run.php.
+     */
+    public const SIDE_MAX = 32766, AREA_MAX = 1 << 26;
     /** @var array<int,int> their total size */
     private array $chanLen = [];
     /** @var array<int,true> channels whose message is being left out (larger than the memory can hold) */
@@ -143,6 +148,20 @@ final class Client
         $l = trim((string)ini_get('memory_limit'));
         $n = (int)$l * (['k' => 1024, 'm' => 1048576, 'g' => 1073741824][strtolower(substr($l, -1))] ?? 1);
         return $n <= 0 ? PHP_INT_MAX : intdiv(max(0, $n - memory_get_usage()), 6);
+    }
+
+    /**
+     * Bytes a new message being joined from its pieces may take: memoryRoom() less what the messages already being joined
+     * announced, of every channel, static or dynamic (one budget for all: each one checked on its own, several at once went
+     * past the memory limit).
+     */
+    public function messageRoom(): int
+    {
+        $joining = array_sum($this->chanTotal);
+        foreach ($this->handlers as $h) {
+            $joining += $h instanceof Drdynvc ? $h->joining() : 0;
+        }
+        return self::memoryRoom() - $joining;
     }
 
     // ------------------------------------------------------------------ framing
@@ -220,6 +239,8 @@ final class Client
             $this->trace?->log('gateway policy', ['denied' => $this->denied]);
         }
 
+        $asked  = null;                                // the protocols the negotiation request asked for (none sent: null)
+        $tlsKey = strtolower((string)($o['host'] ?? '')) . ':' . (int)($o['port'] ?? 0);   // (how TLS went there: Transport::tlsSeen)
         if (($o['vm'] ?? '') !== '') {
             // the console of a Hyper-V virtual machine (what VMConnect does): the Preconnection PDU names the machine, then
             // TLS and NLA with the Hyper-V host's account at once, without the X.224 negotiation (the host does not answer it)
@@ -235,6 +256,7 @@ final class Client
             $lb     = (string)($o['lb'] ?? '');
             $cookie = $lb !== '' ? (str_ends_with($lb, "\r\n") ? $lb : $lb . "\r\n") : 'Cookie: mstshash=' . preg_replace('/[^A-Za-z0-9._-]/', '', substr($o['user'], 0, 9)) . "\r\n";
             $neg    = $want === 0 ? '' : pack('CCvV', 1, 0, 8, $want);
+            $asked  = $want === 0 ? null : $want;
             $x      = "\xe0\x00\x00\x00\x00\x00" . $cookie . $neg;
             if (strlen($x) > 254) {                    // (its length is one byte: a longer token made a broken request)
                 throw new ProtocolException('Routing token too long', 'routing_token');
@@ -255,6 +277,7 @@ final class Client
                 $val = $r->u32();
             }
             if ($type === 3 && ($val === 2 || $val === 3) && $o['security'] === 'auto' && !$this->legacyOnly) {
+                $this->notDowngraded($tlsKey);
                 $this->trace?->log('x224', ['requested' => $want, 'refused' => $val === 2 ? 'SSL_NOT_ALLOWED_BY_SERVER' : 'SSL_CERT_NOT_ON_SERVER',
                     'then' => 'Standard RDP Security']);
                 // (SSL_NOT_ALLOWED_BY_SERVER, or SSL_CERT_NOT_ON_SERVER: a server without a certificate; before, that one ended
@@ -270,6 +293,9 @@ final class Client
             if ($val === 0 && $o['security'] !== 'auto') {
                 throw new ProtocolException('Server only supports legacy RDP security', 'rdp_security');
             }
+            if ($val === 0 && !$this->legacyOnly) {              // (no negotiation, or PROTOCOL_RDP chosen, unasked)
+                $this->notDowngraded($tlsKey);
+            }
             if ($val & ~$want) {                     // not asked for (RDSTLS, HYBRID_EX...): never taken on
                 throw new ProtocolException("Server chose protocol $val, not offered", 'protocol');
             }
@@ -283,7 +309,6 @@ final class Client
 
         if ($val !== 0) {
             // TLS 1.2 or later first; TLS 1.0 and triple DES only to a computer never seen with TLS 1.2 (see Transport::tlsSeen())
-            $tlsKey = strtolower((string)$o['host']) . ':' . (int)$o['port'];
             $seen   = Transport::tlsSeen($tlsKey);
             $legacy = $this->tlsLegacy || $seen === 'legacy';
             try {
@@ -300,6 +325,9 @@ final class Client
                 if ($seen === 'modern') {                // someone in between, or the computer changed: never less than before
                     $this->trace?->log('tls', ['failed' => $e->getMessage(), 'then' => 'nothing: TLS 1.2 or later was seen there before']);
                     throw $e;
+                }
+                if ($val === 1 && $o['security'] === 'auto' && !$this->legacyOnly) {
+                    $this->notDowngraded($tlsKey);   // (TLS 1.0 worked there before: no Standard RDP Security instead)
                 }
                 if ($val !== 1 || $o['security'] !== 'auto' || $this->legacyOnly) {
                     throw $e;
@@ -345,8 +373,9 @@ final class Client
             }
         }
 
+        $this->t->splitRecords();
         $this->graphics();
-        $this->mcsConnect($val);
+        $this->mcsConnect($val, $asked);
         if ($val === 0 && $this->serverSec === null) {
             // Standard RDP Security that encrypts nothing (no security data, or encryption method 0): the password would go in
             // the clear, and no key would be checked (a man in the middle posing as an old server, or a server set to none)
@@ -356,7 +385,7 @@ final class Client
             // Standard RDP Security: the server's key pinned as a certificate is (the SHA-256 of its modulus and exponent, each
             // with its length: before, "n \0 e" let another modulus and exponent give the same string, and so the same pin)
             $key = RdpSecurity::publicKey($this->serverSec[2]);
-            $this->certFingerprint = RdpSecurity::pin(...$key);
+            $this->certFingerprint = RdpSecurity::pin($key[0], $key[1], $this->serverSec[3] < 2);   // (see RdpSecurity::pin)
             $this->rdpSecurity     = [1 => '40-bit', 2 => '128-bit', 8 => '56-bit', 0x10 => 'FIPS'][$this->serverSec[0]] ?? 'unknown';
             $this->trace?->log('rdp security', ['method' => $this->rdpSecurity,
                 'level' => $this->serverSec[3], 'key_bits' => strlen($key[0]) * 8, 'fingerprint' => $this->certFingerprint]);
@@ -377,6 +406,12 @@ final class Client
             $r->skip(7);
             if ($r->u8() >> 2 !== 15 || $r->u8() !== 0) {
                 throw new ProtocolException("MCS channel join $ch failed", 'protocol');
+            }
+            // the channel joined (channelId, else the one requested) must be this one (before, the confirm of any was taken)
+            $r->skip(2);                                                       // initiator
+            $requested = $r->u16be();
+            if (($r->left() >= 2 ? $r->u16be() : $requested) !== $ch) {
+                throw new ProtocolException("MCS channel join $ch confirmed for another channel", 'protocol');
             }
         }
         if ($this->serverSec !== null) {
@@ -457,7 +492,8 @@ final class Client
         return 0x0001 | ($this->o['bpp'] === 32 ? 0x0002 : 0) | ($this->gfx ? 0x0100 : 0) | 0x0020;
     }
 
-    private function mcsConnect(int $protocol): void
+    /** $asked: the protocols the X.224 negotiation request asked for (null: none sent), which the server's core data must echo. */
+    private function mcsConnect(int $protocol, ?int $asked = null): void
     {
         $o     = $this->o;
         $name  = substr(str_pad(Text::toUtf16(substr($o['clientName'], 0, 15)), 32, "\0"), 0, 32);
@@ -508,6 +544,11 @@ final class Client
             $b    = new Reader($r->bytes($r->u16() - 4));
             $this->trace?->log('server data', ['block' => [0x0C01 => 'core', 0x0C02 => 'security', 0x0C03 => 'network', 0x0C04 => 'messageChannel',
                 0x0C08 => 'multitransport'][$type] ?? sprintf('0x%04x', $type), 'data' => Trace::hex($b->data)]);
+            // clientRequestedProtocols: what the server was asked for, which someone in between could have changed in the X.224
+            // request before TLS (to take NLA away); 0 or left out is not echoed (some servers do not fill it)
+            if ($type === 0x0C01 && $asked !== null && strlen($b->data) >= 8 && ($echo = unpack('V', $b->data, 4)[1]) !== 0 && $echo !== $asked) {
+                throw new ProtocolException("Server was asked for protocols $echo, not $asked", 'protocol');
+            }
             if ($type === 0x0C02 && ($method = $b->u32()) !== 0) {
                 if ($protocol !== 0) {              // (TLS and NLA carry no encryption of their own)
                     throw new ProtocolException('Server requires legacy RDP encryption', 'rdp_security');
@@ -565,11 +606,14 @@ final class Client
         $this->mcsSend($this->ioChannel, $info, RdpSecurity::SEC_INFO_PKT);
     }
 
-    /** TS_ORDER_CAPABILITYSET orderSupport: DstBlt, PatBlt (and OpaqueRect), ScrBlt, MemBlt, FastIndex, FastGlyph, GlyphIndex. */
+    /**
+     * TS_ORDER_CAPABILITYSET orderSupport: DstBlt, PatBlt (and OpaqueRect), ScrBlt, MemBlt, Mem3Blt, FastIndex, FastGlyph,
+     * GlyphIndex. Mem3Blt (a cached bitmap with a brush, any ROP3): before, not offered, and Windows drew what needs it as bitmaps.
+     */
     private static function orderSupport(bool $on): string
     {
         $s = str_repeat("\0", 32);
-        foreach ($on ? [0x00, 0x01, 0x02, 0x03, 0x13, 0x18, 0x1B] : [] as $i) {
+        foreach ($on ? [0x00, 0x01, 0x02, 0x03, 0x04, 0x13, 0x18, 0x1B] : [] as $i) {
             $s[$i] = "\1";
         }
         return $s;
@@ -657,11 +701,15 @@ final class Client
         $r->skip(1);
         $data = $r->bytes($r->perLength());
         if ($this->sec !== null) {
-            // Standard RDP Security: every PDU with its security header, decrypted (in order: RC4 is one stream) when encrypted
-            [$flags, $data] = $this->sec->open($data);
-            if ($channel === $this->ioChannel && $flags & RdpSecurity::SEC_LICENSE_PKT) {
-                $this->licenseEncrypt = $this->licenseEncrypt || (bool)($flags & RdpSecurity::SEC_LICENSE_ENCRYPT);
-                $this->license(new Reader($data));
+            // Standard RDP Security: every PDU with its security header, decrypted (in order: RC4 is one stream) when encrypted;
+            // one in the clear where all is encrypted only a licensing PDU on the I/O channel while the licensing lasts, and a
+            // licensing PDU only for the licensing (on another channel, before, it was passed on as that channel's data)
+            [$flags, $data] = $this->sec->open($data, $channel === $this->ioChannel && !$this->licensed);
+            if ($flags & RdpSecurity::SEC_LICENSE_PKT) {
+                if ($channel === $this->ioChannel) {
+                    $this->licenseEncrypt = $this->licenseEncrypt || (bool)($flags & RdpSecurity::SEC_LICENSE_ENCRYPT);
+                    $this->license(new Reader($data));
+                }
                 return;
             }
             if ($channel === $this->ioChannel && $flags & RdpSecurity::SEC_REDIRECTION_PKT) {
@@ -710,6 +758,20 @@ final class Client
         }
     }
 
+    /**
+     * Standard RDP Security only from a computer never seen with TLS: one that had it (Transport::hadTls) and now refuses it,
+     * answers without negotiation or picks PROTOCOL_RDP is refused. Before, taken (under the security "Automatic"), its key
+     * asked about as a changed certificate: someone in between answering for it got the password encrypted to his own key
+     * if the user accepted. A computer changed on purpose: its certificate forgotten in the connection, then asked as new.
+     */
+    private function notDowngraded(string $tlsKey): void
+    {
+        if (Transport::hadTls($tlsKey)) {
+            $this->trace?->log('x224', ['refused' => 'Standard RDP Security from a computer seen with TLS']);
+            throw new ProtocolException('Standard RDP Security from a computer seen with TLS', 'rdp_downgrade');
+        }
+    }
+
     /** The Server Redirection PDU (enhanced security): the session is made again elsewhere, unless it only informs. */
     private function redirect(Reader $body): void
     {
@@ -717,6 +779,12 @@ final class Client
         $this->trace?->log('server redirection', ['flags' => sprintf('0x%x', $info['flags']), 'session' => $info['session'],
             'to' => implode(' ', self::redirectTargets($info, false)) ?: '(the same computer)',
             'routing_token' => $info['lb'] !== null, 'user' => $info['user'] !== null, 'cookie' => $info['cookie'] !== null]);
+        if ($this->sec !== null && $this->sec->level < 2) {
+            // Standard RDP Security with a server that sends in the clear: nothing proves the redirection is its own (anyone
+            // in between could send one to his computer, with a certificate "vouched" for it): not followed
+            $this->trace?->log('server redirection', ['ignored' => 'sent in the clear (encryption level ' . $this->sec->level . ')']);
+            return;
+        }
         if (!($info['flags'] & 0x80)) {                   // (LB_NOREDIRECT: said to the client, not a redirection)
             throw new Redirection($info);
         }
@@ -905,9 +973,8 @@ final class Client
             || strlen($this->railCaps[24] ?? '') < 7 || unpack('V', $this->railCaps[24])[1] === 0)) {
             throw new ProtocolException('The server does not offer RemoteApp', 'app_unsupported');
         }
-        // a desktop the browser could not hold (each side up to 32766 in RDP; 8192 x 8192 pixels in all, four 4K monitors
-        // are half of it): a hostile server could make the page allocate gigabytes
-        if ($this->width < 1 || $this->height < 1 || $this->width > 32766 || $this->height > 32766 || $this->width * $this->height > 1 << 26) {
+        // a desktop the browser could not hold (SIDE_MAX, AREA_MAX): a hostile server could make the page allocate gigabytes
+        if ($this->width < 1 || $this->height < 1 || $this->width > self::SIDE_MAX || $this->height > self::SIDE_MAX || $this->width * $this->height > self::AREA_MAX) {
             throw new ProtocolException("Desktop of {$this->width} x {$this->height}", 'protocol');
         }
         $this->trace?->log('demand active', ['shareId' => sprintf('0x%x', $this->shareId), 'capabilities' => $n, 'size' => "{$this->width}x{$this->height}", 'bpp' => $bpp,
@@ -947,6 +1014,8 @@ final class Client
                 return;
             }
             $r = new Reader($this->bulk->decompress($raw, $comp));
+        } elseif ($comp & 0x20) {             // (before, read as if it were not compressed)
+            throw new ProtocolException('Compressed PDU not negotiated', 'protocol');
         }
         switch ($type2) {
             case 0x02: // update
@@ -989,6 +1058,7 @@ final class Client
 
     private function fastPath(string $pdu): void
     {
+        // (a PDU of 4 bytes at least: Transport::pdus() refuses a shorter length before it gets here)
         $head = ord($pdu[1]) & 0x80 ? 3 : 2;
         if (ord($pdu[0]) & 0x80) {                    // FASTPATH_OUTPUT_ENCRYPTED: decrypted even when not drawn (RC4 is one stream)
             if ($this->sec === null) {
@@ -1059,10 +1129,10 @@ final class Client
                 if ($total > self::CHANNEL_MAX) {
                     throw new ProtocolException("Channel message of $total bytes", 'protocol');
                 }
-                unset($this->chanSkip[$id]);
-                if ($total > self::memoryRoom()) {    // left out, the session goes on (a clipboard copy that does not fit is not pasted)
+                // (a message of this channel cut short goes: this one takes its place, and its share of the memory)
+                unset($this->chanSkip[$id], $this->chanBuf[$id], $this->chanLen[$id], $this->chanTotal[$id]);
+                if ($total > $this->messageRoom()) {  // left out, the session goes on (a clipboard copy that does not fit is not pasted)
                     $this->chanSkip[$id] = true;
-                    unset($this->chanBuf[$id], $this->chanLen[$id], $this->chanTotal[$id]);
                     $this->trace?->log('channel message left out', ['channel' => $this->handlers[$id]->name(), 'bytes' => $total, 'memory_limit' => ini_get('memory_limit')]);
                     error_log("MuDeskClient: a message of $total bytes of channel " . $this->handlers[$id]->name() . ' was left out: more than the memory limit leaves (memory_limit ' . ini_get('memory_limit') . ')');
                 }
@@ -1135,6 +1205,8 @@ final class Client
             if ($len < 0x7FFF) {                   // 15-bit length: longer wrapped, and the rest reached the server as PDUs
                 $this->t->send($hdr . ($len < 0x80 ? chr($len) : pack('n', 0x8000 | ($len + 1))) . $ext . $events);
                 $this->drawnAtInput = $this->drawn;
+            } else {                               // (never the page's: 255 events at most, of 7 bytes at most) said, not lost unseen
+                $this->trace?->once('input_long', 'input dropped: longer than a fast-path PDU', ['events' => $count, 'bytes' => strlen($events)]);
             }
         }
         if ($gapMs > 0) {
@@ -1303,8 +1375,8 @@ final class Client
     public function resized(int $w, int $h): void
     {
         if ($this->gfx) {                    // the desktop of several monitors (8192 is each one's limit, applied by Drdynvc)
-            $this->width  = max(200, min(32766, $w & ~1));
-            $this->height = max(200, min(32766, $h));
+            $this->width  = max(200, min(self::SIDE_MAX, $w & ~1));
+            $this->height = max(200, min(self::SIDE_MAX, $h));
         }
     }
 

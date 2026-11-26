@@ -35,6 +35,18 @@ final class Users
         return null;
     }
 
+    /** The user linked to the provider's account $link (['iss', 'sub']), whatever its name. */
+    public static function byOidc(array $link): ?array
+    {
+        foreach (self::all() as $u) {
+            if (is_array($u['oidc'] ?? null) && hash_equals((string)($u['oidc']['iss'] ?? ''), (string)$link['iss'])
+                && hash_equals((string)($u['oidc']['sub'] ?? ''), (string)$link['sub'])) {
+                return $u;
+            }
+        }
+        return null;
+    }
+
     public static function validName(string $name): bool
     {
         return (bool)preg_match('/^[\p{L}\p{N}._@-]{2,64}$/u', $name);
@@ -242,6 +254,7 @@ final class Users
         return [
             'id' => $u['id'], 'username' => $u['username'], 'role' => $u['role'], 'enabled' => $u['enabled'], 'hours' => $u['hours'] ?? null,
             'source' => $u['source'] ?? null,   // 'ad', 'oidc' or null (a local user)
+            'oidc_linked' => isset($u['oidc']),   // (a local user linked to the single sign-on provider's account: see oidc.php)
             'must_change' => $u['must_change'], 'lang' => $u['lang'], 'max_sessions' => $u['max_sessions'],
             'created' => $u['created'], 'last_login' => $u['last_login'], 'totp' => !empty($u['totp']['enabled']),
             'passkeys' => array_map(static fn($p) => ['id' => $p['id'], 'name' => $p['name'], 'created' => $p['created'],

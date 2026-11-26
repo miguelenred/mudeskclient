@@ -29,6 +29,10 @@ final class Backup
     /** @var (\Closure(string, string): bool)|null how an item is moved (rename); the tests make one fail */
     public static ?\Closure $move = null;
 
+    /** Seconds a restore waits for the running sessions to end: more than a dead one's registration lasts (60 s untouched,
+     *  see Sessions), so that only a session still running stops it; the tests make it short */
+    public static int $waitSessions = 70;
+
     /**
      * Whether $name (relative, with "/") is one a backup carries: never another path of the server. A user's folder whole,
      * whatever its files are called (a "yarn.lock" too: before, such names were left out, and a restore then removed them);
@@ -119,7 +123,13 @@ final class Backup
             }
             // its size from what is read: a file of up to a chunk whole first (one being written meanwhile, as it is then)
             $first = (string)fread($h, self::CHUNK);
-            $size  = feof($h) ? strlen($first) : max(strlen($first), (int)(fstat($h)['size'] ?? 0));
+            $whole = feof($h);
+            $size  = $whole ? strlen($first) : max(strlen($first), (int)(fstat($h)['size'] ?? 0));
+            if ($whole) {
+                // let go before it is sent: kept open while a slow browser took a chunk, on Windows no request could replace
+                // it meanwhile (a store: "Cannot write store")
+                fclose($h);
+            }
             $push(pack('n', strlen($name)) . $name . pack('J', $size) . $first);
             for ($left = $size - strlen($first); $left > 0;) {
                 $d = (string)fread($h, min(self::CHUNK, $left));
@@ -130,7 +140,7 @@ final class Backup
                 $push($d);
                 $left -= strlen($d);
             }
-            fclose($h);
+            $whole || fclose($h);
         }
         $emit($buf, true);
         return $total;
@@ -255,8 +265,8 @@ final class Backup
      * is the backup's: also a store it did not have then goes (certificates fixed since, say); the users' folders and the
      * recordings only when it carries them ($with: its manifest's), else as they are. On any failure what was moved goes back;
      * what could not go back is never removed: kept in the data folder (restore-kept-<when>), said in the server's log. Every
-     * session ends first (the remote ones, and the web ones after: their users are the backup's now). True, 'backup_restore'
-     * (all as it was), or 'backup_kept' (not all of it could go back).
+     * session ends first (the remote ones, and the web ones after: their users are the backup's now; a remote one that does
+     * not end in time: nothing moves). True, 'backup_restore' (all as it was), or 'backup_kept' (not all of it could go back).
      */
     public static function restore(string $dir, array $with = []): bool|string
     {
@@ -268,8 +278,16 @@ final class Backup
         foreach ($running() as $s) {                            // (their processes stop writing before their files move)
             Sessions::kill((string)$s['sid'], 'killed');
         }
-        for ($end = microtime(true) + 5; $running() !== [] && microtime(true) < $end;) {
+        // until every session let go of its registration (its end in the audit written before: rdp.php), or one is still
+        // registered after longer than a dead one's registration lasts (then nothing moves). Before, it went ahead after 5 s:
+        // a session still ending wrote its audit and recording into the data that had just been put in place
+        for ($end = microtime(true) + self::$waitSessions; ($left = $running()) !== [] && microtime(true) < $end;) {
             usleep(100000);
+        }
+        if ($left !== []) {
+            @unlink($flag);
+            error_log('MuDeskClient: a restore did not go ahead: ' . count($left) . ' session(s) did not end');
+            return 'backup_restore';
         }
         @mkdir($old, 0700, true);
         $mv    = self::$move ?? static fn(string $from, string $to): bool => @rename($from, $to);

@@ -16,6 +16,13 @@ final class Connections
     private const MANAGED  = 'managed_connections';
     private const OWN_KEYS = ['pass', 'cert', 'certs', 'audio', 'mic', 'clipboard', 'drive', 'printer', 'ask', 'gfx', 'paste', 'bpp', 'full', 'multi'];   // a user's, of a managed one
     private const TARGET   = ['host', 'port', 'user', 'domain', 'security', 'gw'];   // changed: a saved password must not go to the new target
+    /**
+     * What a session may share from or with this computer. An administrator's choice is a ceiling: in a connection of theirs a
+     * user can turn each off, never on (before, a user's own value went before the administrator's, and the connect dialog's
+     * too: a connection made without clipboard or folder so that no data left a computer had them back at a user's click); so
+     * are a user's own connections' when the user may not make connections. See max().
+     */
+    private const REDIRECTS = ['audio', 'mic', 'clipboard', 'drive', 'printer'];
     /** Kept as they are, besides the target, by a user who may not make connections (see Settings users_create_conns) */
     private const LOCKED   = ['vm' => 0, 'wol' => 0, 'wol_ip' => 0, 'lb' => 0];   // (lb: another collection, another computer)
     /** The longest load balance info: the X.224 request that carries it has a one-byte length */
@@ -136,11 +143,15 @@ final class Connections
     /**
      * The certificate an administrator fixed for a computer (its SHA-256, or SHA-1 as Windows shows it), for any connection to
      * it: by its name, or by its address ($ip, what the connection's name resolved to: one fixed for "pc" holds for 10.0.0.5
-     * too, and the other way round). Null: none fixed (each user confirms it the first time).
+     * too, and the other way round). Null: none fixed (each user confirms it the first time). Each one's addresses are those
+     * kept with it (fixCert(), seenAt()), never looked up here: before, every connection to a computer without one waited for
+     * the DNS of each name fixed (9.5 s on Windows for a name that no longer resolved). One fixed by an earlier version, without
+     * them, is looked up once (5 s at most for all such) and kept.
      */
     public static function fixedCert(string $host, int $port, string $ip = ''): ?string
     {
         $host  = strtolower(trim($host, ' []'));
+        $ip    = self::ip($ip);
         $other = [];
         foreach (Store::read('certs') as $k => $e) {
             if (!preg_match('~^rdp:(.+):(\d+)$~D', (string)$k, $m) || (int)$m[2] !== $port || !is_string($e['fp'] ?? null)) {
@@ -149,20 +160,65 @@ final class Connections
             if ($m[1] === $host) {
                 return $e['fp'];
             }
-            $other[$m[1]] = $e['fp'];
+            $other[$m[1]] = $e;
         }
-        // resolved only when no entry has the name itself, for 5 s at most (a slow DNS never holds the connection up: those
-        // not resolved by then match nothing, and the user's own certificate applies)
-        $until = microtime(true) + 5;
-        foreach ($ip !== '' ? $other : [] as $name => $fp) {
-            if (in_array($ip, Access::addresses((string)$name), true)) {
-                return $fp;
+        $old = [];
+        foreach ($ip !== '' ? $other : [] as $name => $e) {
+            if (!is_array($e['ips'] ?? null)) {
+                $old[] = (string)$name;
+            } elseif (self::ip((string)$name) === $ip || in_array($ip, $e['ips'], true)) {
+                return $e['fp'];
             }
+        }
+        $found = [];
+        $until = microtime(true) + 5;
+        foreach ($old as $name) {
             if (microtime(true) > $until) {
                 break;
             }
+            $found[$name] = array_values(array_unique(array_map(self::ip(...), Access::addresses($name))));
+        }
+        if ($found !== []) {
+            Store::update('certs', static function (array &$d) use ($found, $port): void {
+                foreach ($found as $name => $ips) {
+                    if (is_array($d["rdp:$name:$port"] ?? null) && !isset($d["rdp:$name:$port"]['ips'])) {
+                        $d["rdp:$name:$port"]['ips'] = $ips;
+                    }
+                }
+            });
+        }
+        foreach ($found as $name => $ips) {
+            if (in_array($ip, $ips, true)) {
+                return $other[$name]['fp'];
+            }
         }
         return null;
+    }
+
+    /**
+     * A connection by its name that showed the certificate fixed for it: the address it went to kept with it, so that a
+     * connection by that address finds it too when the computer's address changed (the last 4).
+     */
+    public static function seenAt(string $host, int $port, string $ip): void
+    {
+        $k  = 'rdp:' . strtolower(trim($host, ' []')) . ":$port";
+        $ip = self::ip($ip);
+        $e  = Store::read('certs')[$k] ?? null;
+        if ($ip === '' || !is_array($e) || in_array($ip, is_array($e['ips'] ?? null) ? $e['ips'] : [], true)) {
+            return;
+        }
+        Store::update('certs', static function (array &$d) use ($k, $ip): void {
+            if (is_array($d[$k] ?? null)) {
+                $d[$k]['ips'] = [...array_slice(array_values(array_diff(is_array($d[$k]['ips'] ?? null) ? $d[$k]['ips'] : [], [$ip])), -3), $ip];
+            }
+        });
+    }
+
+    /** An address as one text (IPv6 written one way); '' stays ''. */
+    private static function ip(string $a): string
+    {
+        $b = @inet_pton(trim($a, ' []'));
+        return $b !== false ? (string)inet_ntop($b) : strtolower($a);
     }
 
     /** Every certificate fixed: "rdp:host:port" => [fp, by, at]. */
@@ -176,18 +232,20 @@ final class Connections
      * its SHA-256 or SHA-1 in hex, any case, with or without separators. Returns the fingerprint kept, or 'cert_fixed' when it
      * is neither.
      */
-    public static function fixCert(string $host, int $port, string $fp, string $by): string
+    public static function fixCert(string $host, int $port, string $fp, string $by, ?array $ips = null): string
     {
         $host = strtolower(trim($host, ' []'));
         $fp   = strtolower((string)preg_replace('~[\s:-]~', '', $fp));
         if (($fp !== '' && !preg_match('~^([0-9a-f]{40}|[0-9a-f]{64})$~D', $fp)) || $host === '' || $port < 1 || $port > 65535) {
             return 'cert_fixed';
         }
-        Store::update('certs', static function (array &$d) use ($host, $port, $fp, $by): void {
+        // its addresses, kept with it (see fixedCert()): $ips, those the connection went to; else looked up now
+        $ips = $fp === '' ? [] : array_values(array_unique(array_map(self::ip(...), array_map('strval', $ips ?? Access::addresses($host)))));
+        Store::update('certs', static function (array &$d) use ($host, $port, $fp, $by, $ips): void {
             if ($fp === '') {
                 unset($d["rdp:$host:$port"]);
             } else {
-                $d["rdp:$host:$port"] = ['fp' => $fp, 'by' => $by, 'at' => date('c')];
+                $d["rdp:$host:$port"] = ['fp' => $fp, 'by' => $by, 'at' => date('c'), 'ips' => $ips];
             }
         });
         return $fp;
@@ -217,8 +275,14 @@ final class Connections
                     $name    ??= (string)(Users::get($uid)['username'] ?? '');
                     $m['user'] = str_replace(self::USER_VAR, $name, (string)$m['user']);
                 }
-                $out[$id] = ['managed' => true] + self::defaults(array_intersect_key($own[$id] ?? [], array_flip(self::OWN_KEYS))
+                $c     = ['managed' => true] + self::defaults(array_intersect_key($own[$id] ?? [], array_flip(self::OWN_KEYS))
                     + array_diff_key($m, ['users' => 0]) + ['pass' => null, 'cert' => '']);
+                $admin = self::defaults(array_diff_key($m, ['users' => 0]));
+                foreach (self::REDIRECTS as $k) {                  // (the administrator's a ceiling: see REDIRECTS)
+                    $c['max'][$k] = (bool)($admin[$k] ?? true);
+                    $c[$k]        = !empty($c[$k]) && $c['max'][$k];
+                }
+                $out[$id] = $c;
             }
         }
         return $out;
@@ -355,6 +419,11 @@ final class Connections
             }
             $id      = $id !== '' ? $id : Store::newId();
             $old     = $d[$id] ?? ['created' => date('c')];
+            if (!$create) {                                // (a user who may not make connections: see REDIRECTS)
+                foreach (self::REDIRECTS as $k) {
+                    $c[$k] = !empty($c[$k]) && (bool)(self::defaults($old)[$k] ?? true);
+                }
+            }
             $c      += ['id' => $id, 'created' => $old['created'], 'updated' => date('c')];
             $moved     = isset($d[$id]) && !self::sameTarget($old, $c);   // another computer: its certificate and password were the old one's
             $c['pass'] = $moved ? null : $old['pass'] ?? null;
@@ -390,6 +459,16 @@ final class Connections
                 return 'invalid_input';
             }
         }
+        // the yes/no options true or false (Http::yes): "false", "no" or a list were taken as yes
+        $perf = $in['perf'] ?? [];
+        foreach (['clipboard', 'drive', 'audio', 'mic', 'touch', 'printer', 'ask', 'vm_enhanced', 'record'] as $k) {
+            if (isset($in[$k]) && Http::yes($in[$k]) === null) {
+                return 'invalid_input';
+            }
+        }
+        if (!is_array($perf) || array_filter(array_intersect_key($perf, array_flip(self::PERF)), static fn($v): bool => $v !== null && Http::yes($v) === null) !== []) {
+            return 'invalid_input';
+        }
         $host = strtolower(trim((string)($in['host'] ?? ''), " []"));
         $c    = [
             'name'      => trim(preg_replace('~[\x00-\x1f\x7f]~', '', Text::cut((string)($in['name'] ?? ''), 80))),
@@ -400,7 +479,9 @@ final class Connections
             'domain'    => preg_replace('~[\x00-\x1f\x7f]~', '', Text::cut((string)($in['domain'] ?? ''), 128)),
             'kbd'       => in_array(Http::int($in['kbd'] ?? 0), self::KEYBOARDS, true) ? Http::int($in['kbd']) : 0x040A,
             'bpp'       => in_array(Http::int($in['bpp'] ?? 0), [15, 16, 24, 32], true) ? Http::int($in['bpp']) : 16,
-            'security'  => in_array($in['security'] ?? '', ['auto', 'nla', 'tls'], true) ? $in['security'] : 'auto',
+            // NLA only unless chosen (before, Automatic: on a first connection someone in between could answer that the computer
+            // has only TLS or the old security and be given the password, if the user trusted its fingerprint)
+            'security'  => in_array($in['security'] ?? '', ['auto', 'nla', 'tls'], true) ? $in['security'] : 'nla',
             'resize'    => ($in['resize'] ?? '') === 'fit' ? 'fit' : 'dynamic',
             'clipboard' => (bool)($in['clipboard'] ?? true),
             'paste'     => self::pasteMode($in['paste'] ?? 'auto'),
@@ -733,20 +814,34 @@ final class Connections
         return [$login, $domain];
     }
 
-    /** Saves the options chosen in the connect dialog as the connection defaults. */
-    public static function setOptions(string $uid, string $id, array $o): bool
+    /**
+     * The most each redirection may be in a session of $c (see REDIRECTS): an administrator's connection, its own ceiling; a
+     * user's own when the user may not make connections ($creates false), what it has. [] when the user chooses freely.
+     */
+    public static function max(array $c, bool $creates): array
     {
-        if (self::isManaged($id) && !isset(self::all($uid)[$id])) {
+        if (is_array($c['max'] ?? null)) {
+            return $c['max'];
+        }
+        return $creates || !empty($c['occasional']) ? [] : array_map('boolval', array_intersect_key(self::defaults($c), array_flip(self::REDIRECTS)));
+    }
+
+    /** Saves the options chosen in the connect dialog as the connection defaults (the redirections within max()). */
+    public static function setOptions(string $uid, string $id, array $o, bool $creates = true): bool
+    {
+        $c = self::all($uid)[$id] ?? null;
+        if ($c === null) {
             return false;
         }
-        return Store::update('connections/' . $uid, static function (array &$d) use ($id, $o): bool {
+        $max = self::max($c, $creates);
+        return Store::update('connections/' . $uid, static function (array &$d) use ($id, $o, $max): bool {
             if (!isset($d[$id]) && !self::isManaged($id)) {
                 return false;
             }
             $d[$id] ??= [];                       // a managed one: the user's own options for it
             foreach (['audio', 'mic', 'clipboard', 'drive', 'printer', 'ask', 'full', 'multi'] as $k) {
                 if (isset($o[$k])) {
-                    $d[$id][$k] = (bool)$o[$k];
+                    $d[$id][$k] = (bool)$o[$k] && ($max[$k] ?? true);
                 }
             }
             if (isset($o['gfx'])) {

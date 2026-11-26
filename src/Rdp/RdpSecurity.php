@@ -192,8 +192,12 @@ final class RdpSecurity
             : pack('vv', $flags, 0) . $sig . $c;                         // TS_SECURITY_HEADER1
     }
 
-    /** A slow-path PDU's data from the server: [its security flags, the data] (decrypted when SEC_ENCRYPT says so). */
-    public function open(string $pdu): array
+    /**
+     * A slow-path PDU's data from the server: [its security flags, the data] (decrypted when SEC_ENCRYPT says so). $licensing:
+     * it came on the I/O channel before the licensing ended, the only place a licensing PDU in the clear is taken from 2 on
+     * (before, one was taken at any time and on any channel, and passed on to that channel as its data).
+     */
+    public function open(string $pdu, bool $licensing = false): array
     {
         if (strlen($pdu) < 4) {
             throw new ProtocolException('Standard RDP Security: no security header', 'protocol');
@@ -202,7 +206,7 @@ final class RdpSecurity
         // (a redirection decrypted with or without SEC_ENCRYPT, as other clients do: it may come as 0x0C00; before, it was
         // then taken as plain text and refused as a bad redirection)
         if (!($flags & (self::SEC_ENCRYPT | self::SEC_REDIRECTION_PKT))) {
-            if ($this->level >= 2 && !($flags & self::SEC_LICENSE_PKT)) {
+            if ($this->level >= 2 && !($licensing && $flags & self::SEC_LICENSE_PKT)) {
                 throw new ProtocolException('Standard RDP Security: a PDU in the clear', 'protocol');
             }
             return [$flags, substr($pdu, 4)];
@@ -289,10 +293,15 @@ final class RdpSecurity
         return self::sane(ltrim(Der::read($key)[1], "\0"), ltrim(Der::read($key)[1], "\0"));
     }
 
-    /** The pin of a server's key: the SHA-256 of its modulus and exponent, each after its length (big-endian). */
-    public static function pin(string $n, string $e): string
+    /**
+     * The pin of a server's key: the SHA-256 of its modulus and exponent, each after its length (big-endian); $clear: the
+     * server sends in the clear (encryption level below 2), which goes into the pin too. The level comes in data nothing
+     * authenticates: before, a man in the middle who set it to 1 on a known computer was not seen (the same pin), and
+     * what he then sent in the clear was taken (text in the clipboard, a Server Redirection to his own computer).
+     */
+    public static function pin(string $n, string $e, bool $clear = false): string
     {
-        return hash('sha256', 'rdp-security-key' . pack('N', strlen($n)) . $n . pack('N', strlen($e)) . $e);
+        return hash('sha256', 'rdp-security-key' . pack('N', strlen($n)) . $n . pack('N', strlen($e)) . $e . ($clear ? 'server-in-clear' : ''));
     }
 
     /**

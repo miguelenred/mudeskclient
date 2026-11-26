@@ -1,0 +1,111 @@
+{{/* MuDeskClient - https://miguelenred.es/mudeskclient - Apache License 2.0 */}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mudesk.fullname" . }}
+  labels:
+    {{- include "mudesk.labels" . | nindent 4 }}
+spec:
+  # one pod: the sessions live in its processes and the data folder uses file locks (see values.yaml)
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "mudesk.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mudesk.selector" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ .Values.config | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      containers:
+        - name: mudeskclient
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: https
+              containerPort: 443
+          env:
+            {{- with .Values.hostname }}
+            - name: MUDESK_HOSTNAME
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.workers }}
+            - name: MUDESK_WORKERS
+              value: {{ . | quote }}
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+          # ready while health.php says the gateway works (its data folder writable, its users and settings readable; not
+          # during a restore); alive while Apache answers (a restore under way is never cut by a restart). With a list of
+          # allowed clients, list the nodes' addresses too: the kubelet asks from there
+          readinessProbe:
+            httpGet:
+              path: /health.php
+              port: https
+              scheme: HTTPS
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: https
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/www/mudesk/data
+            - name: tls
+              mountPath: /etc/mudesk/tls
+              {{- if .Values.tls.existingSecret }}
+              readOnly: true
+              {{- end }}
+            {{- if .Values.config }}
+            - name: config
+              mountPath: /var/www/mudesk/config.php
+              subPath: config.php
+              readOnly: true
+            {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.data.existingClaim | default (printf "%s-data" (include "mudesk.fullname" .)) }}
+        - name: tls
+          {{- if .Values.tls.existingSecret }}
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+            items:
+              - key: tls.crt
+                path: cert.pem
+              - key: tls.key
+                path: key.pem
+          {{- else }}
+          persistentVolumeClaim:
+            claimName: {{ printf "%s-tls" (include "mudesk.fullname" .) }}
+          {{- end }}
+        {{- if .Values.config }}
+        - name: config
+          secret:
+            secretName: {{ printf "%s-config" (include "mudesk.fullname" .) }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -16,6 +16,18 @@ $q = static fn(string $k): string => is_string($_GET[$k] ?? null) ? $_GET[$k] : 
 $a = $q('a');
 $p = $q('p');
 
+// a file replaced by an upload is written beside it first, under a name of its own (in its folder: put in its place by a
+// rename at the last chunk). While that part is there, the user's quota counts the bytes of it written so far and not the
+// old file's (given back with its first chunk: a new version that fits was refused near the quota); removed, the old file
+// counts again. One left half way is removed by the housekeeping after a day (Files::notePart)
+$partOf   = static fn(string $path): string => Files::partOf($path);
+$dropPart = static function (string $path) use ($u, $partOf): void {
+    if (is_file($partOf($path))) {
+        Files::delete($u['id'], $partOf($path));
+        is_file($path) && Files::charge($u['id'], (int)filesize($path));
+    }
+};
+
 // images shown as such in the file manager (its thumbnails): only bitmap types, never as a page (no SVG, no HTML)
 const VIEW = ['png' => 'image/png', 'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'gif' => 'image/gif', 'webp' => 'image/webp',
               'bmp' => 'image/bmp', 'avif' => 'image/avif'];
@@ -163,6 +175,7 @@ switch ($a) {
         if ($path === Files::root($u['id'])) {
             Http::fail('invalid_path');
         }
+        $dropPart($path);                 // its replacement being uploaded goes too (an upload cancelled: what arrived of it)
         if (!file_exists($path)) {
             Http::fail('not_found', 404);
         }
@@ -184,46 +197,69 @@ switch ($a) {
         flock($lock, LOCK_EX);
         $in   = fopen('php://input', 'rb');
         $size = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);          // none with a chunked body: the copy below stops anyway
-        // a file replaced gives its room back first: a new version that fits was refused near the quota
+        // a file replaced stays until the new one is whole (see $partOf). Deleted first, as before, one a program of the
+        // remote session had open (Windows) was only marked for deletion: the new one could not be made (invalid_path), and
+        // the old one's data went once the program closed it
+        if ($offset === 0) {
+            $dropPart($path);                                     // (one left halfway: the browser closed, say)
+        }
+        $over = $offset === 0 ? is_file($path) : is_file($partOf($path));
+        $dest = $over ? $partOf($path) : $path;
+        if ($over && $offset === 0 && !$last) {
+            Files::notePart($u['id'], substr($path, strlen(Files::root($u['id'])) + 1));
+        }
+        $old  = $offset === 0 && $over ? (int)filesize($path) : 0;   // its room, given back with the first chunk
         $left = Files::quotaLeft($u['id']);
-        if ($left !== PHP_INT_MAX && $offset === 0 && is_file($path)) {
-            $left += (int)filesize($path);
+        if ($left !== PHP_INT_MAX) {
+            $left += $old;
         }
         if ($size > $left) {
             Http::fail('quota');
         }
         if ($offset === 0) {
-            if (is_file($path)) {                                 // replaced: its quota goes back
-                Files::delete($u['id'], $path);
-            }
             if (!$last) {                                         // recorded from the first chunk, whatever the client sends later
                 Audit::log('file_upload_start', ['path' => $p, 'size' => $size], null, true);
             }
-        } elseif (!is_file($path) || filesize($path) !== $offset) {
+        } elseif (!is_file($dest) || filesize($dest) !== $offset) {
             Http::fail('offset');
         }
-        $out = @fopen($path, 'ab');
+        $out = @fopen($dest, 'ab');
         if ($out === false) {                                     // a name the file system refuses
             Http::fail('invalid_path');
         }
         $n = stream_copy_to_stream($in, $out, $left === PHP_INT_MAX ? null : $left + 1);
         fclose($out);
-        clearstatcache(true, $path);
+        clearstatcache(true, $dest);
         // charged once written (a session may have taken the room meanwhile); over the quota what this request wrote is dropped
-        if ($n === false || $n > $left || !Files::charge($u['id'], $n)) {
+        // (of a replacement, all of it: the old file stays, counted again)
+        if ($n === false || $n > $left || !Files::charge($u['id'], $n - $old)) {
             if ($offset === 0) {
-                @unlink($path);
+                @unlink($dest);
             } else {
-                $h = fopen($path, 'r+');
+                $h = fopen($dest, 'r+');
                 ftruncate($h, $offset);
                 fclose($h);
+                $over && $dropPart($path);
             }
             Http::fail('quota');
+        }
+        if ($last && $over) {
+            // in its place; a file another process has open (Windows) cannot be replaced: tried again for half a second (a
+            // thumbnail read), then the old one stays as it was (said as a file that could not be moved: open remotely)
+            for ($i = 0; !@rename($dest, $path); $i++) {
+                if ($i >= 50) {
+                    $dropPart($path);
+                    Http::fail('move_failed');
+                }
+                usleep(10000);
+            }
+            $dest = $path;
+            clearstatcache(true, $path);
         }
         if ($last) {
             Audit::log('file_upload', ['path' => $p, 'size' => filesize($path)], null, true);
         }
-        Http::json(['ok' => true, 'size' => filesize($path)]);
+        Http::json(['ok' => true, 'size' => filesize($dest)]);
 
     default:
         Http::fail('unknown_action', 404);

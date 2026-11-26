@@ -7,7 +7,7 @@ services:
   mudesk:
     # the image of this version: it does not change by itself ("latest" would bring each new version without asking); to
     # update, put the new version's number here, then `docker compose pull` and `docker compose up -d`
-    image: ghcr.io/miguelenred/mudeskclient:1.2.0
+    image: ghcr.io/miguelenred/mudeskclient:1.3.0
     # build: .
     container_name: mudesk
     restart: unless-stopped
@@ -18,6 +18,22 @@ services:
       - mudesk-tls:/etc/mudesk/tls         # the self-signed certificate made at the first start (or your cert.pem and key.pem)
     # environment:
     #   MUDESK_HOSTNAME: mudesk.example.com   # the name in the self-signed certificate
+    #   MUDESK_WORKERS: 256                   # Apache processes at once (docs/HOSTING.md, Capacity)
+    # its logs rotated (Docker keeps them without limit otherwise) and no privilege gained inside; its health (health.php,
+    # every 30 s, from the image) shows in `docker compose ps`
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true
+    # memory and CPU at most, for the sessions you expect (docs/HOSTING.md, Capacity: 2 GB and 2 CPUs, some 25–35 sessions)
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 2g
+    #       cpus: "2"
 
 volumes:
   mudesk-data:

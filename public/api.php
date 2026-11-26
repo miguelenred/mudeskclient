@@ -2,8 +2,8 @@
 // MuDeskClient - https://miguelenred.es/mudeskclient - Apache License 2.0
 declare(strict_types=1);
 
-use MuDesk\{Access, Audit, Auth, Connections, Crypto, Http, Maintenance, Oidc, Recording, Sessions, Settings, Text, Totp, Users, WebAuthn, WindowsLogin};
-use MuDesk\Rdp\Trace;
+use MuDesk\{Access, Audit, Auth, Connections, Crypto, Http, Maintenance, Oidc, Recording, Sessions, Settings, Setup, Text, Totp, Users, WebAuthn, WindowsLogin};
+use MuDesk\Rdp\{Trace, Transport};
 
 require __DIR__ . '/../src/bootstrap.php';
 
@@ -21,7 +21,7 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 $in     = Http::input();
 $action = is_string($in['action'] ?? null) ? $in['action'] : '';
 Http::$action        = 'api:' . substr($action, 0, 40);
-Http::$auditFailures = !in_array($action, ['login', 'passkey.login', 'setup'], true);   // these log their own detailed outcome
+Http::$auditFailures = !in_array($action, ['login', 'passkey.login', 'setup', 'setup.check', 'setup.wait', 'setup.stream', 'setup.rdp'], true);   // these log their own detailed outcome
 if ($action !== 'state') {
     Auth::checkCsrf();
 }
@@ -30,6 +30,7 @@ $raw = static fn(string $k): string => is_array($v = $in[$k] ?? '') ? Http::fail
 $str = static fn(string $k): string => trim($raw($k));
 $int = static fn(string $k): int => is_array($v = $in[$k] ?? 0) ? Http::fail('invalid_input') : Http::int($v);   // (a float past the int range warned on PHP 8.5)
 $obj = static fn(string $k): array => is_array($v = $in[$k] ?? []) ? $v : Http::fail('invalid_input');
+$bool = static fn(string $k, bool $default = false): bool => ($v = $in[$k] ?? null) === null ? $default : (Http::yes($v) ?? Http::fail('invalid_input'));   // (see Http::yes)
 // public key of the signed audit exports, made the first time; OpenSSL unable to make it: logged, and a clear error
 $signKey = static function (): string {
     try {
@@ -52,14 +53,19 @@ function state(): never
         'csrf'    => Auth::csrf(),
         'version' => $u === null ? null : MuDesk\VERSION,   // (only to a signed-in user: not which version runs to anyone)
         'build'   => Http::build(__DIR__ . '/assets'),   // the page compares it with its own: an older page says so
+        'ws'      => MuDesk\Config::get('websocket') === false ? null : 'ws',   // the WebSocket service's path, tried by the page (see tools/ws-server.php)
         'second'  => ($p = $_SESSION['pending'] ?? null) === null || !($pu = Users::get($p['uid'])) ? null
                      : ['totp' => !empty($pu['totp']['enabled']), 'passkey' => !empty($pu['passkeys'])],
         // (signed in with OpenID Connect, the provider's own second step counts: nothing to add here)
         'user'    => $u === null ? null : Users::view($u) + ['totp_required' => Settings::get('totp_required') && ($_SESSION['via'] ?? '') !== 'oidc',
                      'reconnect' => Settings::get('reconnect_attempts'), 'save_passwords' => Settings::get('save_passwords') && Auth::dek() !== null,
                      'no_key' => Settings::get('save_passwords') && Auth::dek() === null,   // (a session opened with OpenID Connect)
-                     'create_conns' => Auth::createsConns($u), 'record_own' => Auth::recordsOwn($u)]
+                     'create_conns' => Auth::createsConns($u), 'record_own' => Auth::recordsOwn($u),
+                     // (a local user who may link their account to the single sign-on provider's: the profile offers it)
+                     'oidc_link' => Oidc::enabled() && ($u['source'] ?? null) === null && $u['role'] !== 'admin' && !isset($u['oidc'])
+                         && ($_SESSION['via'] ?? '') !== 'oidc' ? Oidc::label() : null]
                      + ($u['role'] === 'admin' ? ['targets_all' => Settings::get('targets')['mode'] === 'all',   // warned in the panel
+                        'proxy_undeclared' => Http::undeclaredProxy(),   // (a proxy on this machine not in trusted_proxies)
                         'check_php' => is_file(__DIR__ . '/check.php')] : []),   // the hosting diagnostics left in the web root
         'previous' => $u === null ? null : Auth::takePrevious(),   // right after signing in: last sign-in and failures since
         'session'  => $u === null ? null : ['idle' => Settings::get('session_idle_minutes') * 60, 'max' => Auth::maxLeft()],   // when it expires
@@ -117,6 +123,25 @@ switch ($action) {
         Audit::log('setup', ['admin' => $str('username')], $str('username'), true);
         Auth::login($str('username'), $raw('password'));
         state();
+
+    // the guided first run (MuDesk\Setup): the server's checks, a request of a second, a long request, a remote computer
+    // reached; only while there is no user, and each one with the setup code (a wrong one counts as a failed sign-in)
+    case 'setup.check':
+    case 'setup.wait':
+    case 'setup.stream':
+    case 'setup.rdp':
+        if (Users::all() !== []) {
+            Http::fail('forbidden', 403);
+        }
+        if (!Auth::setupAllowed($str('setup_code'))) {
+            Http::fail('setup_code', 403);
+        }
+        match ($action) {
+            'setup.check'  => Http::json(['checks' => Setup::checks()]),
+            'setup.wait'   => Setup::wait(),
+            'setup.stream' => Setup::stream($int('seconds')),
+            default        => Http::json(Setup::rdp($str('host'), $int('port') ?: 3389)),
+        };
 
     case 'login':
         $r = Auth::login($str('username'), $raw('password'), $str('code'));
@@ -254,10 +279,10 @@ switch ($action) {
         if (!empty($info['app'])) {    // (RemoteApp: its connection is not made again in the session, see rdp.php)
             Http::fail('record_unavailable');
         }
-        if (empty($in['on']) && !$admin && in_array($info['record_by'] ?? null, ['policy', 'admin'], true)) {
+        if (!$bool('on') && !$admin && in_array($info['record_by'] ?? null, ['policy', 'admin'], true)) {
             Http::fail('record_locked', 403);   // (the connection's recording, or an administrator's: only an administrator stops it)
         }
-        Sessions::record($sid, !empty($in['on']), $u['username'], $admin) || Http::fail('not_found', 404);
+        Sessions::record($sid, $bool('on'), $u['username'], $admin) || Http::fail('not_found', 404);
         Http::json(['ok' => true]);
 
     case 'session.share':          // a link to the user's running session for a guest without an account: view, or control
@@ -291,12 +316,12 @@ switch ($action) {
 
     case 'profile.browser.forget': // one known browser (id) or every one but this (others)
         $u    = Auth::require(false, true);
-        $gone = Auth::forget($u, empty($in['others']) ? $str('id') : null);
-        if ($gone === [] && empty($in['others'])) {
+        $gone = Auth::forget($u, !$bool('others') ? $str('id') : null);
+        if ($gone === [] && !$bool('others')) {
             Http::fail('not_found', 404);
         }
         Audit::log('device_forget', ['browsers' => array_map(static fn($d) => trim(($d['ua'] ?? '') . ' ' . ($d['ip'] ?? '')), array_values($gone)),
-            'others' => !empty($in['others'])], null, true);
+            'others' => $bool('others')], null, true);
         Http::json(['browsers' => Auth::browsers(Users::get($u['id']) ?? $u)]);
 
     case 'totp.begin':
@@ -355,7 +380,7 @@ switch ($action) {
         $old  = empty($conn['id']) || is_array($conn['id']) ? [] : (Connections::all($u['id'])[(string)$conn['id']] ?? []);
         $r    = Connections::save($u['id'], $conn, Auth::dek(), Auth::createsConns($u), ($u['role'] ?? '') === 'admin');   // (recording: administrators only)
         if (is_string($r)) {
-            Http::fail($r, $r === 'conns_locked' ? 403 : 400);
+            Http::fail($r, $r === 'conns_locked' ? 403 : ($r === 'not_found' ? 404 : 400));
         }
         $skip = ['id' => 0, 'created' => 0, 'updated' => 0];
         Audit::log($old === [] ? 'conn_create' : 'conn_update', ['conn' => $r['name'], 'host' => $r['host']] + ($old === []
@@ -377,7 +402,7 @@ switch ($action) {
 
     case 'conns.options':
         $u = Auth::require();
-        if (!Connections::setOptions($u['id'], $str('id'), $obj('opts'))) {
+        if (!Connections::setOptions($u['id'], $str('id'), $obj('opts'), Auth::createsConns($u))) {
             Http::fail('not_found', 404);
         }
         $c = Connections::get($u['id'], $str('id')) ?? [];       // the stored (validated) values of the options sent
@@ -399,6 +424,12 @@ switch ($action) {
         $u = Auth::require();
         $c = Connections::get($u['id'], $str('id')) ?? Http::fail('not_found', 404);
         Connections::setCert($u['id'], $c['id'], '');
+        // and how TLS went with it, by an administrator only: a computer changed on purpose to Standard RDP Security is then
+        // taken, asked as new. That memory is everybody's (before, any user's click took it away for all, and with it the
+        // refusal of someone in between answering for that computer with the old security)
+        if (($u['role'] ?? '') === 'admin') {
+            Transport::tlsForget(strtolower((string)$c['host']) . ':' . (int)$c['port']);
+        }
         Audit::log('cert_forget', ['conn' => $c['name']], null, true);
         Http::json(['ok' => true]);
 
@@ -429,7 +460,7 @@ switch ($action) {
         // took their role away
         $sent   = array_intersect_key($in, array_flip(['role', 'enabled', 'max_sessions', 'hours']));
         $role   = in_array($str('role'), ['admin', 'auditor'], true) ? $str('role') : 'user';
-        $on     = (bool)($in['enabled'] ?? true);
+        $on     = $bool('enabled', true);
         $max    = max(0, min(50, $int('max_sessions')));
         $hours  = Users::hours($in['hours'] ?? null);
         if ($hours === false) {
@@ -487,6 +518,27 @@ switch ($action) {
             'passkeys' => count($target['passkeys'] ?? [])], null, true);
         Http::json(['ok' => true]);
 
+    case 'admin.user.oidc_unlink':         // a local user's link to the provider's account undone (a wrong one linked: see
+        $me     = Auth::require(true);         // oidc.php); they link one again from their profile, signed in with their password
+        $target = Users::get($str('id')) ?? Http::fail('not_found', 404);
+        if (($target['source'] ?? null) !== null) {
+            Http::fail('oidc_not_unlinkable');   // (one the provider or Windows made has no sign-in of its own)
+        }
+        if (isset($target['oidc'])) {
+            $u = Users::update($target['id'], static function (array &$x): void {
+                unset($x['oidc']);
+                $x['sv'] = ($x['sv'] ?? 1) + 1;  // its web sessions end, those opened through that account too
+            }) ?? Http::fail('not_found', 404);
+            if ($target['id'] === $me['id']) {   // (an administrator's own: this session stays, the others end)
+                $_SESSION['sv'] = $u['sv'];
+                Sessions::killUser($target['id'], Auth::wid());
+            } else {
+                Sessions::killUser($target['id']);
+            }
+            Audit::log('oidc_unlink', ['target' => $target['username'], 'iss' => (string)($target['oidc']['iss'] ?? '')], null, true);
+        }
+        Http::json(['user' => Users::view(Users::get($target['id']) ?? $target)]);
+
     // ---------- administration: connections of the administrator (given to users) and those of each user ----------
     case 'admin.conns':
         Auth::require(true);
@@ -538,7 +590,7 @@ switch ($action) {
         $target = Users::get($str('uid')) ?? Http::fail('not_found', 404);
         $conn   = $obj('conn');
         $old    = is_string($conn['id'] ?? null) ? Connections::own($target['id'])[$conn['id']] ?? null : null;
-        $r      = Connections::adminUpdate($target['id'], $conn, !empty($in['forget']));
+        $r      = Connections::adminUpdate($target['id'], $conn, $bool('forget'));
         if (is_string($r)) {
             Http::fail($r, $r === 'not_found' ? 404 : 400);
         }
@@ -560,9 +612,10 @@ switch ($action) {
     case 'admin.settings':
         $me = Auth::require(true);
         if (isset($in['settings'])) {
-            $set = $obj('settings');
-            // everybody's second factor required, the administrator's first: without it his own next request is refused
-            if (!empty($set['totp_required']) && !Users::hasSecondFactor($me)) {
+            $set   = $obj('settings');
+            $repin = Http::yes($set['ad_repin'] ?? false) ?? Http::fail('invalid_input');   // (the others: Settings::save)
+            // everybody's second factor required, the administrator's first: without it their own next request is refused
+            if (Http::yes($set['totp_required'] ?? false) === true && !Users::hasSecondFactor($me)) {
                 Http::fail('totp_required_self');
             }
             $old = Settings::all();
@@ -578,7 +631,7 @@ switch ($action) {
             // the computer that checks Windows accounts: its certificate pinned when it is set or changed, or when asked again
             if ($new['ad_host'] === '' && $new['ad_cert'] !== '') {
                 Settings::pin('ad_cert', '');
-            } elseif ($new['ad_host'] !== '' && ($new['ad_host'] !== $old['ad_host'] || $new['ad_port'] !== $old['ad_port'] || !empty($set['ad_repin']) || $new['ad_cert'] === '')) {
+            } elseif ($new['ad_host'] !== '' && ($new['ad_host'] !== $old['ad_host'] || $new['ad_port'] !== $old['ad_port'] || $repin || $new['ad_cert'] === '')) {
                 $fp = WindowsLogin::fingerprint() ?? '';
                 Settings::pin('ad_cert', $fp);
                 Audit::log('ad_cert_pinned', ['host' => $new['ad_host'], 'fingerprint' => $fp !== '' ? $fp : null], null, $fp !== '');
@@ -634,11 +687,17 @@ switch ($action) {
         Trace::cleanup();
         $list = [];
         foreach (glob(Trace::dir() . '/*.log') ?: [] as $f) {
-            $h      = fopen($f, 'rb');
+            // one removed since the folder was read (by its housekeeping, another administrator) is left out: before, a
+            // warning and a TypeError (500) for the whole list
+            $h = is_file($f) ? @fopen($f, 'rb') : false;
+            if ($h === false) {
+                continue;
+            }
             $head   = json_decode((string)strstr((string)fgets($h), '{'), true) ?: [];   // first line: "0.000 start {...}"
+            $stat   = fstat($h);                                                        // (its size and time from the file read)
             fclose($h);
             $sid    = basename($f, '.log');
-            $list[] = ['sid' => $sid, 'size' => filesize($f), 'date' => $head['date'] ?? date('c', filemtime($f)), 'user' => $head['user'] ?? '',
+            $list[] = ['sid' => $sid, 'size' => (int)$stat['size'], 'date' => $head['date'] ?? date('c', (int)$stat['mtime']), 'user' => $head['user'] ?? '',
                        'conn' => $head['conn'] ?? '', 'host' => $head['host'] ?? '', 'running' => Sessions::info($sid) !== null];
         }
         usort($list, static fn($a, $b) => strcmp($b['date'], $a['date']));
@@ -650,7 +709,7 @@ switch ($action) {
         if ($file === '' || !is_file($file)) {
             Http::fail('not_found', 404);
         }
-        $delete = !empty($in['delete']);
+        $delete = $bool('delete');
         Audit::log($delete ? 'trace_delete' : 'trace_download', ['sid' => $str('sid'), 'size' => filesize($file)], null, true);
         if ($delete) {
             unlink($file);
@@ -722,7 +781,8 @@ switch ($action) {
                 Http::fail('backup_unreadable');
             }
         }
-        $_SESSION['backups'] = array_slice(($_SESSION['backups'] ?? []) + [$id => ['key' => base64_encode(MuDesk\Backup::key($raw('password'), $salt)),
+        // (its key sealed with this browser's session key: never in the clear in the session file)
+        $_SESSION['backups'] = array_slice(($_SESSION['backups'] ?? []) + [$id => ['key' => Auth::seal(MuDesk\Backup::key($raw('password'), $salt), "backup:$id"),
             'salt' => base64_encode($salt), 'with' => $with]], -2, null, true);
         Http::json(['id' => $id]);
 
@@ -761,6 +821,17 @@ switch ($action) {
         Auth::requireAuditor();
         Http::json(MuDesk\Status::usage(30));
 
+    case 'oidc.link':                      // a local user links their account to the single sign-on provider's (see oidc.php)
+        $u = Auth::require();
+        if (!Oidc::enabled() || ($u['source'] ?? null) !== null || $u['role'] === 'admin' || isset($u['oidc']) || ($_SESSION['via'] ?? '') === 'oidc') {
+            Http::fail('oidc_not_linkable', 403);
+        }
+        try {
+            Http::json(['url' => Oidc::start($u['id'])]);
+        } catch (\RuntimeException) {
+            Http::fail('oidc_provider', 502);
+        }
+
     case 'admin.certs':                    // the certificates fixed for every connection to their computers
         Auth::require(true);
         Http::json(['certs' => Connections::fixedCerts()]);
@@ -781,10 +852,10 @@ switch ($action) {
     case 'admin.sessions.record':  // any running session recorded from now on (on), or no longer (also one recorded by its connection)
         $a    = Auth::require(true);
         $info = Sessions::info($str('sid')) ?? Http::fail('not_found', 404);
-        if (!empty($in['on']) && !empty($info['app'])) {
+        if ($bool('on') && !empty($info['app'])) {
             Http::fail('record_unavailable');
         }
-        Sessions::record($str('sid'), !empty($in['on']), $a['username'], true) || Http::fail('not_found', 404);
+        Sessions::record($str('sid'), $bool('on'), $a['username'], true) || Http::fail('not_found', 404);
         Http::json(['ok' => true]);
 
     case 'admin.sessions.kill':

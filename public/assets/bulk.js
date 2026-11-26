@@ -228,8 +228,9 @@ export class Xcrush {
     if (src.length < 2) throw new Error('XCRUSH: short block');
     const l1 = src[0], l2 = src[1], h = this.hist;
     if (flags & FLUSHED) { h.fill(0); this.pos = 0; }
-    let d = src.subarray(2);
-    if (l2 & COMPRESSED) d = this.l2.inPlace(d, l2);    // (copied into this history below, before the next block)
+    // level 2 always: its flushed or at front flags count without compression too (its history was left as it was, the
+    // compressor's started again); not compressed, the data as it is (copied into this history below, before the next block)
+    const d = this.l2.inPlace(src.subarray(2), l2);
     if (l1 & 0x04) this.pos = 0;                   // level 1 at front: writing starts again at offset 0
     const n = d.length, start = this.pos;
     let pos = start, lit = 0;

@@ -4,6 +4,7 @@
 
 const WHITE = { 1: 0xff, 2: 0xffff, 3: 0xffffff };
 const DEPTHS = new Set([8, 15, 16, 24, 32]);             // colour depths of RDP bitmaps
+const POINTER_CACHE = 25;                                // pointer cache entries the gateway offers (pointer capability set)
 
 /** A pixel value of bpp bytes at src[s] (bytes past the end read as 0). */
 function pixel(src, s, bpp) {
@@ -291,7 +292,10 @@ export function pointerDecode(u8, kind) {
   if (kind !== 9) { xorBpp = dv.getUint16(0, true); p = 2; }
   const index = dv.getUint16(p, true), hx = dv.getUint16(p + 2, true), hy = dv.getUint16(p + 4, true);
   const w = dv.getUint16(p + 6, true), h = dv.getUint16(p + 8, true);
-  if (w > 384 || h > 384) throw new Error('pointer: bad size');   // the protocol limit (the client offers 96x96)
+  // what the gateway offers (src/Rdp/Client.php): large pointers up to 96 x 96 (the protocol's 384 x 384 asked for 590 KB
+  // a pointer) and a cache of 25 (an index past it filled the page's cache with up to 65,536 pointers)
+  if (w > 96 || h > 96) throw new Error('pointer: bad size');
+  if (index >= POINTER_CACHE) throw new Error('pointer: bad cache index');
   let andLen, xorLen;
   if (kind === 12) { andLen = dv.getUint32(p + 10, true); xorLen = dv.getUint32(p + 14, true); p += 18; }
   else { andLen = dv.getUint16(p + 10, true); xorLen = dv.getUint16(p + 12, true); p += 14; }
@@ -302,7 +306,10 @@ export function pointerDecode(u8, kind) {
   let hasAlpha = false;
   if (xorBpp === 32) for (let i = 3; i < xor.length; i += 4) if (xor[i]) { hasAlpha = true; break; }
   for (let y = 0; y < h; y++) {
-    const sy = h - 1 - y;
+    // colour masks come bottom-up, 1 bpp ones (both masks) top-down, as Windows sends them. Before, 1 bpp pointers were drawn
+    // upside down: the cross Windows shows over a sheet's cells was drawn up to 17 px below its hot spot, where the click
+    // went, so the click fell on the cell above the one seen
+    const sy = xorBpp === 1 ? y : h - 1 - y;
     for (let x = 0; x < w; x++) {
       const andBit = and.length ? (and[sy * andStride + (x >> 3)] >> (7 - (x & 7))) & 1 : 0;
       let r = 0, g = 0, b = 0, a = 255;

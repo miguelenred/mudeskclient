@@ -6,9 +6,12 @@
 const opaque = (px) => { for (let i = 0; i < px.length; i++) if (px[i] < 0xff000000) return false; return true; };
 
 export class GfxSurfaces {
-  /** out(): {ctx, canvas} of the desktop; dirty(x, y, w, h) after each change; reset(w, h); ack(frameId, decoded); log(error); note(info). */
-  constructor({ out, dirty, reset, ack, log, note }) {
-    Object.assign(this, { out, dirty, reset, ack, log, note });
+  /**
+   * out(): {ctx, canvas} of the desktop; dirty(x, y, w, h) after each change; reset(w, h); ack(frameId, decoded); log(error);
+   * note(info); refresh(): a full picture asked of the server (an H.264 decoder failed), optional.
+   */
+  constructor({ out, dirty, reset, ack, log, note, refresh }) {
+    Object.assign(this, { out, dirty, reset, ack, log, note, refresh });
     this.surfaces = new Map();
     this.cache = new Map();
     this.glyphs = new Map();                            // ClearCodec glyph cache: index -> canvas
@@ -141,7 +144,8 @@ export class GfxSurfaces {
       case 's2s': {
         const src = this.surfaces.get(o.src), dst = this.surfaces.get(o.dst);
         if (!src || !dst) break;
-        const w = o.rect.r - o.rect.l, h = o.rect.b - o.rect.t;
+        // (within the source surface: the scratch canvas below, kept, is never larger; one of 65535 x 65535 was kept for good)
+        const w = Math.min(o.rect.r, src.w) - o.rect.l, h = Math.min(o.rect.b, src.h) - o.rect.t;
         if (w <= 0 || h <= 0) break;
         const later = [];
         for (const [x, y] of o.pts) {
@@ -187,6 +191,7 @@ export class GfxSurfaces {
       case 'end': this.ack(o.frame, ++this.decoded); break;
       case 'log': this.log(o.msg); break;
       case 'note': this.note(o.msg); break;
+      case 'refresh': this.refresh?.(); break;
     }
   }
 }

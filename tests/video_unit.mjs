@@ -222,5 +222,40 @@ const text = (u8, e) => new TextDecoder().decode(u8.subarray(e[1], e[1] + e[2]))
     JSON.stringify({ hour, quiet, live, going }));
 }
 
+// ------------------------------------------------------------ a picture the encoder refused
+
+{
+  // the encoder throwing on a picture (closed, out of memory): the picture closed all the same (a VideoFrame holds a whole
+  // picture of the desktop until closed; before, it was left to the collector)
+  const { recordingVideo } = await import('../public/assets/recvideo.js');
+  const frames = [], workers = [];
+  const el = () => ({ style: {}, width: 1024, height: 768, append() {}, remove() {}, addEventListener() {}, getBoundingClientRect: () => ({ width: 1024, height: 768 }),
+    getContext: () => new Proxy({}, { get: () => () => {} }) });
+  Object.assign(globalThis, {
+    document: { createElement: el, body: { append() {} }, addEventListener() {} },
+    ResizeObserver: class { observe() {} disconnect() {} },
+    location: { href: 'https://gateway.test/' },
+    Worker: class { constructor() { workers.push(this); } postMessage() {} terminate() {} },
+    VideoEncoder: class {
+      static async isConfigSupported() { return { supported: true }; }
+      constructor() { Object.assign(this, { encodeQueueSize: 0, state: 'configured' }); }
+      configure() {}
+      encode() { throw new Error('encoder closed'); }
+      async flush() {}
+      close() { this.state = 'closed'; }
+    },
+    VideoFrame: class { constructor() { frames.push(this); } close() { this.closed = true; } },
+  });
+  const made = recordingVideo({ sid: 's', info: { width: 1024, height: 768 }, csrf: 'x' }).then(() => 'made', (e) => e.message);
+  for (let i = 0; i < 5 && !workers.length; i++) await new Promise((r) => setTimeout(r, 0));
+  const wk = workers.at(-1);
+  wk?.onmessage({ data: { t: 'cap', ms: 0 } });          // a picture asked for: the encoder throws
+  await new Promise((r) => setTimeout(r, 0));
+  wk?.onmessage({ data: { t: 'end' } });                 // (the page stopped the stream)
+  const result = await made;
+  check('video: a picture the encoder refused is closed all the same, and the video is not made', frames.length === 1 && frames[0].closed === true && result !== 'made',
+    JSON.stringify({ frames: frames.length, closed: frames[0]?.closed, result }));
+}
+
 console.log(failed ? `\n${failed} failed` : '\nAll tests passed');
 process.exit(failed ? 1 : 0);

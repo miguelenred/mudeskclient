@@ -14,7 +14,7 @@ MuDeskClient es de **copiar y pegar**: no hay que compilar nada, no usa base de 
 4. Comprueba que `https://tu-sitio/mudesk/data/web-check.txt` responde 403 o 404.
 5. El servidor web tiene que poder conectar con el puerto RDP de cada equipo remoto (3389 por defecto): cortafuegos de salida del hosting, del router y de Windows.
 
-Con Docker, un solo comando y nada más que instalar: [apartado 12](#12-opción-d-docker-para-probarlo-o-en-un-servidor-con-docker).
+Con Docker, un solo comando y nada más que instalar: [apartado 12](#12-opción-d-docker-para-probarlo-o-en-un-servidor-con-docker). En Kubernetes, un chart de Helm: [apartado 13](#13-opción-e-kubernetes-helm); en Proxmox VE, un contenedor LXC creado con un comando: [apartado 14](#14-opción-f-proxmox-ve-un-contenedor-lxc).
 
 Más detalles técnicos (Nginx, IIS, PHP-FPM, capacidad): [HOSTING](HOSTING.md).
 
@@ -91,7 +91,8 @@ Si al subir un archivo aparece «PHP no puede escribir en su carpeta temporal»,
 
 1. Abre **`https://tu-dominio/mudesk/`** en el navegador.
 2. La pantalla pide un **código de instalación**. Está en el archivo `mudesk/data/setup-code.php`, que se crea en ese momento. Ábrelo con el Administrador de archivos (**Ver** o **Editar**, no lo abras en el navegador: no mostraría nada). La segunda línea es el código, con este aspecto: `1A2B3-C4D5E-F6A7B-8C9D0`. Cópialo.
-3. Escribe el código, el nombre del administrador y una contraseña de **al menos 12 caracteres** (con 4 distintos como mínimo, que no sea una contraseña común ni contenga el nombre). El código solo sirve una vez y el archivo se borra al terminar. Sirve durante un día: después otro código ocupa su lugar en el mismo archivo (vuelve a abrirlo).
+3. Escribe el código y pulsa **Comprobar el servidor**. MuDeskClient comprueba el servidor paso a paso, cada comprobación en verde, ámbar o rojo con lo que hay que hacer cuando no está en verde: la versión, las funciones y la memoria de PHP, la carpeta de datos (que se pueda escribir y que no se pueda leer desde la web), HTTPS, un proxy delante, cómo llegan el teclado y el ratón a una sesión; y después, desde tu navegador, una petición larga como la de una sesión (12 s) y cuántas peticiones PHP atiende el servidor a la vez. Si quieres, escribe la dirección y el puerto de un equipo remoto y pulsa **Probar**: dice si responde, con NLA o TLS, o por qué no (muchas veces un cortafuegos). Las comprobaciones en rojo se pueden arreglar después; hasta entonces MuDeskClient no funcionará bien.
+4. Pulsa **Continuar** y escribe el nombre del administrador y una contraseña de **al menos 12 caracteres** (con 4 distintos como mínimo, que no sea una contraseña común ni contenga el nombre). Si el servidor atiende menos peticiones a la vez de las que necesitan 20 sesiones, una casilla marcada pone *Sesiones RDP a la vez* en lo que admite. El código solo sirve una vez y el archivo se borra al terminar. Sirve durante un día: después otro código ocupa su lugar en el mismo archivo (vuelve a abrirlo).
 
 Este código existe para que nadie más pueda adueñarse de una instalación recién copiada antes que tú.
 
@@ -103,7 +104,7 @@ Abre **`https://tu-dominio/mudesk/data/web-check.txt`**. Debe salir un error **4
 
 Algunos hostings **no dejan salir conexiones** a otros puertos, entre ellos el de Escritorio remoto. Para comprobarlo antes de nada:
 
-1. Abre `mudesk/tools/check.php` con el editor del Administrador de archivos y cambia `CAMBIAR` en la línea `const TOKEN = 'CAMBIAR';` por una palabra secreta tuya.
+1. Abre `mudesk/tools/check.php` con el editor del Administrador de archivos y cambia `CAMBIAR` en la línea `const TOKEN = 'CAMBIAR';` por un secreto tuyo de 16 caracteres o más.
 2. Copia ese archivo a la carpeta `mudesk/public/`.
 3. Abre `https://tu-dominio/mudesk/public/check.php`, escribe tu palabra secreta en *Token* y, en *RDP saliente*, la dirección de tu equipo remoto y **su puerto** (3389 si no se cambió; si tu equipo usa otro, escribe ese). Pulsa el botón de la prueba.
 4. Si dice que no puede conectar, revisa el [apartado 7, cortafuegos](#7-cortafuegos-que-hay-que-dejar-pasar).
@@ -168,7 +169,7 @@ sudo systemctl restart apache2
 
 ### 5.3 Copiar MuDeskClient
 
-Con el ZIP en tu carpeta personal:
+Con el ZIP en tu carpeta personal (uno descargado de las versiones de GitHub: compruébalo antes con el `SHA256SUMS` de esa misma versión, junto a él, con `sha256sum -c --ignore-missing SHA256SUMS`, que tiene que decir `OK`):
 
 ```bash
 sudo unzip MuDeskClient.zip -d /var/www/html/
@@ -185,6 +186,8 @@ Abre `https://IP-DEL-EQUIPO/mudesk/` (la IP se ve con `hostname -I`), acepta el 
 ```bash
 sudo cat /var/www/html/mudesk/data/setup-code.php
 ```
+
+Opcional, para menos retraso con el teclado y el ratón y menos procesos de Apache: el servicio WebSocket de MuDeskClient, montado como dice [HOSTING](HOSTING.md#websocket-opcional) (`deploy/lxc/install.sh`, [apartado 14](#14-opción-f-proxmox-ve-un-contenedor-lxc), lo monta solo).
 
 ## 6. Preparar los equipos Windows a los que te vas a conectar
 
@@ -245,6 +248,7 @@ Todo lo tuyo está en la carpeta **`data`**: usuarios, conexiones, auditoría, a
 | «Usuario o contraseña remotos incorrectos» | Usuario y contraseña de **Windows** del equipo remoto (no los de MuDeskClient). Para una cuenta local, escribe `.\usuario`; para una de dominio, `DOMINIO\usuario` (un dominio que bloquea NTLM necesita Kerberos: el dominio por su nombre DNS; README, *Limitaciones*) |
 | «El servidor solo admite la seguridad RDP antigua (Windows XP, Server 2003)…» | Pon la *Seguridad* de la conexión en *Automática* (en *Opciones avanzadas*); sus riesgos están en [SECURITY](../../SECURITY.md) |
 | «El servidor no cifra la conexión…» | El equipo está configurado para no cifrar nada, o alguien en la red se hace pasar por él: revisa su nivel de cifrado ([HOSTING](HOSTING.md#equipos-remotos)) y la red que hay en medio |
+| «El equipo usa una versión de CredSSP sin la actualización de seguridad de 2018…» | Actualiza Windows en ese equipo (Windows 7 y Server 2008 R2 sin las actualizaciones de mayo de 2018). Mientras no se pueda, un administrador puede permitirlo con `'credssp_unpatched' => true` en `config.php`, con el riesgo que explica [SECURITY](../../SECURITY.md) |
 | «El servidor está ocupado: hay demasiadas sesiones abiertas» | Se ha llegado al máximo de sesiones a la vez: inténtalo más tarde, o súbelo en *Administración → Ajustes* si el hosting lo permite ([HOSTING](HOSTING.md), *Capacidad*) |
 | La sesión se corta cada minuto y medio y vuelve a conectar | Hay un proxy delante (por ejemplo Cloudflare) que corta las conexiones largas: usa una conexión directa |
 | Página en blanco o error 500 | Mira el registro de errores de PHP del hosting (en XAMPP, `C:\xampp\php\logs\php_error_log`) |
@@ -253,7 +257,7 @@ Si nada de esto lo resuelve, el *Modo diagnóstico* de la ventana al conectar gu
 
 ## 12. Opción D: Docker (para probarlo, o en un servidor con Docker)
 
-La imagen `ghcr.io/miguelenred/mudeskclient` trae Apache, PHP 8.4 y MuDeskClient listos, con HTTPS. Un solo comando:
+La imagen `ghcr.io/miguelenred/mudeskclient` (la misma en Docker Hub como `miguelenred/mudeskclient`, desde la 1.3.0) trae Apache, PHP 8.4 y MuDeskClient listos, con HTTPS. Un solo comando:
 
 ```bash
 docker run -d --name mudesk --restart unless-stopped -p 8443:443 -v mudesk-data:/var/www/mudesk/data ghcr.io/miguelenred/mudeskclient
@@ -269,12 +273,45 @@ docker run -d --name mudesk --restart unless-stopped -p 8443:443 -v mudesk-data:
 docker compose up -d
 ```
 
-El código de instalación: `docker compose exec mudesk cat /var/www/mudesk/data/setup-code.php`. `compose.yaml` nombra la imagen de su versión (`ghcr.io/miguelenred/mudeskclient:1.2.0`, por ejemplo), que no cambia sola. Para actualizar: pon allí el número de la nueva versión y después `docker compose pull` y `docker compose up -d`. Usa la imagen publicada; para construir la imagen con el código de esa carpeta, quita el comentario de la línea `build: .` en `compose.yaml` y arráncalo con `docker compose up -d --build`. El nombre del certificado (`MUDESK_HOSTNAME`) y tu propio certificado también se ponen en ese archivo.
+El código de instalación: `docker compose exec mudesk cat /var/www/mudesk/data/setup-code.php`. `compose.yaml` nombra la imagen de su versión (`ghcr.io/miguelenred/mudeskclient:1.3.0`, por ejemplo), que no cambia sola. Para actualizar: pon allí el número de la nueva versión y después `docker compose pull` y `docker compose up -d`. Usa la imagen publicada; para construir la imagen con el código de esa carpeta, quita el comentario de la línea `build: .` en `compose.yaml` y arráncalo con `docker compose up -d --build`. El nombre del certificado (`MUDESK_HOSTNAME`) y tu propio certificado también se ponen en ese archivo.
 
 Opciones:
 
 - **Tu propio certificado**: monta una carpeta con `cert.pem` y `key.pem` en `/etc/mudesk/tls` (`-v /ruta/a/tls:/etc/mudesk/tls:ro`). Sin él, `-e MUDESK_HOSTNAME=nombre` pone ese nombre en el certificado autofirmado (también como subjectAltName, que los navegadores comprueban). Esa carpeta es un volumen propio, así que el certificado autofirmado se mantiene al rehacer el contenedor en una actualización (ponle nombre, `-v mudesk-tls:/etc/mudesk/tls`, para conservarlo con `docker rm`). El código no se puede escribir desde el servidor web (solo `data/`), y OPcache está activado.
 - **Detrás de tu proxy inverso** (Nginx, Caddy, Traefik): apúntalo a `https://contenedor:443`. Pon su dirección en `trusted_proxies` de un `config.php` montado en `/var/www/mudesk/config.php`, y deja abiertas las peticiones largas (ver [HOSTING](HOSTING.md)).
-- **Una versión**: `ghcr.io/miguelenred/mudeskclient:1.2.0` en lugar de la última.
+- **Una versión**: `ghcr.io/miguelenred/mudeskclient:1.3.0` en lugar de la última.
+- **WebSocket**: la imagen ejecuta también el servicio WebSocket de MuDeskClient detrás de su Apache, y la página lo usa cuando responde (menos retraso con el teclado y el ratón, menos procesos de Apache: [HOSTING](HOSTING.md#websocket-opcional)); `'websocket' => false` en un `config.php` montado lo desactiva. Detrás de tu proxy inverso, deja pasar también los WebSocket (Nginx: las cabeceras `Upgrade` y `Connection`) y conserva el `Host` del sitio; si no, la página sigue por HTTP.
+- **En producción**: la imagen comprueba su propia salud cada 30 s (pide `health.php` desde dentro; `docker ps` muestra *healthy*, y los orquestadores pueden usarlo; con una lista de clientes permitidos, añade `127.0.0.1`). `-e MUDESK_WORKERS=N` fija cuántos procesos de Apache pueden ir a la vez (256 por defecto, de 10 a 20000: cada sesión ocupa uno, y hasta 4 más mientras se usan su teclado y su ratón, ninguno con el servicio WebSocket; ver [HOSTING](HOSTING.md), *Capacidad*). `compose.yaml` rota los registros del contenedor (3 archivos de 10 MB), lo ejecuta con `no-new-privileges` y trae límites de memoria y CPU para quitarles el comentario y ajustarlos a las sesiones que esperes.
 
 El contenedor tiene que llegar al puerto RDP de los equipos remotos; los paquetes de Wake-on-LAN solo salen de él con `--network host` (Linux).
+
+## 13. Opción E: Kubernetes (Helm)
+
+El chart está en `deploy/helm/mudeskclient` (en el zip y en el repositorio). Ejecuta la imagen de Docker en **un solo pod** (cada sesión RDP vive en un proceso PHP de ese pod, y la carpeta de datos se escribe con bloqueos de archivo, así que nunca ejecuta dos), con sus datos en un volumen que se queda al desinstalar la versión:
+
+```bash
+helm install mudesk deploy/helm/mudeskclient
+kubectl exec deploy/mudesk-mudeskclient -- cat /var/www/mudesk/data/setup-code.php
+kubectl port-forward svc/mudesk-mudeskclient 8443:443
+```
+
+Después abre `https://localhost:8443` y escribe el código de instalación (su segunda línea). Los valores (`deploy/helm/mudeskclient/values.yaml`) fijan:
+
+- **Cómo se llega a él**: `service.type` `LoadBalancer` con `service.externalTrafficPolicy: Local` conserva la dirección de cada cliente (la usan los bloqueos de acceso y los clientes permitidos). Con `ingress.enabled` el chart crea un Ingress con lo que una sesión necesita de ingress-nginx (HTTPS hasta el pod, peticiones abiertas durante horas, nada acumulado, cuerpos de hasta 8 MB; los WebSocket pasan tal cual, para el servicio WebSocket de la imagen); entonces pon las direcciones del controlador de ingress en `trusted_proxies`, o todos los clientes cuentan como una sola dirección.
+- **Tu certificado**: `tls.existingSecret`, un secreto de tipo `kubernetes.io/tls`; sin él, se crea un certificado autofirmado al primer arranque y se guarda en un pequeño volumen propio.
+- **`config.php`**: `config`, su texto completo (ver `config.sample.php`).
+- **Tamaño**: `resources`, `workers` (procesos de Apache a la vez) y `persistence.data.size` (ver [HOSTING](HOSTING.md), *Capacidad*).
+
+El pod está listo mientras `health.php` dice que la pasarela funciona (con una lista de clientes permitidos, añade las direcciones de los nodos: el kubelet pregunta desde ellas), y vivo mientras Apache responde, así que una restauración en marcha nunca se corta con un reinicio. Tiene que llegar al puerto RDP de los equipos remotos; Wake-on-LAN no sale de la red de un pod.
+
+## 14. Opción F: Proxmox VE (un contenedor LXC)
+
+En el host de Proxmox, como root, dentro de un MuDeskClient descomprimido (el zip de una versión, o un clon del repositorio):
+
+```bash
+bash deploy/proxmox/create-lxc.sh --hostname mudesk --storage local-lvm --bridge vmbr0
+```
+
+Crea un contenedor Debian 12 sin privilegios (2 núcleos, 2 GB y 8 GB de disco por defecto; `--cores`, `--memory`, `--disk`, `--ip 192.168.1.50/24 --gw 192.168.1.1` para una dirección fija, `--id`, `--version`, `--workers`), que arranca con el host, e instala en él MuDeskClient (el mismo desde el que se ejecuta; con `--version`, esa versión de GitHub) con `deploy/lxc/install.sh`: Apache y PHP de Debian, HTTPS con un certificado autofirmado (o el tuyo en `/etc/mudesk/tls`), solo `public/` servido, HTTP sin cifrar enviado a HTTPS, los ajustes de Apache y PHP de la imagen de Docker y el servicio WebSocket (el servicio de systemd `mudesk-ws`). Al terminar muestra la dirección y el código de instalación.
+
+`deploy/lxc/install.sh` también funciona solo, como root, en cualquier Debian 12 o posterior o Ubuntu 22.04 o posterior (otro contenedor LXC, una máquina virtual, un servidor): `bash install.sh` descarga la última versión (`--version X.Y.Z` para otra, `--from CARPETA` para una descomprimida) y comprueba su ZIP con el `SHA256SUMS` publicado con ella (se detiene si no coinciden). Ejecútalo de nuevo para actualizar: se sustituye el código y se quedan `data/` y `config.php` (en el contenedor creado arriba: `pct exec ID -- bash /root/mudesk-install.sh`).

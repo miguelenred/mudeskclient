@@ -18,6 +18,17 @@ final class Rdpsnd implements Channel
     /** server format index => client list index */
     private array $map = [];
     private ?array $pending = null;
+    /**
+     * Wave Confirms waiting for their block to have been played: [when (microtime), timestamp, block number]. Windows
+     * Server 2003's audio driver sends two blocks ahead and takes a confirm as the block played: all confirmed on arrival,
+     * its program believed the sound over after 0.74 s, and Sound Recorder stayed "playing" with the device held. As
+     * Windows' own client does, each is sent when its block's end is played (blocks one after another), its timestamp the
+     * server's plus that time.
+     * @var list<array{0: float, 1: int, 2: int}>
+     */
+    private array $confirms = [];
+    private float $playEnd = 0.0;           // when the blocks taken so far end playing (microtime)
+    private const CONFIRMS_MAX = 64;        // waiting at most (a server sending faster than sound plays: the oldest go at once)
 
     public function __construct(private Client $c)
     {
@@ -127,6 +138,37 @@ final class Rdpsnd implements Channel
         if (isset($this->map[$fmt])) {
             $this->c->emit(Client::F_AUDIO, 'W' . pack('v', $fmt) . $samples);
         }
-        $this->send(0x05, pack('vCC', ($ts + 50) & 0xffff, $block, 0));
+        $now            = microtime(true);
+        $this->playEnd  = max($now, $this->playEnd) + self::seconds($this->map[$fmt] ?? null, strlen($samples));
+        $this->confirms[] = [$this->playEnd, ($ts + (int)round(($this->playEnd - $now) * 1000)) & 0xffff, $block];
+        if (count($this->confirms) > self::CONFIRMS_MAX) {
+            [, $at, $no] = array_shift($this->confirms);
+            $this->send(0x05, pack('vCC', $at, $no, 0));
+        }
+        $this->tick();
+    }
+
+    /** How long a block of $bytes of format $f plays (0 for one not played: confirmed at once). */
+    private static function seconds(?array $f, int $bytes): float
+    {
+        if ($f === null || $f['rate'] < 1) {
+            return 0.0;
+        }
+        return match ($f['tag']) {
+            0x0001  => $bytes / ($f['rate'] * $f['ch'] * max(1, intdiv($f['bits'], 8))),
+            0x0011  => intdiv($bytes, $f['align']) * ((intdiv($f['align'] - 4 * $f['ch'], $f['ch']) * 2) + 1) / $f['rate'],   // (samples a block)
+            default => $bytes / ($f['rate'] * $f['ch']),   // A-law, mu-law: a byte a sample
+        };
+    }
+
+    /** Sends the Wave Confirms whose block has been played; seconds until the next one is due (null: none waits). */
+    public function tick(): ?float
+    {
+        $now = microtime(true);
+        while ($this->confirms !== [] && $this->confirms[0][0] <= $now) {
+            [, $at, $no] = array_shift($this->confirms);
+            $this->send(0x05, pack('vCC', $at, $no, 0));
+        }
+        return $this->confirms === [] ? null : $this->confirms[0][0] - $now;
     }
 }

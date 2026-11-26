@@ -240,3 +240,24 @@ Medido en el equipo de pruebas (Windows 11 Pro), a través del servidor de desar
 | Cámara: la página en otra pestaña | el mismo ritmo: las imágenes las marca el temporizador de un worker (los de una página oculta van como mucho una vez por segundo) |
 | Carpeta: listar 155 archivos (`Get-ChildItem` de PowerShell) | 12,96 s con un nombre por petición (cada uno un viaje al navegador, unos 84 ms aquí), 1,0 s con los nombres enviados junto al primero y respondidos por la pasarela |
 | Carpeta: leer o escribir un archivo | en trozos de hasta 1 MB (lectura) o tal como escribe Windows; lo que escribe un programa se guarda en la carpeta del navegador al cerrar el archivo, o antes de leerlo (el navegador solo lee lo guardado), y la siguiente escritura copia antes el archivo: un programa que lee y escribe por turnos el mismo archivo grande va lento ahí. Un archivo vaciado al abrirlo no se copia antes |
+
+## El proceso PHP de una sesión, AVC444 en color completo (1.3)
+
+Medido en el equipo de pruebas (Windows 11 Pro, el servidor integrado de PHP 8.3, canal gráfico con H.264, 1024 × 768):
+
+| Qué | Medido |
+|---|---|
+| El proceso PHP que mantiene una sesión | 17 MB (13 MB propios; 7–9 MB un proceso PHP sin nada abierto); nada de CPU con el escritorio quieto |
+| Lo mismo, con texto desplazándose sin parar | 2,7 % de un núcleo a unos 100 KB/s |
+| Las dos imágenes de AVC444 unidas en color completo (el worker del navegador) | 25–35 ms de CPU para una imagen entera de 1920 × 1080 (Node.js 24 en este equipo: 25 ms con los colores de un escritorio, 33–35 ms con colores al azar); una actualización suele ser unos pocos rectángulos pequeños |
+| Una petición de entrada que el hosting rechazó (508, dos veces) | enviada de nuevo con su número, recibida a los 179 ms; no se perdió nada de lo escrito |
+
+Medido de nuevo tras la revisión de velocidad y memoria (el mismo equipo; *Priorizar el modo de gráficos H.264/AVC 444* de Windows activado):
+
+| Qué | Medido |
+|---|---|
+| El proceso PHP que mantiene una sesión por HTTP | sin cambios: 17,0 MB (12,8 MB propios), 0,1 % de un núcleo con el escritorio quieto |
+| La pasarela, con texto desplazándose sin parar (`tests/bench.mjs`, AVC444) | 2,8 % de un núcleo y 4 MB a 594 KB/s, 43 imágenes por segundo |
+| Una sesión del servicio WebSocket (Linux, PHP 8.3) | un PHP arrancado para ella: 15,9 MB residentes, 8,2 MB propios; una copia del servicio, que compiló el código una vez (lo que hace con `pcntl`): nada propio al crearse, su código compartido con el servicio y con las demás sesiones (unos 5 a 8 MB menos cada una, antes de lo que use la propia sesión) |
+| Los acuses de recibo de imagen del navegador con 60 y 120 ms de retraso (como por HTTP) | 24 y 22 imágenes por segundo frente a 14–28 en el acto (una animación a pantalla completa, H.264 codificado por el software de Windows): Windows mantiene varias imágenes en vuelo, así que la ida y vuelta HTTP de cada acuse no fija los fps |
+| Windows Server 2022 en una máquina virtual (canalización gráfica 8.1: ClearCodec y RemoteFX progresivo, sin H.264) | una animación a pantalla completa a 38–44 imágenes por segundo, 0,7–0,9 MB/s, la pasarela al 5–6 % de un núcleo y 4 MB |

@@ -108,6 +108,9 @@ final class Settings
         });
     }
 
+    /** The settings that are a yes or a no. */
+    private const YES_NO = ['ad_create', 'oidc_create', 'totp_required', 'trace_all', 'save_passwords', 'users_create_conns', 'kerberos_rc4', 'record_users'];
+
     /**
      * Validates and stores the given values; returns the new settings, or 'invalid_input' (nothing stored) for a JSON
      * list or object where text or a number goes. Only the values that change are written (see write()).
@@ -130,6 +133,11 @@ final class Settings
         }
         foreach (['ad_host', 'ad_domain', 'oidc_issuer', 'oidc_client_id', 'oidc_secret', 'oidc_label', 'oidc_claim'] as $k) {
             if (is_array($in[$k] ?? null)) {
+                return 'invalid_input';
+            }
+        }
+        foreach (self::YES_NO as $k) {                          // true or false (Http::yes): "false" or a list were taken as yes
+            if (isset($in[$k]) && Http::yes($in[$k]) === null) {
                 return 'invalid_input';
             }
         }
@@ -161,11 +169,6 @@ final class Settings
         }
         if (isset($in['oidc_claim'])) {
             $s['oidc_claim'] = $in['oidc_claim'] === 'preferred_username' ? 'preferred_username' : 'email';
-        }
-        foreach (['ad_create', 'oidc_create'] as $k) {
-            if (isset($in[$k])) {
-                $s[$k] = (bool)$in[$k];
-            }
         }
         if (isset($in['oidc_domains'])) {
             $s['oidc_domains'] = array_values(array_unique(array_filter(array_map(static fn($d) => strtolower(trim((string)$d, " @\t")),
@@ -201,9 +204,9 @@ final class Settings
                 $s[$k] = max($min, min($max, Http::int($in[$k])));   // (a float past the int range warned on PHP 8.5)
             }
         }
-        foreach (['totp_required', 'trace_all', 'save_passwords', 'users_create_conns', 'kerberos_rc4', 'record_users'] as $k) {
+        foreach (self::YES_NO as $k) {
             if (isset($in[$k])) {
-                $s[$k] = (bool)$in[$k];
+                $s[$k] = (bool)Http::yes($in[$k]);
             }
         }
         self::$saved = array_filter($s, static fn(mixed $v, string $k): bool => $v !== $was[$k], ARRAY_FILTER_USE_BOTH);

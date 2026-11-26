@@ -240,3 +240,24 @@ Measured on the test computer (Windows 11 Pro), through the dev server on the sa
 | Camera: the page in another tab | the same rate: the pictures are paced by a worker's timer (a hidden page's own timers run once a second at most) |
 | Folder: listing 155 files (PowerShell `Get-ChildItem`) | 12.96 s one name per request (each a round trip to the browser, about 84 ms here), 1.0 s with the names sent with the first one and answered by the gateway |
 | Folder: a file read or written | in pieces of up to 1 MB (a read) or as Windows writes them; what a program writes is saved in the browser's folder when it closes the file, or before it is read (the browser reads only what is saved), and the next write copies the file first: a program reading and writing the same large file by turns is slow there. A file emptied when opened is not copied first |
+
+## A session's PHP process, AVC444 in full colour (1.3)
+
+Measured on the test computer (Windows 11 Pro, PHP 8.3's built-in server, graphics pipeline with H.264, 1024 × 768):
+
+| What | Measured |
+|---|---|
+| The PHP process that holds a session | 17 MB (13 MB of its own; 7–9 MB for a PHP process with nothing open); no CPU with the desktop still |
+| The same, text scrolling without pause | 2.7 % of one core at about 100 KB/s |
+| AVC444's two pictures joined in full colour (the browser's worker) | 25–35 ms of CPU for a whole 1920 × 1080 picture (Node.js 24 on this computer: 25 ms with a desktop's colours, 33–35 ms with random ones); an update is usually a few small rectangles |
+| An input request the hosting refused (508, twice) | sent again with its number, taken at 179 ms; nothing typed lost |
+
+Measured again after the review of speed and memory (the same computer; Windows' *Prioritize H.264/AVC 444 graphics mode* on):
+
+| What | Measured |
+|---|---|
+| The PHP process that holds a session over HTTP | unchanged: 17.0 MB (12.8 MB of its own), 0.1 % of one core with the desktop still |
+| The gateway, text scrolling without pause (`tests/bench.mjs`, AVC444) | 2.8 % of one core and 4 MB at 594 KB/s, 43 frames a second |
+| A session of the WebSocket service (Linux, PHP 8.3) | a PHP started for it: 15.9 MB resident, 8.2 MB of its own; a copy of the service, which compiled the code once (what it makes with `pcntl`): nothing of its own when made, its code shared with the service and every other session (some 5 to 8 MB less each, before what the session itself uses) |
+| The browser's frame acknowledgements made 60 and 120 ms late (as over HTTP) | 24 and 22 frames a second against 14–28 at once (a full-screen animation, H.264 encoded by Windows' software): Windows keeps several frames in flight, so the HTTP round trip of each acknowledgement does not set the frame rate |
+| Windows Server 2022 in a virtual machine (graphics pipeline 8.1: ClearCodec and RemoteFX progressive, no H.264) | a full-screen animation at 38–44 frames a second, 0.7–0.9 MB/s, the gateway at 5–6 % of one core and 4 MB |

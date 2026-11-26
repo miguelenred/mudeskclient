@@ -26,7 +26,8 @@ if ($q('a') === 'download') {
     $job = $_SESSION['backups'][$id] ?? null;
     unset($_SESSION['backups'][$id]);
     Auth::release();
-    if (!is_array($job)) {
+    $key = is_array($job) ? Auth::unseal((string)$job['key'], "backup:$id") : null;   // (sealed: see admin.backup.prepare)
+    if ($key === null) {
         Http::fail('not_found', 404);
     }
     @set_time_limit(0);
@@ -36,7 +37,7 @@ if ($q('a') === 'download') {
     header('Cache-Control: no-store');
     $out = fopen('php://output', 'wb');
     try {
-        $n = Backup::write($out, (string)base64_decode((string)$job['key']), (string)base64_decode((string)$job['salt']),
+        $n = Backup::write($out, $key, (string)base64_decode((string)$job['salt']),
             ['version' => MuDesk\VERSION, 'created' => date('c'), 'by' => $u['username'], 'with' => (array)$job['with']], $entries);
     } catch (RuntimeException $e) {                // (a file that could not be read: the backup ends unfinished, refused if restored)
         error_log('MuDeskClient: a backup was cut short: ' . $e->getMessage());
@@ -52,6 +53,16 @@ if ($q('a') === 'upload' && ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     Auth::release();
     $file = Config::dir("tmp/restore-$id.mudeskbackup");
     $at   = (int)($_GET['o'] ?? 0);
+    // pieces of 8 MB at most (the page sends 2 MB), and none that would leave this server less than 512 MB free (before, no
+    // limit: an upload could fill the disk). Its whole size is unknown here: what is free is asked for each piece
+    $size = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
+    if ($size > 8 << 20) {
+        Http::fail('backup_piece', 413);
+    }
+    $free = @disk_free_space(Config::dir('tmp'));
+    if ($free !== false && $free - $size < 512 << 20) {
+        Http::fail('backup_space', 507);
+    }
     clearstatcache(true, $file);
     if ($at < 0 || ($at > 0 && (!is_file($file) || filesize($file) !== $at))) {
         Http::fail('offset');

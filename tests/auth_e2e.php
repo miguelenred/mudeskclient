@@ -32,7 +32,7 @@ final class Browser
     {
     }
 
-    /** @return array{0:int,1:array,2:float} status, JSON body, seconds */
+    /** @return array{0:int,1:array,2:float,3:string} status, JSON body, seconds, the body as it came */
     public function api(string $action, array $data = []): array
     {
         global $base;
@@ -63,7 +63,7 @@ final class Browser
         }
         $j = (array)json_decode($body, true);
         $this->csrf = $j['csrf'] ?? $this->csrf;
-        return [$code, $j, $t];
+        return [$code, $j, $t, $body];
     }
 
     /**
@@ -100,6 +100,26 @@ $file = "$data/setup-code.php";
 check('setup code file created, behind exit', is_file($file) && str_starts_with((string)file_get_contents($file), '<?php exit; ?>'));
 $code = trim(substr((string)file_get_contents($file), 15));
 
+// the guided first run (MuDesk\Setup): the server's checks, a request of a second, a long request (a line a second, each as
+// it comes), a remote computer reached; only with the setup code, and only before the administrator exists
+$guest = new Browser('10.1.0.9');
+$guest->api('state');
+[$noCode] = $guest->api('setup.check');
+[$badCode] = $guest->api('setup.check', ['setup_code' => 'AAAAA-BBBBB-CCCCC-DDDDD']);
+[$chkCode, $chk] = $admin->api('setup.check', ['setup_code' => $code]);
+$chkState = array_column($chk['checks'] ?? [], 'state', 'id');
+check('guided setup: the server\'s checks only with the code, every one, each ok, warn or fail (HTTPS through the trusted proxy, the data folder writable)',
+    $noCode === 403 && $badCode === 403 && $chkCode === 200 && array_keys($chkState) === ['php', 'functions', 'memory', 'time_limit', 'display_errors',
+    'data_writable', 'tmp_writable', 'data_protected', 'https', 'proxy', 'input', 'opcache'] && array_diff($chkState, ['ok', 'warn', 'fail']) === []
+    && $chkState['https'] === 'ok' && $chkState['proxy'] === 'ok' && $chkState['data_writable'] === 'ok' && $chkState['functions'] === 'ok');
+[$waitCode, $wait, $waitT] = $admin->api('setup.wait', ['setup_code' => $code]);
+check('guided setup: a request of a second, with when the server began and ended it', $waitCode === 200 && ($wait['end'] ?? 0) - ($wait['start'] ?? 0) >= 0.99 && $waitT >= 0.99,
+    sprintf('%d, %.3f s on the server, %.3f s here', $waitCode, ($wait['end'] ?? 0) - ($wait['start'] ?? 0), $waitT));
+[$streamCode, , $streamT, $streamBody] = $admin->api('setup.stream', ['setup_code' => $code, 'seconds' => 2]);
+check('guided setup: a long request, a line a second', $streamCode === 200 && preg_split('/\s+/', trim($streamBody)) === ['1', '2'] && $streamT >= 1.9);
+[, $rdpBad] = $admin->api('setup.rdp', ['setup_code' => $code, 'host' => 'no valid name!', 'port' => 3389]);
+check('guided setup: a remote computer with a name that is none: said', ($rdpBad['ok'] ?? null) === false && ($rdpBad['problem'] ?? '') === 'address');
+
 [$c] = $admin->api('setup', ['username' => 'admin', 'password' => $pass]);
 check('setup refused without the code', $c === 403);
 [$c] = $admin->api('setup', ['setup_code' => 'AAAAA-BBBBB-CCCCC-DDDDD', 'username' => 'admin', 'password' => $pass]);
@@ -114,6 +134,8 @@ clearstatcache();
 check('setup code deleted after use', !is_file($file));
 [$c] = (new Browser('10.1.0.2'))->api('setup', ['setup_code' => $code, 'username' => 'evil', 'password' => $pass]);
 check('second setup refused', $c === 403);
+[$c] = $admin->api('setup.check', ['setup_code' => $code]);
+check('guided setup: no checks once the administrator exists', $c === 403);
 
 // test settings: small global limit
 [$c] = $admin->api('admin.settings', ['settings' => ['login_max_attempts' => 5, 'login_lock_minutes' => 15, 'login_global_max' => 12]]);
@@ -133,7 +155,11 @@ $ok->api('state');
 [$c, , $t] = $ok->api('login', ['username' => 'admin', 'password' => $pass]);
 $times[] = $t;
 check('login ok', $c === 200);
-check('every login answer takes the same time', max($times) - min($times) < 0.15 && min($times) >= 0.95, implode(' / ', array_map(static fn($x) => sprintf('%.2fs', $x), $times)));
+// the failures (no such user, a wrong password) take the same second; the sign-in that works, at least that second: opening
+// its data key (PBKDF2, 400,000 rounds) and checking the password can take more on a slow computer (0.9 to 1.2 s here with
+// PHP 8.1 and 8.2), which says nothing the answer does not (before, all three compared, failing there by chance)
+check('every login answer takes at least a second, every failure the same', abs($times[0] - $times[1]) < 0.15 && min($times) >= 0.95,
+    implode(' / ', array_map(static fn($x) => sprintf('%.2fs', $x), $times)));
 
 // session bound to the browser
 $thief = new Browser('10.3.0.1', 'OtherBrowser/9');

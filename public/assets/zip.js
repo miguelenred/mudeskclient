@@ -22,6 +22,17 @@ export const ZIP_MAX_ENTRIES = 0xffff;
  * files: [{name, parts: Uint8Array[], crc, dir}] -> Blob. Throws past 65,535 entries or 4 GB: the counts and offsets of a
  * ZIP are 16 and 32 bits, and they wrapped around into a broken file.
  */
+/**
+ * A path made safe as a name inside a ZIP (as Files::zipName on the gateway, which already did it for a remote computer's
+ * names: here once more): no control characters, nothing Windows refuses (< > : " | ? *, a trailing dot or space, a device
+ * name), none of the look-alikes of / \ : . that unzippers using Windows' older text functions turn into the real ones;
+ * each made "_", "." and ".." left out.
+ */
+export function zipName(path) {
+  return String(path).split(/[\\/]+/).map((p) => p.replace(/[\x00-\x1f\x7f<>:"|?*．／＼：∕⁄﹨¥₩]/g, '_').replace(/[. ]+$/, ''))
+    .filter((p) => p !== '').map((p) => (/^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$|clock\$)(\..*)?$/i.test(p) ? '_' + p : p)).join('/');
+}
+
 export function zipBlob(files) {
   if (files.length > ZIP_MAX_ENTRIES) throw new Error('ZIP: more than 65,535 entries');
   const enc = new TextEncoder();
@@ -33,7 +44,7 @@ export function zipBlob(files) {
       ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()];
   })();
   for (const f of files) {
-    const name = enc.encode(f.name.replace(/\\/g, '/') + (f.dir ? '/' : ''));
+    const name = enc.encode((zipName(f.name) || '_') + (f.dir ? '/' : ''));
     const size = f.dir ? 0 : f.parts.reduce((n, x) => n + x.length, 0);   // what arrived (a file may shrink after copying)
     if (size > 0xffffffff || offset > 0xffffffff) throw new Error('ZIP: over 4 GB');
     const head = (sig, extra) => {

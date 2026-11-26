@@ -1,0 +1,51 @@
+{{/* MuDeskClient - https://miguelenred.es/mudeskclient - Apache License 2.0 */}}
+{{- if not .Values.persistence.data.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "mudesk.fullname" . }}-data
+  labels:
+    {{- include "mudesk.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep   # the data stays when the release is uninstalled
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.persistence.data.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.data.size }}
+{{- end }}
+{{- if not .Values.tls.existingSecret }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "mudesk.fullname" . }}-tls
+  labels:
+    {{- include "mudesk.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep   # the self-signed certificate users accepted stays too
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.persistence.tls.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.tls.size }}
+{{- end }}
+{{- if .Values.config }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "mudesk.fullname" . }}-config
+  labels:
+    {{- include "mudesk.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  config.php: |
+    {{- .Values.config | nindent 4 }}
+{{- end }}

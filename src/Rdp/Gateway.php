@@ -74,6 +74,11 @@ final class Gateway
     /** 'websocket', 'http' (the older transport of two connections) or 'rpc' (RPC over HTTP); how the user signed in: 'kerberos' or 'ntlm' */
     public string $transport = 'websocket';
     public string $auth = '';
+    /**
+     * Tests against a real gateway only: the transport taken whatever it offers ('http': the older one of two connections,
+     * as Windows Server 2012 and 2012 R2 have; 'rpc': RPC over HTTP, as 2008 and 2008 R2), else null (the best it has).
+     */
+    public static ?string $only = null;
     /** @var array<string,string> its cookies (a balancer in front of several gateways keeps the sign-in on one of them) */
     private array $cookies = [];
     private Kerberos|false|null $krb = null;    // its Kerberos ticket (null: not tried yet; false: none to be had, or refused)
@@ -120,8 +125,13 @@ final class Gateway
         $hostHeader   = (str_contains($gwHost, ':') ? "[$gwHost]" : $gwHost) . ($port !== 443 ? ":$port" : '');
         $this->connId = vsprintf('{%s-%s-%s-%s-%s}', self::guidParts());
         $creds        = [$gwHost, $user, $domain, $password, self::bindings($cert)];
+        if (self::$only === 'rpc') {
+            $this->rpcOpen($hostHeader, $gwHost, $ip, $port, $user, $domain, $password, $creds[4], $target, $targetPort, $clientName, $consent);
+            $this->pair();
+            return;
+        }
         try {
-            $status = $this->signIn('RDG_OUT_DATA', $hostHeader, true, ...$creds);
+            $status = $this->signIn('RDG_OUT_DATA', $hostHeader, self::$only !== 'http', ...$creds);
         } catch (ProtocolException $e) {
             if (!$this->noHttpTransport) {
                 throw $e;
@@ -166,10 +176,10 @@ final class Gateway
         $key    = self::tlsKey($gwHost, $port);
         $seen   = Transport::tlsSeen($key);
         for ($legacy = $seen === 'legacy'; ; $legacy = true) {
-            // (its certificate pinned, as a computer's: OpenSSL's security level 0, as Transport's, for a Windows Server 2008 R2
-            // or 2012 gateway with a SHA-1 or 1024-bit certificate, or only TLS 1.0, which a level 2 system refused)
+            // (its certificate pinned, as a computer's: OpenSSL's security level 1, as Transport's, for a Windows Server 2008 R2
+            // or 2012 gateway with a 1024-bit certificate, which a level 2 system refused; 0 only for TLS 1.0, which needs it)
             $ctx  = stream_context_create(['socket' => ['tcp_nodelay' => true], 'ssl' => ['verify_peer' => false, 'verify_peer_name' => false,
-                'allow_self_signed' => true, 'capture_peer_cert' => true, 'SNI_enabled' => $byName, 'security_level' => 0,
+                'allow_self_signed' => true, 'capture_peer_cert' => true, 'SNI_enabled' => $byName, 'security_level' => $legacy ? 0 : Transport::SECURITY_LEVEL,
                 'ciphers' => Transport::tlsCiphers($legacy)] + ($byName ? ['peer_name' => $gwHost] : [])]);
             $addr = str_contains($ip, ':') ? "[$ip]" : $ip;
             // the TCP connection, then the handshake (both within the wait: PHP applies a client's connection timeout to it)
@@ -218,7 +228,7 @@ final class Gateway
                 stream_context_create(['socket' => ['tcp_nodelay' => true]])) ?: null;
         }
         $ctx = stream_context_create(['socket' => ['tcp_nodelay' => true], 'ssl' => ['verify_peer' => false, 'verify_peer_name' => false,
-            'allow_self_signed' => true, 'capture_peer_cert' => true, 'security_level' => 0, 'SNI_enabled' => false]]);   // (as Transport's)
+            'allow_self_signed' => true, 'capture_peer_cert' => true, 'security_level' => Transport::SECURITY_LEVEL, 'SNI_enabled' => false]]);   // (as Transport's)
         $in = self::$listener !== null ? @stream_socket_client('tcp://' . stream_socket_get_name(self::$listener, false), $en, $es, 2, STREAM_CLIENT_CONNECT, $ctx) : false;
         $out = false;
         for ($i = 0; $in !== false && $i < 4; $i++) {
@@ -596,6 +606,7 @@ final class Gateway
             if (microtime(true) > $end) {
                 throw new ProtocolException('Gateway: no answer', 'gateway');
             }
+            $this->flush();                                    // (pongs, a close's answer: sent while waiting too)
             $this->read($end);
         }
     }
@@ -763,6 +774,9 @@ final class Gateway
                 $data = substr($data ^ str_repeat($mask, intdiv($n, 4) + 1), 0, $n);
             }
             $op = $b0 & 0x0F;
+            if ($op >= 0x8 && ($n > 125 || !($b0 & 0x80))) {    // a control frame: 125 bytes at most, never in pieces (RFC 6455 5.5)
+                throw new ProtocolException('Gateway: bad control frame', 'gateway');
+            }
             if ($op === 0x0 || $op === 0x1 || $op === 0x2) {   // data (and its continuations): a whole message once FIN
                 if ($this->msg === '' && ($b0 & 0x80)) {
                     $this->pkt .= $data;
@@ -782,7 +796,9 @@ final class Gateway
                     $this->out      .= self::frame(substr($data, 0, 2), 0x8);
                     $this->closeSent = true;
                 }
-            } elseif ($op === 0x9) {                             // ping: pong with its data
+            } elseif ($op === 0x9 && strlen($this->out) < self::OUT_HIGH) {   // ping: pong with its data
+                // (not while much waits to go: pings sent faster than the pongs left piled them up, while the tunnel's
+                // handshake read without writing, until the PHP process ran out of memory; RFC 6455 lets some go unanswered)
                 $this->out .= self::frame($data, 0xA);
             }
         }

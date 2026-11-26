@@ -422,9 +422,12 @@ final class Auth
                 $pk = $i;
             }
         }
-        if (($lock = self::lockedFor($keys)) !== null) {
-            Audit::anonymous() && Audit::log('login_fail', ['method' => 'passkey', 'reason' => 'locked_' . $lock], $u['username'] ?? null, false);
-            return $lock === 'ip' ? 'locked_ip' : 'invalid';
+        // only this address's own lock: a passkey cannot be guessed, so the locks of the user and of everybody (made by failed
+        // passwords, anyone's) never keep its owner out. Before, five failed passwords for the name, from anywhere, kept the
+        // administrator's passkey out of a new computer while the lock lasted
+        if (($lock = self::lockedFor($keys)) === 'ip') {
+            Audit::anonymous() && Audit::log('login_fail', ['method' => 'passkey', 'reason' => 'locked_ip'], $u['username'] ?? null, false);
+            return 'locked_ip';
         }
         $count = $pk === null || !$u['enabled'] ? null : WebAuthn::verify($u['passkeys'][$pk], $pending ? 'login2:' . $u['id'] : 'login',
             WebAuthn::unb64u((string)($in['clientData'] ?? '')), WebAuthn::unb64u((string)($in['authData'] ?? '')),
@@ -441,8 +444,10 @@ final class Auth
         }
         if (!$pending) {                                   // passwordless: the data key comes from the passkey
             $prf = WebAuthn::unb64u((string)($in['prf'] ?? ''));
-            $dek = $u['passkeys'][$pk]['dek'] === null || strlen($prf) !== 32 ? null
-                 : Crypto::decrypt(WebAuthn::prfKey($prf, $u['passkeys'][$pk]['id']), $u['passkeys'][$pk]['dek'], 'passkey:' . $u['id']);
+            // (one that wraps no data key, also one without the field: written by hand or restored from an older copy)
+            $wrapped = $u['passkeys'][$pk]['dek'] ?? null;
+            $dek     = !is_string($wrapped) || strlen($prf) !== 32 ? null
+                     : Crypto::decrypt(WebAuthn::prfKey($prf, $u['passkeys'][$pk]['id']), $wrapped, 'passkey:' . $u['id']);
             if ($dek === null) {
                 Audit::log('login_fail', ['method' => 'passkey', 'reason' => 'passkey_second_step_only'], $u['username'], false);
                 return 'passkey_password';
@@ -575,8 +580,9 @@ final class Auth
             return 'invalid';                      // a local user typed as DOMAIN\name: never checked against Windows
         }
         $r = $login === '' || $password === '' ? 'auth_failed' : WindowsLogin::check($login, $password);
-        if (in_array($r, ['unreachable', 'timeout', 'nla_unavailable', 'ad_cert', 'mitm', 'protocol', 'kerberos', 'kerberos_integrity'], true)) {
-            // the computer that checks them did not (down, or not the one pinned): not the user's failure, so not counted
+        if (in_array($r, ['unreachable', 'timeout', 'nla_unavailable', 'ad_cert', 'mitm', 'protocol', 'kerberos', 'kerberos_integrity', 'credssp_unpatched'], true)) {
+            // the computer that checks them did not (down, not the one pinned, or its CredSSP without the 2018 update): not
+            // the user's failure, so not counted
             Audit::log('login_fail', ['method' => 'windows', 'reason' => $r], $name, false);
             return 'ad_unavailable';
         }
@@ -654,6 +660,24 @@ final class Auth
             Audit::log('login_fail', ['method' => $how, 'reason' => 'outside_hours'], $u['username'], false);
             return 'outside_hours';
         }
+        $previous = self::previous($u);
+        $known    = self::device($u);
+        $dev      = $known ?? bin2hex(random_bytes(12));
+        $ip       = Http::clientIp();
+        // the user's record first: when it cannot be written (its file damaged, or locked on Windows), no session opens. Before,
+        // the session was filled first and stayed signed in after the error, with no login_ok in the audit
+        try {
+            $saved = Users::update($u['id'], static function (array &$x) use ($dev, $ip): void {
+                $x['last_login'] = date('c');
+                $d       = self::devices($x);
+                $d[$dev] = ['used' => time()] + ($d[$dev] ?? ['added' => time(), 'ua' => Http::browser((string)($_SERVER['HTTP_USER_AGENT'] ?? '')), 'ip' => $ip]);
+                uasort($d, static fn($a, $b) => $a['used'] <=> $b['used']);
+                $x['devices'] = array_slice($d, -20, null, true);
+            });
+        } catch (\Throwable $e) {
+            unset($_SESSION['dek']);
+            throw $e;
+        }
         session_regenerate_id(true);
         $_SESSION             = array_intersect_key($_SESSION, ['dek' => 1]);   // (the data key of this sign-in)
         $_SESSION['seen']     = time();
@@ -664,17 +688,8 @@ final class Auth
         $_SESSION['bind']     = self::binding();
         $_SESSION['sv']       = $u['sv'] ?? 1;
         $_SESSION['wid']      = bin2hex(random_bytes(16));   // this sign-in: its remote sessions end with it
-        $_SESSION['previous'] = self::previous($u);
-        $known = self::device($u);
-        $dev   = $known ?? bin2hex(random_bytes(12));
-        $ip    = Http::clientIp();
-        self::$user = Users::update($u['id'], static function (array &$x) use ($dev, $ip): void {
-            $x['last_login'] = date('c');
-            $d       = self::devices($x);
-            $d[$dev] = ['used' => time()] + ($d[$dev] ?? ['added' => time(), 'ua' => Http::browser((string)($_SERVER['HTTP_USER_AGENT'] ?? '')), 'ip' => $ip]);
-            uasort($d, static fn($a, $b) => $a['used'] <=> $b['used']);
-            $x['devices'] = array_slice($d, -20, null, true);
-        });
+        $_SESSION['previous'] = $previous;
+        self::$user = $saved;
         self::success($keys);
         Audit::log('login_ok', ['method' => $how], null, true);
         if ($known === null) {
@@ -746,15 +761,46 @@ final class Auth
     public static function storeKey(string $dek): void
     {
         $k = random_bytes(32);
-        setcookie(self::KEY_COOKIE, rtrim(strtr(base64_encode($k), '+/', '-_'), '='),
-            ['expires' => 0, 'path' => '/', 'secure' => Http::isHttps(), 'httponly' => true, 'samesite' => 'Strict']);
-        $_COOKIE[self::KEY_COOKIE] = rtrim(strtr(base64_encode($k), '+/', '-_'), '=');
-        $_SESSION['dek']           = Crypto::encrypt($k, $dek, 'session');
+        self::keyCookie($k);
+        $_SESSION['dek'] = Crypto::encrypt($k, $dek, 'session');
     }
 
     public static function dek(): ?string
     {
+        $k = self::cookieKey();
+        return $k === null || !isset($_SESSION['dek']) ? null : Crypto::decrypt($k, $_SESSION['dek'], 'session');
+    }
+
+    /**
+     * $secret sealed with this browser's session key (its cookie, made now when it has none, as storeKey() makes it): kept in
+     * the web session without being there in the clear (a backup's key: before, in the session file as it was, for whoever
+     * could read that folder). unseal() gives it back; null without that cookie.
+     */
+    public static function seal(string $secret, string $purpose): string
+    {
+        $k = self::cookieKey();
+        if ($k === null) {
+            self::keyCookie($k = random_bytes(32));       // (nothing of this session was sealed with another: dek() had none)
+        }
+        return Crypto::encrypt($k, $secret, $purpose);
+    }
+
+    public static function unseal(string $sealed, string $purpose): ?string
+    {
+        $k = self::cookieKey();
+        return $k === null ? null : Crypto::decrypt($k, $sealed, $purpose);
+    }
+
+    private static function cookieKey(): ?string
+    {
         $k = base64_decode(strtr((string)($_COOKIE[self::KEY_COOKIE] ?? ''), '-_', '+/'), true);
-        return $k === false || strlen($k) !== 32 || !isset($_SESSION['dek']) ? null : Crypto::decrypt($k, $_SESSION['dek'], 'session');
+        return $k === false || strlen($k) !== 32 ? null : $k;
+    }
+
+    private static function keyCookie(string $k): void
+    {
+        setcookie(self::KEY_COOKIE, rtrim(strtr(base64_encode($k), '+/', '-_'), '='),
+            ['expires' => 0, 'path' => '/', 'secure' => Http::isHttps(), 'httponly' => true, 'samesite' => 'Strict']);
+        $_COOKIE[self::KEY_COOKIE] = rtrim(strtr(base64_encode($k), '+/', '-_'), '=');
     }
 }

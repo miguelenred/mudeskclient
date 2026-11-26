@@ -65,6 +65,7 @@ async function imageToDib(blob) {
   const c = canvas(w, h);
   const ctx = c.getContext('2d');
   ctx.drawImage(bmp, 0, 0);
+  bmp.close();                                           // (its pixels are in the canvas now: its memory freed at once, not left to the collector)
   const px = ctx.getImageData(0, 0, w, h).data;
   const out = new Uint8Array(40 + w * h * 4);
   const dv = new DataView(out.buffer);
@@ -393,7 +394,7 @@ export class ClipboardBridge {
       sent.state = 'failed';
       this.#refreshFiles();
       this.ui.toast(t('files_sent_failed', files.length), true);
-      return;
+      return false;                                        // (a Ctrl+V that brought them presses no V: see the session's paste)
     }
     this.lastSent = '';
     const list = enc.encode('F' + JSON.stringify(files.map((f) => ({ name: f.name, size: f.size }))));
@@ -454,6 +455,13 @@ export class ClipboardBridge {
 
   clearHistory() {
     [...this.history].forEach((x) => this.forget(x));
+  }
+
+  /** The session's view left: its pictures freed (an object URL holds its image as long as the page lasts). */
+  dispose() {
+    this.clearHistory();
+    if (this.remoteImage) URL.revokeObjectURL(this.remoteImage);
+    this.remoteImage = null;
   }
 
   /** Pastes a text of the history into the active remote application (the gateway puts it on the remote clipboard, presses

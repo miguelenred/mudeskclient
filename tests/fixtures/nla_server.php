@@ -11,7 +11,8 @@ declare(strict_types=1);
 //   php nla_server.php user domain password openssl.cnf [x224|v3|tls10]   (prints the port, then one line per connection:
 //   ok|bad, creds|none, or "tls" when the TLS handshake failed; with x224, first a line "x224 <hex>" with the X.224 request
 //   it got; with v3, CredSSP version 3 as Windows 7 and Server 2008 R2 without updates speak it: the public key itself bound,
-//   the server's with its first byte plus one; with tls10, only TLS 1.0 with AES128-SHA, as they offer TLS too)
+//   the server's with its first byte plus one; with tls10, only TLS 1.0 with AES128-SHA, as they offer TLS too, and a CredSSP
+//   message split into TLS records answered as they answer it: the connection closed, "split")
 use MuDesk\Rdp\{Der, KerberosCrypto, Ntlm, Rc4};
 use MuDesk\Text;
 
@@ -36,14 +37,26 @@ $srv    = stream_socket_server('tcp://127.0.0.1:0', $en, $es, STREAM_SERVER_BIND
         + ($tls10 ? ['security_level' => 0, 'ciphers' => 'AES128-SHA:@SECLEVEL=0'] : [])]));
 echo substr((string)strrchr((string)stream_socket_get_name($srv, false), ':'), 1), "\n";
 
-$readDer = static function ($c): string {
-    $h = (string)@fread($c, 2);                              // (a connection cut during TLS warned on some versions)
+$readDer = static function ($c) use ($tls10): string {
+    // (each read up to what is asked for: a message can come in several TLS records)
+    $read = static function (int $n) use ($c): string {
+        for ($s = ''; strlen($s) < $n && ($d = @fread($c, $n - strlen($s))) !== false && $d !== '';) {
+            $s .= $d;
+        }
+        return $s;
+    };
+    $h = $tls10 ? (string)@fread($c, 2) : '';               // (a read, one TLS record at most)
+    if ($tls10 && strlen($h) === 1) {                        // the message's first record one byte (1/n-1): refused
+        echo "split\n";                                      // (then closed, as any message missing)
+        return '';
+    }
+    $h .= $read(2 - strlen($h));                             // (a connection cut during TLS warned on some versions)
     if (strlen($h) < 2) {
         return '';
     }
     $n = ord($h[1]);
     if ($n & 0x80) {
-        $ext = (string)@fread($c, $n & 0x7F);
+        $ext = $read($n & 0x7F);
         $h  .= $ext;
         $n   = (int)hexdec(bin2hex($ext));
     }
@@ -112,7 +125,7 @@ for ($last = time(); time() - $last < 60;) {                   // (on Windows an
                 throw new RuntimeException('binding');
             }
             $sBind = hash('sha256', "CredSSP Server-To-Client Binding Hash\0" . $nonce . $pubKey, true);
-            fwrite($c, $tsRequest(Der::ctx(3, Der::octet($etype === 23 ? KrbFixture::rc4Wrap($ctxKey, $ourSeq + 1, $sBind, true) : KrbFixture::wrap($ctxKey, $ourSeq + 1, $sBind)))));
+            fwrite($c, $tsRequest(Der::ctx(3, Der::octet($etype === 23 ? KrbFixture::rc4Wrap($ctxKey, $ourSeq, $sBind, true) : KrbFixture::wrap($ctxKey, $ourSeq, $sBind)))));
             $next = $readDer($c);
             if ($next === '' || !isset(($f = Der::fields(Der::value($next)))[2])) {
                 echo "ok none kerberos $who\n";
@@ -135,8 +148,19 @@ for ($last = time(); time() - $last < 60;) {                   // (on Windows an
     $msg       = "NTLMSSP\0" . pack('V', 2) . pack('vvV', strlen($target), strlen($target), 56) . pack('V', 0xE2898235) . $challenge
                . str_repeat("\0", 8) . pack('vvV', strlen($info), strlen($info), 56 + strlen($target)) . "\x0a\x00\x63\x45\x00\x00\x00\x0f" . $target . $info;
     fwrite($c, $tsRequest(Der::ctx(1, Der::seq(Der::seq(Der::ctx(0, Der::octet($msg)))))));
-    // AUTHENTICATE with the key binding: the NTLMv2 proof checked with the password; right, the binding answered
-    $f     = Der::fields(Der::value($readDer($c)));
+    // AUTHENTICATE with the key binding: the NTLMv2 proof checked with the password; right, the binding answered. None (the
+    // client gave up after the CHALLENGE, an old CredSSP refused: nothing more, or its disconnection): "drop"
+    $second = $readDer($c);
+    try {
+        $f = Der::fields(Der::value($second));
+    } catch (Throwable) {
+        $f = [];
+    }
+    if (!isset($f[1], $f[3])) {
+        echo "drop\n";
+        fclose($c);
+        continue;
+    }
     $auth  = Der::value(Der::fields(Der::value(Der::value($f[1])))[0]);
     $field = static fn(int $off): string => substr($auth, unpack('V', $auth, $off + 4)[1], unpack('v', $auth, $off)[1]);
     $nt    = $field(20);

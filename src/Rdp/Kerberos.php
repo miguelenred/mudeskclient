@@ -43,7 +43,8 @@ final class Kerberos
     /** @var string|null the context's key once the AP-REP came: the acceptor's subkey, else the initiator's */
     private ?string $key = null;
     private bool $acceptorSubkey = false;
-    private int $peerSeq = 0;
+    private int $peerSeq = 0;            // the service's next sequence number (its AP-REP's, then one more each message)
+    private bool $sequenced = false;     // replay and sequence detection asked: the service's messages checked in order
     private string $mechTypes = '';      // the mechTypes list sent, for the mechListMIC
     private ?string $cname = null;       // the client's name as the KDC gave it back (its canonical form)
     private float $deadline = 0.0;       // when the sign-in to the KDC gives up
@@ -408,7 +409,7 @@ final class Kerberos
         $salt0   = $this->realm . $this->user;                          // (the default salt)
         $nonce   = random_int(1, 0x7FFFFFFF);
         $rep     = $this->kdcCall($req('', $nonce));
-        $info    = $userKey = null;
+        $info    = $userKey = $keyInfo = null;
         for ($try = 0; ($err = self::krbError($rep)) !== null; $try++) {
             [$code, $edata, $stime, $crealm] = $err;
             if ($try >= 3) {
@@ -416,6 +417,10 @@ final class Kerberos
             } elseif ($code === 68 && $crealm !== null && $crealm !== '' && strcasecmp($crealm, $this->realm) !== 0) {
                 return strtoupper($crealm);                              // KDC_ERR_WRONG_REALM: the account's realm
             } elseif ($code === 37 && $stime !== null) {                // KRB_AP_ERR_SKEW: the KDC's time taken
+                // (within a day: the error is not authenticated, and a KDC so far off is broken; before, any time taken)
+                if (abs($stime - time()) > 86400) {
+                    throw new ProtocolException('Kerberos: the KDC\'s clock is more than a day away', 'kerberos');
+                }
                 $this->skew = $stime - time();
             } elseif ($code === 25) {                                    // KDC_ERR_PREAUTH_REQUIRED: its salt and type
                 $info = self::etypeInfo($edata, $salt0) ?? throw new ProtocolException('Kerberos: no key of a type in use for the user', 'kerberos');
@@ -428,13 +433,22 @@ final class Kerberos
                 continue;
             }
             [$etype, $salt, $iter] = $info;
-            $userKey ??= KerberosCrypto::userKey($etype, $this->password, $salt, $iter);
+            // the key of the type and salt the last PREAUTH_REQUIRED named (before, the first one's stayed when a later one named
+            // others), made again only when they change (a clock corrected asks with the same one)
+            if ($keyInfo !== $info) {
+                [$userKey, $keyInfo] = [KerberosCrypto::userKey($etype, $this->password, $salt, $iter), $info];
+            }
             $ts  = Der::seq(Der::ctx(0, self::time($this->now())), Der::ctx(1, Der::int(random_int(0, 999999))));
             $enc = Der::seq(Der::ctx(1, Der::int(2)), Der::ctx(2, Der::octet(self::encrypted($etype, KerberosCrypto::encryptFor($etype, $userKey, 1, $ts)))));
             $rep = $this->kdcCall($req($enc, $nonce));
         }
         $f = self::fieldsOf($rep, 11);
         [$etype, $cipher] = self::encData($f[6] ?? throw new ProtocolException('Kerberos: AS-REP without its part', 'kerberos'));
+        // only in a type in use: RC4 only when allowed (before, a reply in RC4 was opened with the password's NT hash whatever
+        // the setting, a KDC or someone in between choosing it without pre-authentication)
+        if (!in_array($etype, self::types(), true)) {
+            throw new ProtocolException('Kerberos: the AS-REP in an encryption type not in use', 'kerberos');
+        }
         if ($userKey === null || $info[0] !== $etype) {  // no pre-authentication asked (the salt in the reply, if any), or the reply in another key
             [, $salt, $iter] = self::etypeInfo($f[2] ?? '', $salt0, $etype) ?? [$etype, $info[1] ?? $salt0, $info[2] ?? 4096];
             $userKey = KerberosCrypto::userKey($etype, $this->password, $salt, $iter);
@@ -606,9 +620,16 @@ final class Kerberos
     // ------------------------------------------------------------------ GSS-API (RFC 4121) and SPNEGO (RFC 4178)
 
     /**
+     * GSS flags for CredSSP (RFC 4121 4.1.1.1): mutual authentication, confidentiality and integrity (0x32, the default)
+     * with replay and sequence detection (0x0C). Asked so, Windows numbers its sealed messages from its AP-REP's sequence
+     * number, and they are checked (inOrder()); not asked, it numbers them 0 (seen on Windows Server 2022, AES and RC4).
+     */
+    public const SEQUENCED = 0x3E;
+
+    /**
      * The first token for the service: SPNEGO's NegTokenInit offering Kerberos (Microsoft's OID first, as Windows does),
      * with the AP-REQ (mutual authentication) whose authenticator carries the GSS checksum (RFC 4121 4.1.1: the channel
-     * bindings' MD5, or zeros, and the context flags), a fresh subkey and the initial sequence number.
+     * bindings' MD5, or zeros, and the context flags $flags), a fresh subkey and the initial sequence number.
      */
     public function initToken(string $bindings = '', int $flags = 0x32): string
     {
@@ -619,6 +640,7 @@ final class Kerberos
         $this->seq    = random_int(0, 0x3FFFFFFF);
         $this->key    = null;
         [$this->acceptorSubkey, $this->peerSeq] = [false, 0];   // (a new context: nothing kept from the last one's AP-REP)
+        $this->sequenced = ($flags & 0x0C) !== 0;
         $cksum = Der::seq(Der::ctx(0, Der::int(0x8003)),
             Der::ctx(1, Der::octet(pack('V', 16) . ($bindings !== '' ? $bindings : str_repeat("\0", 16)) . pack('V', $flags))));
         // with channel bindings, the hint that this client sends them (MS-KILE 3.2.5.8: AD-IF-RELEVANT { AD-AUTH-DATA-AP-OPTIONS,
@@ -697,6 +719,10 @@ final class Kerberos
         if ($mic !== null && !$this->micOk($mic)) {
             throw new ProtocolException('Kerberos: mechListMIC mismatch', 'mitm');
         }
+        // (numbered as RFC 4121 says, the service's first: the next message one more; Windows' 0 is outside the sequence)
+        if ($mic !== null && $this->sequenced && $this->micSeq($mic) === $this->peerSeq) {
+            $this->peerSeq++;
+        }
         if ($state !== 1 && $state !== 3) {
             return null;
         }
@@ -721,7 +747,7 @@ final class Kerberos
             // RFC 4757 7.2: 01 01, HMAC (11 00), filler; the sequence number encrypted with the checksum's key; the checksum
             $hdr = "\x01\x01\x11\x00\xFF\xFF\xFF\xFF";
             $ck  = $this->rc4Sign(15, $hdr . $data);
-            return self::framed($hdr . $this->rc4Seq($ck, $this->seq++, false) . $ck);
+            return self::framed($hdr . $this->rc4Seq($ck, self::seqBytes($this->seq++, false)) . $ck);
         }
         $hdr = "\x04\x04" . chr($this->flags(false, false)) . "\xFF\xFF\xFF\xFF\xFF" . pack('J', $this->seq++);
         return $hdr . KerberosCrypto::checksum($this->key, 25, $data . $hdr);
@@ -741,6 +767,31 @@ final class Kerberos
             throw new ProtocolException('Kerberos: bad MIC token', 'mitm');
         }
         return hash_equals(KerberosCrypto::checksum($this->key, 23, $this->mechTypes . substr($mic, 0, 16)), substr($mic, 16));
+    }
+
+    /** The sequence number of the service's MIC token (RFC 4757's: encrypted with its checksum's key). */
+    private function micSeq(string $mic): int
+    {
+        if ($this->etype === KerberosCrypto::RC4) {
+            $t = self::unframed($mic);
+            return unpack('N', $this->rc4Seq(substr($t, 16, 8), substr($t, 8, 8)))[1];
+        }
+        return unpack('J', $mic, 8)[1];
+    }
+
+    /**
+     * The service's sealed message taken in its order (RFC 4121 4.2.6, RFC 4757 7.3): with replay and sequence detection
+     * asked (SEQUENCED), its number must be the service's next; one repeated, out of order or after one lost is refused.
+     * Before, never compared: one message of the service read in CredSSP, but nothing said it was the one expected.
+     */
+    private function inOrder(int $n): void
+    {
+        if ($this->sequenced) {
+            if ($n !== $this->peerSeq) {
+                throw new ProtocolException('Kerberos: a message of the service out of its order', 'mitm');
+            }
+            $this->peerSeq++;
+        }
     }
 
     // ------------------------------------------------------------------ RFC 4757's GSS tokens (an RC4 context key)
@@ -768,11 +819,16 @@ final class Kerberos
         return substr(hash_hmac('md5', md5(pack('V', $usage) . $data, true), hash_hmac('md5', "signaturekey\0", $this->key, true), true), 0, 8);
     }
 
-    /** The sequence number (big-endian, then the direction: 0 the initiator's, FF the acceptor's) in RC4 with the checksum's key. */
-    private function rc4Seq(string $ck, int $seq, bool $acceptor): string
+    /** The sequence number field: big-endian, then the direction (0 the initiator's, FF the acceptor's). */
+    private static function seqBytes(int $seq, bool $acceptor): string
     {
-        $k = hash_hmac('md5', $ck, hash_hmac('md5', pack('V', 0), $this->key, true), true);
-        return (new Rc4($k))->crypt(pack('N', $seq & 0xFFFFFFFF) . str_repeat($acceptor ? "\xFF" : "\0", 4));
+        return pack('N', $seq & 0xFFFFFFFF) . str_repeat($acceptor ? "\xFF" : "\0", 4);
+    }
+
+    /** The sequence number field in RC4 with the checksum's key, either way (encrypted or read). */
+    private function rc4Seq(string $ck, string $field): string
+    {
+        return (new Rc4(hash_hmac('md5', $ck, hash_hmac('md5', pack('V', 0), $this->key, true), true)))->crypt($field);
     }
 
     /** The key that seals a token's confounder and data: the context key XOR F0, then its HMAC-MD5s with 0 and the sequence number. */
@@ -796,7 +852,7 @@ final class Kerberos
             $data = $plain . "\x01";
             $ck   = $this->rc4Sign(13, $hdr . $conf . $data);
             $n    = $this->seq++;
-            return self::framed($hdr . $this->rc4Seq($ck, $n, false) . $ck . $this->rc4Seal(pack('N', $n & 0xFFFFFFFF))->crypt($conf . $data));
+            return self::framed($hdr . $this->rc4Seq($ck, self::seqBytes($n, false)) . $ck . $this->rc4Seal(pack('N', $n & 0xFFFFFFFF))->crypt($conf . $data));
         }
         $seq = pack('J', $this->seq++);
         $f   = chr($this->flags(false, true));
@@ -813,7 +869,7 @@ final class Kerberos
                 throw new ProtocolException('Kerberos: bad wrap token', 'protocol');
             }
             $ck  = substr($t, 16, 8);
-            $seq = (new Rc4(hash_hmac('md5', $ck, hash_hmac('md5', pack('V', 0), $this->key, true), true)))->crypt(substr($t, 8, 8));
+            $seq = $this->rc4Seq($ck, substr($t, 8, 8));
             if (substr($seq, 4) !== "\xFF\xFF\xFF\xFF") {                  // (the acceptor's direction)
                 throw new ProtocolException('Kerberos: wrap token not from the service', 'mitm');
             }
@@ -825,6 +881,7 @@ final class Kerberos
             if ($pad < 1 || $pad > 8 || strlen($p) < 8 + $pad || substr($p, -$pad) !== str_repeat(chr($pad), $pad)) {
                 throw new ProtocolException('Kerberos: bad wrap token padding', 'protocol');
             }
+            $this->inOrder(unpack('N', $seq)[1]);
             return substr($p, 8, strlen($p) - 8 - $pad);
         }
         if (strlen($token) < 16 + 16 + 12 || substr($token, 0, 2) !== "\x05\x04" || ($f = ord($token[2])) & 0x03 ^ 0x03 || $token[3] !== "\xFF") {
@@ -843,6 +900,7 @@ final class Kerberos
         if (strlen($p) < 16 + $ec || substr($p, -16, 6) !== "\x05\x04" . chr($f) . "\xFF" . pack('n', $ec) || substr($p, -8) !== substr($token, 8, 8)) {
             throw new ProtocolException('Kerberos: wrap token header mismatch', 'protocol');
         }
+        $this->inOrder(unpack('J', $token, 8)[1]);
         return substr($p, 0, strlen($p) - 16 - $ec);
     }
 }

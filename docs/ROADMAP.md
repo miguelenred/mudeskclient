@@ -11,7 +11,7 @@ Done with Windows 11 Pro (see [TESTING.md › Windows 11 Pro](TESTING.md#windows
 What is already done:
 
 - Screen stream decoded in a Web Worker; lookup tables and inlined hot paths in the RLE decoder.
-- Input without PHP session, up to 4 requests in flight with sequence numbers, `TCP_NODELAY`.
+- Input without PHP session, up to 4 requests in flight with sequence numbers (one the hosting refuses sent again, one at a time meanwhile), `TCP_NODELAY`.
 - The gateway does not decode bitmaps (0.19 s CPU for 34 MB).
 - Bulk compression on both links: MPPC ≈3.5× less traffic, XCRUSH (RDP 6.1, offered by default) about a third less than MPPC with less gateway CPU; bitmap cache + MemBlt (with `drawing_orders`): 1.6 MB instead of 10.9 MB together in the xrdp test.
 - Graphics pipeline with H.264 (used by the automatic mode with Windows 8.1 or later): 21 KB/s instead of 4.2 MB/s on the same animated screen (FreeRDP). With Windows 11 the version 10.7 is offered (with 8.1 Windows does not use H.264) and the animation goes from 18 to about 45 frames/s.
@@ -22,7 +22,7 @@ What is already done:
 
 - Automatic graphics mode (the default): the Windows version in the NTLM challenge decides (signed in with Kerberos, which gives none: a domain's Windows, the pipeline); Windows 8.1 or later → graphics pipeline with H.264 when the browser supports it; xrdp, TLS only and older Windows → bitmaps. A RemoteApp connection always uses bitmaps and drawing orders (no graphics pipeline).
 
-Next: AVC444 with full-resolution colour.
+Done: AVC444 with full-resolution colour (v1 and v2, checked against the protocol's layout; with Windows 11 its luma picture shown through it). Left: see Windows send the second picture (with its graphics card encoding, it sent the first one only).
 
 What is left (gains still to be measured):
 
@@ -67,8 +67,9 @@ Left:
 - **Done: session recording** (1.1), played back in the browser with the same decoders, opened from the audit. Decided: off unless the administrator records a connection; the user is told before anything is shown and while the session lasts; encrypted with a key of the server; kept 30 days (a setting) and at most 2 GB each (`record_max_mb`); watched only by administrators and auditors, each viewing audited. **Done since 1.1:** its sound and the microphone's (not the keyboard or the clipboard); started and stopped at any moment, by administrators (in the session or in *Active sessions*) and by users when allowed; downloaded as a WebM video made in the browser (WebCodecs and a WebM writer of the project's own); one started in the session made by the user's browser, of what it shows (MediaRecorder: no new connection); kept until deleted by hand by default; deleted by administrators; users' own in **Recordings**. Left: skipping still stretches.
 - **Done: sharing a session** (1.1) with a link, view only or with control (see [USAGE](USAGE.md#sharing-a-session)).
 - **Done: Remote Desktop Gateway and connection broker** (1.1): a connection through an RD Gateway (MS-TSGU over a WebSocket, over two HTTPS connections, or RPC over HTTP for Windows Server 2008 and 2008 R2; in plain PHP) and with a farm's load balance info, the broker's redirections followed (its password for the next computer given with RDSTLS); tested through an open-source gateway in front of Windows 11 (RPC over HTTP against a gateway written from the specifications), not yet against Windows Server's own gateway or a real broker.
-- **Done: older Windows** (1.1): Standard RDP Security for Windows XP and Server 2003 (only with the security *Automatic*), TLS 1.0 and CredSSP 3 for Windows 7 and Server 2008 R2, Kerberos with RC4 for Windows Server 2003 domains; their limits in [SECURITY](../SECURITY.md).
+- **Done: older Windows** (1.1): Standard RDP Security for Windows XP and Server 2003 (only with the security *Automatic*), TLS 1.0 and CredSSP 3 for Windows 7 and Server 2008 R2 (CredSSP 3 now only with `credssp_unpatched`: CVE-2018-0886), Kerberos with RC4 for Windows Server 2003 domains; their limits in [SECURITY](../SECURITY.md). After 1.2.0, tried on Windows Server 2003, 2008, 2008 R2, 2012 and 2012 R2 themselves, and TLS 1.0 made by MuDeskClient for Windows 7 and 2008 R2 as first released (PHP's cannot reach them).
 - **Done in 1.2**: the first connection to a computer confirmed by its fingerprints (SHA-256 and SHA-1), or one an administrator fixed for everyone; *Administration → Status* with charts of the last 30 days and `health.php` for monitors; encrypted backups and their restore; links for a while and guests' control lost when unused; nothing works while the data folder can be read from the web.
+- **Done in 1.3**: a guided first run that checks the server step by step; an optional WebSocket service for servers of your own (less delay and fewer processes; each session a copy of the service); a Helm chart, an installer for Debian and Ubuntu and an LXC container for Proxmox VE; the Docker image ready for production; keys and clicks a hosting refuses sent again; CredSSP without the 2018 update refused (CVE-2018-0886); fuzzing every night; AVC444 in full colour and Mem3Blt. Tested against Windows Server 2022: its own RD Gateway with its three transports, the Session Host with two users at once, RemoteApp and the MuDeskPDF printer.
 
 Other ideas: persistent bitmap cache, copy of the audit to an external syslog server (stronger proof than the HMAC chain, whose key lives on the same server). Smart cards are not possible: a browser cannot let the gateway use the card's private key.
 
@@ -76,7 +77,7 @@ Other ideas: persistent bitmap cache, copy of the audit to an external syslog se
 
 | Decision | Reason |
 |---|---|
-| One long HTTP request per session | Shared hosting: no daemons, no WebSocket |
+| One long HTTP request per session, a WebSocket only where there is one | Shared hosting: no daemons, no WebSocket. On a server of your own an optional service carries the same session over a WebSocket (less delay, fewer processes), run by the same `rdp.php`, so nothing depends on it |
 | Bitmaps forwarded, decoded in JavaScript | Low CPU and memory on the hosting |
 | OpenSSL extension required | RDP requires TLS; TLS in plain PHP would be slow and unsafe. OpenSSL is bundled with PHP |
 | Kerberos when a domain controller can be reached, else NTLM | From a hosting the domain controllers are usually out of reach: NTLM then, as Windows does without a KDC (not where the domain blocks it). Kerberos with AES and, for Windows Server 2003 domains and passwords older than their domain's AES keys, RC4 (offered last), only if the administrator allows it (off by default: someone in the middle could make it be used, and the password then breaks far faster); passwords only (no smart cards) |

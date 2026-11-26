@@ -6,7 +6,7 @@
 const SEND_MS = 100;                                     // sent in pieces of about this long: fewer requests, a little more delay
 
 export class MicCapture {
-  /** o: {send(Uint8Array pcm, maxBytes, frameBytes), onError(i18n key)} */
+  /** o: {send(Uint8Array pcm, maxBytes, frameBytes), onError(i18n key), onLive(on): the microphone taken or let go} */
   constructor(o) {
     Object.assign(this, o);
     this.run = 0;                                        // each start; an older one still starting gives up
@@ -53,6 +53,7 @@ export class MicCapture {
       ctx.createMediaStreamSource(stream).connect(node);
       node.connect(ctx.destination);                     // (silent: kept running by the page's audio output)
       this.live = { stream, ctx };
+      this.onLive?.(true);
       this.unlock();
     } catch (e) {
       stream?.getTracks().forEach((t) => t.stop());
@@ -75,6 +76,7 @@ export class MicCapture {
     this.live.stream.getTracks().forEach((t) => t.stop());
     this.live.ctx.close().catch(() => {});
     this.live = null;
+    this.onLive?.(false);
   }
 
   #fail(key) {

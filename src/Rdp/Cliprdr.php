@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace MuDesk\Rdp;
 
-use MuDesk\{Audit, Config, Text};
+use MuDesk\{Audit, Config, Files, Text};
 
 /**
  * Clipboard redirection (MS-RDPECLIP): text, formatted text (HTML), images (DIB) and files in both directions.
@@ -132,7 +132,7 @@ final class Cliprdr implements Channel
                 break;
             case 2: // remote format list
                 $this->send(3, 1);
-                $this->remoteFormats($body);
+                $this->remoteFormats($body, ($flags & 0x4) !== 0);
                 break;
             case 3: // response to our format list
                 $this->lists = max(0, $this->lists - 1);
@@ -165,20 +165,33 @@ final class Cliprdr implements Channel
         }
     }
 
-    private function remoteFormats(Reader $r): void
+    /** Files of a remote copy taken at most (what a ZIP holds; the tests make it smaller) */
+    public static int $filesMax = 65535;
+
+    /** $ascii: CB_ASCII_NAMES, the short (32-byte) names in 8-bit text, not UTF-16 (MS-RDPECLIP 2.2.3.1.1.1). */
+    private function remoteFormats(Reader $r, bool $ascii = false): void
     {
         $this->stale  = $this->requested !== null;      // its answer belongs to the previous list
         $this->remote = [];
         $d            = $r->data;
-        while ($r->left() >= 4 && count($this->remote) < 1000) {   // (11 million in a 64 MB list took 450 MB and 25 s)
+        // 1000 entries read at most (11 million in a 64 MB list took 450 MB and 25 s; before, 1000 different ones: one id
+        // over and over was read to the end, 10 s of a 40 MB list), each long name 255 characters at most, as Windows' (one
+        // without its end was looked through to the end of the message)
+        for ($k = 0; $r->left() >= 4 && $k < 1000; $k++) {
             $id = $r->u32();
             if ($this->long) {
                 $end = $r->pos;
-                while ($end + 1 < strlen($d) && ($d[$end] !== "\0" || $d[$end + 1] !== "\0")) {
+                $max = min(strlen($d), $r->pos + 512);
+                while ($end + 1 < $max && ($d[$end] !== "\0" || $d[$end + 1] !== "\0")) {
                     $end += 2;
+                }
+                if ($end + 1 >= $max) {
+                    break;                              // (no end within a name's length: the rest of the list not taken)
                 }
                 $name = Text::fromUtf16(substr($d, $r->pos, $end - $r->pos));
                 $r->skip(min($r->left(), $end - $r->pos + 2));
+            } elseif ($ascii) {                         // up to its first null (before, read as UTF-16: no name was recognized)
+                $name = Text::valid(strstr($r->bytes(32) . "\0", "\0", true));
             } else {
                 $name = rtrim(Text::fromUtf16($r->bytes(32)), "\0");
             }
@@ -263,15 +276,21 @@ final class Cliprdr implements Channel
         $r           = new Reader($data);
         $n           = $r->u32();
         $this->files = [];
-        for ($i = 0; $i < $n && $r->left() >= 592; $i++) {
+        // 65,535 files at most (what a ZIP holds; before, no limit but the message's: 113,000 names took 9 s of the gateway's
+        // CPU and a 31 MB frame to the page), each name read up to its end
+        for ($i = 0; $i < $n && $i < self::$filesMax && $r->left() >= 592; $i++) {
             $d             = new Reader($r->bytes(592));
             $d->skip(36);
             $attr          = $d->u32();
             $d->skip(24);
             $hi            = $d->u32();
             $lo            = $d->u32();
-            // relative path inside the copy: no "..", "." or drive letters (they would reach the browser's ZIP)
-            $name          = implode('\\', array_diff(preg_split('~[\\\\/:]+~', Text::fromUtf16($d->bytes(520)), -1, PREG_SPLIT_NO_EMPTY), ['.', '..']));
+            $raw           = $d->bytes(520);
+            for ($end = 0; $end < 520 && substr($raw, $end, 2) !== "\0\0"; $end += 2) {
+            }
+            // relative path inside the copy, as safe in the browser's ZIP (Files::zipName: no "..", drive letters, look-alikes
+            // of separators, names Windows refuses); the same index kept (the server's files are asked for by it)
+            $name          = str_replace('/', '\\', Files::zipName(Text::fromUtf16(substr($raw, 0, $end)))) ?: '_';
             $this->files[] = ['name' => $name, 'size' => $hi * 4294967296 + $lo, 'dir' => (bool)($attr & 0x10)];
         }
         $this->audit('clip_from_remote', ['type' => 'files', 'count' => count($this->files),   // (the first 50 names, each cut)
@@ -575,6 +594,9 @@ final class Cliprdr implements Channel
     /** Message from the browser (see class comment). */
     public function fromBrowser(string $m): void
     {
+        if (($m[0] ?? '') === 'H' && strlen($m) < 5) {
+            return;                                        // (never the page's: its text's length comes first) not read as one of 0
+        }
         if (in_array($m[0] ?? '', ['X', 'H', 'B', 'F'], true)) {
             if ($this->typing !== null) {                  // copied in the browser while typing: that stays
                 $this->typing['saved'] = null;

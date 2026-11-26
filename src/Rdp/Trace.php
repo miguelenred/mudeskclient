@@ -53,7 +53,8 @@ final class Trace
     public static function cleanup(): void
     {
         foreach (glob(self::dir() . '/*.log') ?: [] as $f) {
-            if (filemtime($f) < time() - self::KEEP_DAYS * 86400) {
+            $t = @filemtime($f);                 // (removed meanwhile by another request's cleanup: no warning)
+            if ($t !== false && $t < time() - self::KEEP_DAYS * 86400) {
                 @unlink($f);
             }
         }

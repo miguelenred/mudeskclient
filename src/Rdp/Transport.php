@@ -29,11 +29,15 @@ final class Transport
     /** The Remote Desktop Gateway this connection goes through (its socket is then the client's end of a loopback pair) */
     public ?Gateway $gw = null;
 
+    /** TLS 1.0 made by MuDesk itself (startTls() with $legacy), when PHP's cannot reach the computer: see LegacyTls */
+    private ?LegacyTls $tls = null;
+
     /*
-     * TLS offered: 1.2 or later without triple DES first; TLS 1.0 and 1.1 too, triple DES last ("legacy": Windows Server 2003
-     * to 2008 R2 without updates; 2003's TLS has no AES), only to a computer never seen with the first (see tlsSeen()):
-     * someone in between who made the first handshake fail took any computer back to the weaker ones. The certificate is
-     * checked by its pinned fingerprint (OpenSSL's security level 0: a SHA-1 or 1024-bit certificate of those Windows).
+     * TLS offered: 1.2 or later without triple DES first (PHP's); TLS 1.0 ("legacy": Windows 7, Server 2008 R2, 2008 and
+     * Vista without their TLS 1.2 update) made by MuDesk itself (LegacyTls), only to a computer never seen with the first
+     * (see tlsSeen()): someone in between who made the first handshake fail took any computer back to the weaker ones.
+     * The certificate is checked by its pinned fingerprint (OpenSSL's security level 0: a SHA-1 or 1024-bit certificate of
+     * those Windows). Before, TLS 1.0 was PHP's too: it never reached Windows 7 or Server 2008 R2 as first released.
      */
     private const TLS_STORE = 'tls';                 // data/tls.json: how TLS went with each computer and gateway
     private const TLS_KEEP  = 5000;                  // computers remembered (the latest)
@@ -70,10 +74,37 @@ final class Transport
             return null;
         }
         return match ($e[0] ?? null) {
-            'modern' => time() - $e[1] < self::TLS_DAYS * 86400 ? 'modern' : null,
-            'legacy' => time() - $e[1] < self::TLS_AGAIN ? 'legacy' : null,
-            default  => null,
+            'modern'                  => time() - $e[1] < self::TLS_DAYS * 86400 ? 'modern' : null,
+            'tls10', 'none', 'legacy' => time() - $e[1] < self::TLS_AGAIN ? 'legacy' : null,   // ('legacy': written before 1.3)
+            default                   => null,
         };
+    }
+
+    /**
+     * Whether TLS worked with $key within a year (any version): a computer that then offers only Standard RDP Security is
+     * refused, not taken (someone in between answering for it). Entries of earlier versions ('legacy': TLS 1.0, or no TLS
+     * at all) do not count.
+     */
+    public static function hadTls(string $key): bool
+    {
+        try {
+            $e = \MuDesk\Store::read(self::TLS_STORE)[$key] ?? null;
+        } catch (\RuntimeException) {
+            return false;
+        }
+        return is_array($e) && in_array($e[0] ?? null, ['modern', 'tls10'], true) && is_int($e[1] ?? null) && time() - $e[1] < self::TLS_DAYS * 86400;
+    }
+
+    /** Forgets how TLS went with $key (its certificate forgotten on purpose: a computer changed to Standard RDP Security). */
+    public static function tlsForget(string $key): void
+    {
+        try {
+            \MuDesk\Store::update(self::TLS_STORE, static function (array &$d) use ($key): void {
+                unset($d[$key]);
+            });
+        } catch (\RuntimeException $x) {
+            error_log('MuDeskClient: ' . $x->getMessage());
+        }
     }
 
     /**
@@ -83,7 +114,7 @@ final class Transport
      */
     public static function tlsWorked(string $key, string $protocol): void
     {
-        $kind = in_array($protocol, ['TLSv1.2', 'TLSv1.3'], true) ? 'modern' : 'legacy';
+        $kind = in_array($protocol, ['TLSv1.2', 'TLSv1.3'], true) ? 'modern' : ($protocol === 'none' ? 'none' : 'tls10');   // ('none': no TLS shared)
         try {
             $e = \MuDesk\Store::read(self::TLS_STORE)[$key] ?? null;
             if (is_array($e) && ($e[0] ?? null) === $kind && is_int($e[1] ?? null) && time() - $e[1] < 86400) {
@@ -135,11 +166,18 @@ final class Transport
         return $this->gw === null ? [] : $this->gw->writable();
     }
 
+    /**
+     * OpenSSL's security level of PHP's TLS here (TLS 1.2 or later: TLS 1.0 is LegacyTls's): 1, keys of 1024 bits or more (a
+     * Windows Server 2008 R2 or 2012 gateway's certificate can be one of 1024 bits; a system's level 2 refused it). Before, 0
+     * on every connection: keys of 512 bits taken on the first attempt too.
+     */
+    public const SECURITY_LEVEL = 1;
+
     public function __construct(string $ip, int $port)
     {
         $ctx  = stream_context_create(['socket' => ['tcp_nodelay' => true], 'ssl' => [
             'verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true,
-            'capture_peer_cert' => true, 'security_level' => 0, 'SNI_enabled' => false,   // (the ciphers: startTls())
+            'capture_peer_cert' => true, 'security_level' => self::SECURITY_LEVEL, 'SNI_enabled' => false,   // (the ciphers: startTls())
         ]]);
         $addr = str_contains($ip, ':') ? "[$ip]" : $ip;
         // the timeout also limits the TLS handshake (PHP applies a client's connection timeout to it)
@@ -162,11 +200,14 @@ final class Transport
         return true;
     }
 
-    /** The TLS handshake: TLS 1.2 or later without triple DES, or with $legacy TLS 1.0 on and triple DES last (see tlsSeen()). */
+    /** The TLS handshake: TLS 1.2 or later without triple DES (PHP's), or with $legacy TLS 1.0 (LegacyTls; see tlsSeen()). */
     public function startTls(bool $legacy = false): \OpenSSLCertificate
     {
-        $m = self::tlsMethods($legacy);
-        stream_context_set_option($this->sock, 'ssl', 'ciphers', self::tlsCiphers($legacy));
+        if ($legacy) {
+            return $this->legacyTls();
+        }
+        $m = self::tlsMethods(false);
+        stream_context_set_option($this->sock, 'ssl', 'ciphers', self::tlsCiphers(false));
         if ($this->gw !== null) {
             // through a gateway: the handshake goes through pump(), so it is made step by step (blocking, nothing pumped it)
             $end = microtime(true) + self::WAIT;
@@ -194,19 +235,57 @@ final class Transport
         return $cert;
     }
 
+    /** TLS 1.0 made here: the handshake (through the gateway's pump() too), what came after it kept for reading. */
+    private function legacyTls(): \OpenSSLCertificate
+    {
+        $end       = microtime(true) + self::WAIT;
+        $this->tls = new LegacyTls();
+        $cert      = $this->tls->handshake(fn(string $d) => $this->write($d), function () use ($end): string {
+            while (true) {
+                $d = @fread($this->sock, 65536);
+                if ($d !== false && $d !== '') {
+                    return $d;
+                }
+                if (feof($this->sock) || microtime(true) > $end) {
+                    return '';
+                }
+                $this->wait(min(1.0, max(0.0, $end - microtime(true))));   // (moves the gateway's bytes too)
+            }
+        });
+        $this->buf .= $this->tls->open('');
+        return $cert;
+    }
+
+    /** The connection's security done (NLA's messages sent): TLS 1.0 made here splits its records from now on (LegacyTls). */
+    public function splitRecords(): void
+    {
+        if ($this->tls !== null) {
+            $this->tls->split = true;
+        }
+    }
+
     /** TLS version and cipher, for the diagnostic trace. */
     public function tlsInfo(): array
     {
+        if ($this->tls !== null) {
+            return ['protocol' => 'TLSv1', 'cipher' => $this->tls->name];
+        }
         $c = stream_get_meta_data($this->sock)['crypto'] ?? [];
         return ['protocol' => $c['protocol'] ?? '?', 'cipher' => $c['cipher_name'] ?? '?'];   // (see tlsProtocol())
     }
 
     public function send(string $data): void
     {
+        $this->bytesOut += strlen($data);
+        $this->write($this->tls !== null ? $this->tls->seal($data) : $data);
+    }
+
+    /** Writes bytes as they are (the TLS records of LegacyTls, or the stream's own). */
+    private function write(string $data): void
+    {
         if (!is_resource($this->sock)) {                       // (closed: a second disconnect, say)
             throw new ProtocolException('Connection closed', 'closed');
         }
-        $this->bytesOut += strlen($data);
         $until = microtime(true) + 30;                         // a server reading a byte now and then held the worker for ever
         while ($data !== '') {
             if (microtime(true) > $until) {
@@ -244,11 +323,11 @@ final class Transport
         for ($got = 0; $got < 4194304;) {                     // 4 MB at a time: a server sending without pause was read without end
             $d = @fread($this->sock, 65536);
             if ($d === false || $d === '') {
-                return !feof($this->sock);
+                return !feof($this->sock) && !$this->tls?->closed;
             }
             $got           += strlen($d);
             $this->bytesIn += strlen($d);
-            $this->buf     .= $d;
+            $this->buf     .= $this->tls !== null ? $this->tls->open($d) : $d;
         }
         return true;
     }

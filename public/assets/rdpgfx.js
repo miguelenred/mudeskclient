@@ -25,6 +25,10 @@ const ZGFX_MATCH = Uint8Array.from(ZGFX_TOKENS, (t) => t[3]), ZGFX_BASE = Int32A
 const HISTORY = 2500000;
 const ZGFX_MAX = 1 << 26;                          // largest decompressed message accepted (64 MB: a 4K picture uncompressed is 33 MB)
 const CACHE_MAX = 100 * 1048576;                   // the bitmap cache a server may fill (MS-RDPEGFX: 100 MB, 16 MB thin client)
+const SLOTS_MAX = 25600;                           // the cache's slots (MS-RDPEGFX MaxCacheSlots): 1 to this
+// rectangles of an H.264 message taken one by one at most (more: their bounding box). Before, each went into the queue: a
+// few hundred bytes brought 100,000 (60 s of the worker), 11 KB 6.7 million (hours, and 775 MB)
+const RECTS_MAX = 64;
 
 export class Zgfx {
   constructor() {
@@ -101,6 +105,7 @@ export class Zgfx {
           count += v;
         } else cur &= (1 << curBits) - 1;
         if (o + count > end) throw new Error('ZGFX: segment too long');
+        if (dist > HISTORY) throw new Error('ZGFX: match beyond the history');   // (its tokens reach 33 MB back: it read before the ring)
         let src = (hpos - dist + HISTORY) % HISTORY;
         for (let i = 0; i < count; i++) {                // byte by byte: the source may overlap what is written
           buf[o++] = h[hpos] = h[src];
@@ -148,7 +153,9 @@ export class Zgfx {
       at = this.#segment(u8.subarray(p + 4, p + 4 + len), buf, at);
       p += 4 + len;
     }
-    return at === size ? buf : buf.subarray(0, at);
+    // (exactly the size said: shorter was taken, and the 64 MB a 7-byte header asked for kept alive by what referred to it)
+    if (at !== size) throw new Error('ZGFX: not the size said');
+    return buf;
   }
 }
 
@@ -304,13 +311,16 @@ export class ClearCodec {
 
   #subcodecs(s, out, width, height) {
     const dv = new DataView(s.buffer, s.byteOffset, s.byteLength);
-    let p = 0;
+    let p = 0, area = 0;
     while (p + 13 <= s.length) {
       const x0 = dv.getUint16(p, true), y0 = dv.getUint16(p + 2, true), w = dv.getUint16(p + 4, true), h = dv.getUint16(p + 6, true);
       const len = dv.getUint32(p + 8, true), id = s[p + 12];
       const data = s.subarray(p + 13, p + 13 + len);
       p += 13 + len;
       if (x0 + w > width || y0 + h > height) continue;   // not within the rectangle (its size, from the data, asked for gigabytes)
+      // all of them over the rectangle once at most (before, empty ones of 13 bytes each drew the whole rectangle: 2.6 KB took
+      // 4 s), an uncompressed one with all its pixels (as the specification and other clients require)
+      if ((area += w * h) > width * height || (id === 0 && data.length < w * h * 3)) throw new Error('ClearCodec: subcodecs beyond their data');
       if (id === 0) {                                    // uncompressed: straight into place
         for (let y = 0, i = 0; y < h; y++) for (let x = 0, o = (y0 + y) * width + x0; x < w; x++, i += 3) out[o++] = bgr(data, i);
         continue;
@@ -416,9 +426,10 @@ export function spsFullRange(rbsp) {
   w.copy(new Bits(r.u8), r.p);
   w.u(1, 1);
   const signal = () => { w.u(1, 1); w.u(3, 5); w.u(1, 1); w.u(1, 1); w.u(8, 1); w.u(8, 1); w.u(8, 1); };
+  const restrict = () => { w.u(1, 1); w.u(1, 1); w.ue(2); w.ue(1); w.ue(16); w.ue(16); w.ue(0); w.ue(refs); };
   if (!r.u(1)) {                                          // no VUI: write a minimal one
     w.u(2, 0); signal(); w.u(5, 0);                       // no aspect/overscan; signal; no chroma loc, timing, HRD, pic_struct
-    w.u(1, 1); w.u(1, 1); w.ue(2); w.ue(1); w.ue(16); w.ue(16); w.ue(0); w.ue(refs);   // no reordering: output each frame at once
+    restrict();                                           // no reordering: output each frame at once
     return w.bytes();
   }
   const aspect = r.u(1);
@@ -431,11 +442,51 @@ export function spsFullRange(rbsp) {
   signal();
   let stop = r.u8.length * 8 - 1;                         // the rest of the VUI is kept as is, up to the stop bit
   while (stop > r.p && !((r.u8[stop >> 3] >> (7 - (stop & 7))) & 1)) stop--;
+  // ... and when it says nothing of reordering (no bitstream_restriction: a decoder may then hold each frame until later
+  // ones come, and none comes before it is acknowledged), the same "no reordering" as above, put where that flag is
+  const at = restrictionFlag(new Bits(r.u8), r.p);
+  if (at + 1 === stop && !((r.u8[at >> 3] >> (7 - (at & 7))) & 1)) {   // (the flag 0, the stop bit right after it)
+    w.copy(r, at);
+    restrict();
+    return w.bytes();
+  }
   w.copy(r, stop);
   return w.bytes();
 }
 
-/** Annex B access unit with every SPS rewritten by spsFullRange. */
+/**
+ * Where bitstream_restriction_flag is in a VUI read up to its chroma location (H.264 E.1.1, E.1.2), or -1 when it cannot
+ * be read that way (the VUI is then kept as it is).
+ */
+function restrictionFlag(r, p) {
+  r.p = p;
+  try {
+    if (r.u(1)) { r.ue(); r.ue(); }                         // chroma_loc_info: two locations
+    if (r.u(1)) r.p += 65;                                  // timing_info: num_units_in_tick, time_scale, fixed_frame_rate_flag
+    const hrd = () => {                                     // hrd_parameters
+      const n = r.ue();
+      if (n > 31) throw new Error('SPS: bad HRD');
+      r.p += 8;                                             // bit_rate_scale, cpb_size_scale
+      for (let i = 0; i <= n; i++) { r.ue(); r.ue(); r.p++; }   // bit rate, CPB size, cbr_flag
+      r.p += 20;                                            // four delay and offset lengths
+    };
+    const nal = r.u(1);
+    if (nal) hrd();
+    const vcl = r.u(1);
+    if (vcl) hrd();
+    if (nal || vcl) r.p++;                                  // low_delay_hrd_flag
+    r.p++;                                                  // pic_struct_present_flag
+    return r.p;
+  } catch {
+    return -1;
+  }
+}
+
+/**
+ * Annex B access unit with every SPS rewritten by spsFullRange; one longer than SPS_MAX passed as it is (a real one is tens of
+ * bytes: a server's of 16 MB was gone through element by element, half a gigabyte of the page's memory).
+ */
+const SPS_MAX = 4096;
 export function fixColour(au) {
   const starts = [];
   for (let i = 0; i + 3 <= au.length; i++) if (au[i] === 0 && au[i + 1] === 0 && au[i + 2] === 1) { starts.push(i + 3); i += 2; }
@@ -445,18 +496,120 @@ export function fixColour(au) {
     let end = k + 1 < starts.length ? starts[k + 1] - 3 : au.length;
     if (k + 1 < starts.length && au[end - 1] === 0) end--;         // 4-byte start code
     const nal = au.subarray(p, end);
-    parts.push(start, (nal[0] & 0x1f) === 7 ? Uint8Array.of(nal[0], ...escape(spsFullRange(unescape(nal.subarray(1))))) : nal);
+    parts.push(start, (nal[0] & 0x1f) === 7 && nal.length <= SPS_MAX ? Uint8Array.of(nal[0], ...escape(spsFullRange(unescape(nal.subarray(1))))) : nal);
   });
   const out = new Uint8Array(parts.reduce((n, x) => n + x.length, 0));
   parts.reduce((o, x) => { out.set(x, o); return o + x.length; }, 0);
   return out;
 }
 
+// ------------------------------------------------------------------ AVC444
+
+/**
+ * AVC444 (MS-RDPEGFX 3.3.8.3.2): rectangle (x0, y0, w, h) in full colour, as RGBA words (0xAABBGGRR), from the two 4:2:0
+ * pictures Windows sends: the main view (the luma, and the chroma averaged over 2 x 2 pixels) and the auxiliary one (the
+ * chroma samples the main view leaves out). main, aux: {Y, sy, U, su, V, sv} planes and strides; aux null (none yet): the
+ * main view's chroma for all four samples, a 4:2:0 picture. width, height: the surface's.
+ * - v1: odd rows from the auxiliary luma, 8 rows of U then 8 of V in turn (B4, B5); odd columns of even rows from the
+ *   auxiliary chroma (B6, B7).
+ * - v2: odd columns from the auxiliary luma, U in its left half and V in its right half (B4, B5); even columns of odd rows
+ *   from the auxiliary chroma, U at every 4th column from 0 and V from 2, each plane U in its left half and V in its right
+ *   half (B6 to B9).
+ * The sample at an even column and row is the average's: 4 times it less the other three, kept as the average when that
+ * moves it by less than 30 (the encoder's rounding otherwise shows as noise). BT.709, full range, as Windows encodes it.
+ */
+// clamped to 0-255 by a table, with no comparison to mispredict: 1920 x 1080 of varied colours in 10 ms, not 35
+const CLAMP = new Uint8Array(2048).map((_, i) => Math.max(0, Math.min(255, i - 1024)));
+const rgba = (Y, u, v) => {                      // BT.709, full range: one pixel as a signed RGBA word
+  const d = v - 128, e = u - 128, y = Y + 1024;
+  return 0xff000000 | (CLAMP[y + ((475 * e) >> 8)] << 16) | (CLAMP[y - ((48 * e + 120 * d) >> 8)] << 8) | CLAMP[y + ((403 * d) >> 8)];
+};
+
+export function yuv444Rect(main, aux, v2, x0, y0, w, h, width, height) {
+  // by blocks of 2 x 2 pixels (the four samples one 4:2:0 sample stands for, which the filter needs together), the planes
+  // and indexes in locals, words written signed (an unsigned one over 2^31 is no small integer to the engine): 1920 x 1080
+  // took 95 ms (v1) and 141 ms (v2) a sample at a time with a closure
+  const out = new Int32Array(w * h), x1 = x0 + w, y1 = y0 + h, halfW = width >> 1, quarterW = width >> 2;
+  const mY = main.Y, mU = main.U, mV = main.V, msy = main.sy, msu = main.su, msv = main.sv;
+  const aY = aux ? aux.Y : null, aU = aux ? aux.U : null, aV = aux ? aux.V : null, asy = aux ? aux.sy : 0, asu = aux ? aux.su : 0, asv = aux ? aux.sv : 0;
+  for (let by = y0 & ~1; by < y1; by += 2) {
+    const cy = by >> 1, row1 = by + 1 < height, top = by >= y0, bottom = row1 && by + 1 < y1;
+    const my0 = by * msy, my1 = my0 + msy, o0 = (by - y0) * w - x0, o1 = o0 + w;
+    const mu = cy * msu, mv = cy * msv, au = cy * asu, av = cy * asv;
+    const ru = (((cy >> 3) << 4) + (cy & 7)) * asy, rv = ru + 8 * asy, r0 = by * asy;
+    for (let bx = x0 & ~1; bx < x1; bx += 2) {
+      const cx = bx >> 1, col1 = bx + 1 < width, left = bx >= x0, right = col1 && bx + 1 < x1;
+      let u00 = mU[mu + cx], v00 = mV[mv + cx];
+      let u10 = u00, v10 = v00, u01 = u00, v01 = v00, u11 = u00, v11 = v00;
+      if (aux) {
+        if (!v2) {
+          if (col1) { u10 = aU[au + cx]; v10 = aV[av + cx]; }                                       // B6, B7
+          if (row1) {                                                                                // B4, B5
+            u01 = aY[ru + bx]; v01 = aY[rv + bx];
+            if (col1) { u11 = aY[ru + bx + 1]; v11 = aY[rv + bx + 1]; }
+          }
+        } else {
+          if (col1) {                                                                                // B4, B5
+            u10 = aY[r0 + cx]; v10 = aY[r0 + halfW + cx];
+            if (row1) { u11 = aY[r0 + asy + cx]; v11 = aY[r0 + asy + halfW + cx]; }
+          }
+          if (row1) {                                                                                // B6 to B9
+            const q = bx >> 2;
+            if (bx & 2) { u01 = aV[av + q]; v01 = aV[av + quarterW + q]; } else { u01 = aU[au + q]; v01 = aU[au + quarterW + q]; }
+          }
+        }
+        if (col1 && row1) {
+          const fu = 4 * u00 - u10 - u01 - u11, fv = 4 * v00 - v10 - v01 - v11;
+          const cu = CLAMP[fu + 1024], cv = CLAMP[fv + 1024];
+          if (cu - u00 >= 30 || u00 - cu >= 30) u00 = cu;
+          if (cv - v00 >= 30 || v00 - cv >= 30) v00 = cv;
+        }
+      }
+      if (top) {
+        if (left) out[o0 + bx] = rgba(mY[my0 + bx], u00, v00);
+        if (right) out[o0 + bx + 1] = rgba(mY[my0 + bx + 1], u10, v10);
+      }
+      if (bottom) {
+        if (left) out[o1 + bx] = rgba(mY[my1 + bx], u01, v01);
+        if (right) out[o1 + bx + 1] = rgba(mY[my1 + bx + 1], u11, v11);
+      }
+    }
+  }
+  return new Uint32Array(out.buffer);
+}
+
+/**
+ * The planes of a decoded picture ({Y, sy, U, su, V, sv, w, h}; NV12's chroma taken apart), or null when the browser gives
+ * none. spare: planes no longer used (the picture before the last one), whose memory is used again when it fits: a new
+ * buffer for each picture made some 90 MB of garbage a second at 1920 x 1080 and 30 pictures a second.
+ */
+async function framePlanes(frame, spare) {
+  try {
+    const w = frame.codedWidth & ~1, h = frame.codedHeight & ~1, rect = { x: 0, y: 0, width: w, height: h }, size = frame.allocationSize({ rect });
+    const buf = spare?.buf.length === size ? spare.buf : new Uint8Array(size);
+    const lay = await frame.copyTo(buf, { rect });
+    const p = { buf, Y: buf.subarray(lay[0].offset), sy: lay[0].stride, w, h };
+    if (frame.format === 'I420') return Object.assign(p, { U: buf.subarray(lay[1].offset), su: lay[1].stride, V: buf.subarray(lay[2].offset), sv: lay[2].stride });
+    const cw = w >> 1, ch = h >> 1, uv = buf.subarray(lay[1].offset), s = lay[1].stride;
+    const [U, V] = spare?.nv12 && spare.U.length === cw * ch ? [spare.U, spare.V] : [new Uint8Array(cw * ch), new Uint8Array(cw * ch)];
+    p.nv12 = true;
+    for (let j = 0; j < ch; j++) {
+      for (let i = 0; i < cw; i++) { U[j * cw + i] = uv[j * s + 2 * i]; V[j * cw + i] = uv[j * s + 2 * i + 1]; }
+    }
+    return Object.assign(p, { U, su: cw, V, sv: cw });
+  } catch {
+    return null;
+  } finally {
+    frame.close();
+  }
+}
+
 // ------------------------------------------------------------------ pipeline
 
 /**
  * Parses GFX PDUs and turns them into ordered drawing operations for the main thread (see gfxsurfaces.js).
- * Operations keep their order: those after an H.264 frame wait until the decoder outputs it.
+ * Operations keep their order: those after an H.264 frame wait until the decoder outputs it (or fails, or is given up on:
+ * see #unstall).
  */
 const GFX_CMDS = { 1: 'wireToSurface1', 2: 'wireToSurface2', 3: 'deleteEncodingContext', 4: 'solidFill', 5: 'surfaceToSurface', 6: 'surfaceToCache',
   7: 'cacheToSurface', 8: 'evictCache', 9: 'createSurface', 10: 'deleteSurface', 11: 'startFrame', 12: 'endFrame', 14: 'resetGraphics',
@@ -464,6 +617,8 @@ const GFX_CMDS = { 1: 'wireToSurface1', 2: 'wireToSurface2', 3: 'deleteEncodingC
 const OUTPUT_MAX = 32766;                          // largest side of the graphics output and of a desktop in RDP (MS-RDPEGFX, MS-RDPBCGR)
 const DESKTOP_MAX = 1 << 26;                       // largest desktop accepted, in pixels (8192 x 8192; 4 monitors of 4K are half of it)
 const GFX_CODECS = { 0: 'uncompressed', 3: 'remoteFX', 8: 'clearCodec', 10: 'planar', 11: 'avc420', 12: 'alpha', 14: 'avc444', 15: 'avc444v2' };
+const STALL = 1000;                                // ms an H.264 decoder may owe pictures without giving any (see #unstall)
+const REFRESH_GAP = 2000;                          // ms between two full pictures asked for (see #refresh)
 
 export class GfxPipeline {
   constructor(emit) {
@@ -473,6 +628,7 @@ export class GfxPipeline {
     this.rfx = new RfxDecoder();
     this.prog = new ProgressiveDecoder();
     this.decoders = new Map();                      // surfaceId -> {dec, pending: []}
+    this.yuv = new Map();                           // surfaceId -> AVC444: {main, aux, luma, chroma, jobs} (see #avc444)
     this.argb = new Set();                          // surfaces with an alpha channel
     this.sizes = new Map();                         // surfaceId -> [width, height]
     this.outArea = 0;                               // pixels of the graphics output (ResetGraphics)
@@ -482,6 +638,9 @@ export class GfxPipeline {
     this.idlers = [];                               // idle() waiting for that queue to empty
     this.software = false;                          // H.264 decoded in software (a recording made into a video: every picture out at once)
     this.ts = 0;
+    this.watchdog = 0;                              // timer of #unstall, while pictures are owed (started at watched)
+    this.watched = 0;
+    this.refreshed = -Infinity;                     // when a full picture was last asked for (#refresh)
     this.stats = null;                              // diagnostic mode: message and codec counts
   }
 
@@ -511,8 +670,8 @@ export class GfxPipeline {
     while (p + 8 <= data.length) {
       const cmd = dv.getUint16(p, true), len = dv.getUint32(p + 4, true);
       if (len < 8 || p + len > data.length) break;
-      if (this.stats) {
-        const k = cmd === 0x0001 ? 'wireToSurface1:' + (GFX_CODECS[dv.getUint16(p + 10, true)] ?? dv.getUint16(p + 10, true)) : GFX_CMDS[cmd] ?? 'cmd' + cmd;
+      if (this.stats) {                              // (the codec of a PDU long enough to have one: outside the try below, it threw)
+        const k = cmd === 0x0001 && len >= 12 ? 'wireToSurface1:' + (GFX_CODECS[dv.getUint16(p + 10, true)] ?? dv.getUint16(p + 10, true)) : GFX_CMDS[cmd] ?? 'cmd' + cmd;
         this.stats[k] = (this.stats[k] || 0) + 1;
       }
       try {
@@ -528,6 +687,19 @@ export class GfxPipeline {
     return { l: dv.getUint16(o, true), t: dv.getUint16(o + 2, true), r: dv.getUint16(o + 4, true), b: dv.getUint16(o + 6, true) };
   }
 
+  /** $n rectangles from $o on: as they are up to RECTS_MAX, else their bounding box (see RECTS_MAX). */
+  #rects(dv, o, n) {
+    const rects = [];
+    for (let i = 0; i < Math.min(n, RECTS_MAX + 1); i++) rects.push(this.#rect(dv, o + i * 8));
+    if (n <= RECTS_MAX) return rects;
+    const box = { l: 0xffff, t: 0xffff, r: 0, b: 0 };
+    for (let i = 0; i < n; i++) {
+      const r = this.#rect(dv, o + i * 8);
+      box.l = Math.min(box.l, r.l); box.t = Math.min(box.t, r.t); box.r = Math.max(box.r, r.r); box.b = Math.max(box.b, r.b);
+    }
+    return box.r > box.l && box.b > box.t ? [box] : [];
+  }
+
   #pdu(cmd, s, dv) {
     switch (cmd) {
       case 0x0009: {
@@ -540,17 +712,29 @@ export class GfxPipeline {
         for (const [sw, sh] of this.sizes.values()) area += sw * sh;
         if (area > 4 * Math.max(this.outArea, 1920 * 1080)) throw new Error(`GFX: surfaces of ${area} pixels`);
         if (s[6] === 0x21) this.argb.add(id); else this.argb.delete(id);
+        this.prog.deleteSurface(id);                   // (an id used again: the progressive tiles of the surface before are not its)
         this.sizes.set(id, [w, h]);
         this.#out({ op: 'create', id, w, h });
         break;
       }
       case 0x000a: {
-        const id = dv.getUint16(0, true), d = this.decoders.get(id);
+        const id = dv.getUint16(0, true), d = this.decoders.get(id), y = this.yuv.get(id);
         if (d) {                                       // close() outputs nothing more and calls no error: free the waiting frames
           for (const e of d.pending) e.ready = true;
           d.pending = [];
           d.dec.close();
           this.decoders.delete(id);
+        }
+        if (y) {                                       // (AVC444: its two decoders, and the pictures they still owed)
+          for (const k of ['luma', 'chroma']) if (y[k]) { y[k].dec.close(); y[k] = null; }
+          for (const job of y.jobs) {
+            for (const e of job.entries) e.ready = true;
+            job.luma?.frame?.close();                  // (pictures of a browser without planes, held for the other stream's)
+            job.chroma?.frame?.close();
+          }
+          y.jobs = [];                                 // (a picture still being read finds nothing left to draw)
+          this.yuv.delete(id);
+          this.#flush();
         }
         this.prog.deleteSurface(id);
         this.sizes.delete(id);
@@ -575,15 +759,23 @@ export class GfxPipeline {
         this.#out({ op: 'fill', id: dv.getUint16(0, true), color, rects });
         break;
       }
-      case 0x0005: {
-        const n = dv.getUint16(12, true), pts = [];
-        for (let i = 0; i < n; i++) pts.push([dv.getUint16(14 + i * 4, true), dv.getUint16(16 + i * 4, true)]);
-        this.#out({ op: 's2s', src: dv.getUint16(0, true), dst: dv.getUint16(2, true), rect: this.#rect(dv, 4), pts });
+      case 0x0005: {                                   // surface to surface: the rectangle inside its surface, each copy inside the other
+        const src = dv.getUint16(0, true), dst = dv.getUint16(2, true), r = this.#rect(dv, 4), n = dv.getUint16(12, true), pts = [];
+        const [sw, sh] = this.sizes.get(src) || [0, 0], [dw, dh] = this.sizes.get(dst) || [0, 0];
+        // (as FreeRDP checks: one of 65535 x 65535 grew the page's scratch canvas to that size, kept for good)
+        if (r.r < r.l || r.b < r.t || r.r > sw || r.b > sh) throw new Error('GFX: copy rectangle outside its surface');
+        for (let i = 0; i < n; i++) {
+          const x = dv.getUint16(14 + i * 4, true), y = dv.getUint16(16 + i * 4, true);
+          if (x + r.r - r.l > dw || y + r.b - r.t > dh) throw new Error('GFX: copy outside its surface');
+          pts.push([x, y]);
+        }
+        this.#out({ op: 's2s', src, dst, rect: r, pts });
         break;
       }
       case 0x0006: {                                   // surface to cache: a rectangle inside the surface, all slots within CACHE_MAX
         const id = dv.getUint16(0, true), slot = dv.getUint16(10, true), r = this.#rect(dv, 12), [sw, sh] = this.sizes.get(id) || [0, 0];
         if (r.r <= r.l || r.b <= r.t || r.r > sw || r.b > sh) throw new Error('GFX: cache rectangle outside its surface');
+        if (slot < 1 || slot > SLOTS_MAX) throw new Error('GFX: cache slot out of range');   // (65,536 tiny canvases were possible)
         const bytes = (r.r - r.l) * (r.b - r.t) * 4;
         if (this.cached - (this.slots.get(slot) || 0) + bytes > CACHE_MAX) throw new Error('GFX: bitmap cache over 100 MB');
         this.cached += bytes - (this.slots.get(slot) || 0);
@@ -646,12 +838,12 @@ export class GfxPipeline {
       }
       case 0x0003: px = this.rfx.decode(data, w, h); this.#out({ op: 'px', id, x: r.l, y: r.t, w, h, px, blend: true }, [px.buffer]); return;
       case 0x000c: { const a = this.#alpha(data, w * h); this.#out({ op: 'alpha', id, x: r.l, y: r.t, w, h, a }, [a.buffer]); return; }
-      case 0x000b: this.#avc(id, data); return;
-      case 0x000e: case 0x000f: {                      // AVC444 v1/v2: the first stream is a 4:2:0 picture of its own (its
-        const v = new DataView(data.buffer, data.byteOffset, 4).getUint32(0, true), lc = v >>> 30;   // extra chroma is left out)
-        if (lc !== 2) this.#avc(id, data.subarray(4, lc ? data.length : 4 + (v & 0x3fffffff)));     // 2: chroma-only update
+      case 0x000b: case 0x000e: case 0x000f:
+        // (not offered without WebCodecs: Drdynvc; one sent anyway queued its places and then stopped every later picture)
+        if (typeof VideoDecoder !== 'function') throw new Error('GFX: H.264 not offered');
+        if (codec === 0x000b) this.#avc(id, data);
+        else this.#avc444(id, codec === 0x000f, data);
         return;
-      }
       default: throw new Error('GFX: unsupported codec ' + codec);
     }
     this.#out({ op: 'px', id, x: r.l, y: r.t, w, h, px }, [px.buffer]);
@@ -674,18 +866,23 @@ export class GfxPipeline {
 
   #avc(id, data) {
     const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const n = dv.getUint32(0, true), rects = [];
-    for (let i = 0; i < n; i++) rects.push(this.#rect(dv, 4 + i * 8));
+    const n = data.length >= 4 ? dv.getUint32(0, true) : -1;
+    if (n < 0 || 4 + n * 10 > data.length) throw new Error('GFX: AVC420 metablock beyond its data');
+    const rects = this.#rects(dv, 4, n);
     const nal = data.subarray(4 + n * 10);
     let d = this.decoders.get(id);
     if (!d) {
       const codec = avcCodec(nal);
-      if (!codec) return;                             // wait for a key frame with SPS
-      d = { pending: [] };
+      if (!codec) { if (nal.length) this.#refresh(); return; }   // wait for a key frame with SPS (asked for)
+      d = { pending: [], last: 0 };                   // last: when it last gave a picture, or began to owe one
       d.dec = new VideoDecoder({
         output: (frame) => {
-          const entry = d.pending.shift();
-          if (!entry) { frame.close(); return; }
+          d.last = performance.now();
+          // pictures come out in the order given (the SPS says no reordering): the chunks before this one's, which the
+          // decoder dropped, go out without theirs; a picture whose entry was given up on (#unstall) is freed
+          while (d.pending.length && d.pending[0].ts < frame.timestamp) d.pending.shift().ready = true;
+          const entry = d.pending[0]?.ts > frame.timestamp ? null : d.pending.shift();
+          if (!entry) { frame.close(); this.#flush(); return; }
           entry.op.frame = frame;
           entry.transfer = [frame];
           entry.ready = true;
@@ -697,21 +894,249 @@ export class GfxPipeline {
           d.pending = [];
           this.decoders.delete(id);
           this.#flush();
+          this.#refresh();                             // (the next decoder needs a key frame)
         },
       });
       d.dec.configure({ codec, optimizeForLatency: true, colorSpace: BT709, ...(this.software ? { hardwareAcceleration: 'prefer-software' } : {}) });
       this.decoders.set(id, d);
     }
-    const entry = { op: { op: 'video', id, rects }, transfer: [], ready: false };
+    const entry = { op: { op: 'video', id, rects }, transfer: [], ready: false, ts: this.ts };   // (ts: its chunk's)
     this.queue.push(entry);
+    if (!d.pending.length) d.last = performance.now();
     d.pending.push(entry);
     try {
-      if (nal.length) { d.dec.decode(new EncodedVideoChunk({ type: isKey(nal) ? 'key' : 'delta', timestamp: this.ts++, data: fixColour(nal) })); return; }
+      if (nal.length) {
+        d.dec.decode(new EncodedVideoChunk({ type: isKey(nal) ? 'key' : 'delta', timestamp: this.ts++, data: fixColour(nal) }));
+        this.#watch();
+        return;
+      }
     } catch (e) {                                     // e.g. a delta frame first: nothing will come out for this entry
       this.emit({ op: 'log', msg: 'H.264: ' + e.message });
+      this.#refresh();
     }
     d.pending.splice(d.pending.indexOf(entry), 1);
     entry.ready = true;
     this.#flush();
+  }
+
+  /**
+   * AVC444 (v1, v2): the luma stream (a 4:2:0 picture of its own) and the chroma stream (the samples it leaves out) each go
+   * to a decoder of their own (LC: both, the luma alone or the chroma alone); once a message's pictures are out, the
+   * rectangles each stream updated are made in full colour from the latest two (yuv444Rect), in order with every other
+   * operation. Before, only the luma picture was shown (4:2:0: coloured text and thin lines blurred). A browser that gives a
+   * picture without its planes: the luma picture shown as it is, as before.
+   */
+  #avc444(id, v2, data) {
+    const head = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true), lc = head >>> 30, n1 = head & 0x3fffffff;
+    if (lc === 3 || (lc === 0 && 4 + n1 > data.length)) throw new Error('GFX: AVC444 stream sizes beyond its data');
+    const streams = lc === 0 ? [['luma', data.subarray(4, 4 + n1)], ['chroma', data.subarray(4 + n1)]] : [[lc === 1 ? 'luma' : 'chroma', data.subarray(4)]];
+    const job = { v2, need: 0, entries: [], parts: [] };   // parts: [stream, its rectangles, its H.264 data]
+    for (const [kind, s] of streams) {
+      const dv = new DataView(s.buffer, s.byteOffset, s.byteLength), n = s.length >= 4 ? dv.getUint32(0, true) : -1;
+      if (n < 0 || 4 + n * 10 > s.length) throw new Error('GFX: AVC444 metablock beyond its data');
+      job.parts.push([kind, this.#rects(dv, 4, n), s.subarray(4 + n * 10)]);
+    }
+    if (this.stats) {                                // (diagnostic mode: which streams come, and the first ones' NAL unit types)
+      this.stats['avc444:LC' + lc] = (this.stats['avc444:LC' + lc] || 0) + 1;
+      if ((this.avcNotes = (this.avcNotes || 0) + 1) <= 6) {
+        const types = (s) => { const t = []; for (let i = 0; i + 3 < s.length && t.length < 8; i++) if (s[i] === 0 && s[i + 1] === 0 && s[i + 2] === 1) t.push(s[i + 3] & 0x1f); return t.join(' '); };
+        this.emit({ op: 'note', msg: `avc444 v${v2 ? 2 : 1} LC ${lc}: ` + streams.map(([k, s]) => `${k} ${s.length} B, NAL ${types(s)}`).join('; ') });
+      }
+    }
+    let st = this.yuv.get(id);
+    if (!st) this.yuv.set(id, st = { main: null, aux: null, luma: null, chroma: null, jobs: [], spare: { luma: null, chroma: null } });
+    for (const [, rects] of job.parts) {             // (their places among the other operations, kept until the pictures are out)
+      for (let i = 0; i < rects.length; i++) {
+        const e = { op: { op: 'video', id }, transfer: [], ready: false };   // (a video without a frame draws nothing)
+        job.entries.push(e);
+        this.queue.push(e);
+      }
+    }
+    st.jobs.push(job);
+    for (const [kind, , nal] of job.parts) {
+      let d = st[kind];
+      if (!d) {
+        const codec = avcCodec(nal);
+        if (!codec) {                                  // wait for a key frame with SPS (asked for)
+          if (this.stats) this.stats[`avc444:${kind} before its SPS`] = (this.stats[`avc444:${kind} before its SPS`] || 0) + 1;
+          if (nal.length) this.#refresh();
+          continue;
+        }
+        d = st[kind] = this.#yuvDecoder(id, st, kind, codec);
+      }
+      if (!nal.length) continue;
+      job.need++;
+      const p = { job, ts: this.ts };                 // (ts: its chunk's)
+      if (!d.pending.length) d.last = performance.now();
+      d.pending.push(p);
+      try {
+        d.dec.decode(new EncodedVideoChunk({ type: isKey(nal) ? 'key' : 'delta', timestamp: this.ts++, data: fixColour(nal) }));
+        this.#watch();
+      } catch (e) {                                   // e.g. a delta frame first: nothing will come out for it
+        this.emit({ op: 'log', msg: 'H.264: ' + e.message });
+        const i = d.pending.indexOf(p);
+        if (i >= 0) { d.pending.splice(i, 1); job.need--; }
+        this.#refresh();
+      }
+    }
+    this.#yuvFlush(id, st);
+  }
+
+  #yuvDecoder(id, st, kind, codec) {
+    const d = { pending: [], last: 0 };             // pending: {job, ts}; last: as #avc's
+    d.dec = new VideoDecoder({
+      output: (frame) => {
+        d.last = performance.now();
+        // (in the order given, as #avc's: the jobs of chunks the decoder dropped go without this stream's picture)
+        while (d.pending.length && d.pending[0].ts < frame.timestamp) d.pending.shift().job.need--;
+        const job = d.pending[0]?.ts > frame.timestamp ? null : d.pending.shift()?.job;
+        if (!job) { frame.close(); this.#yuvFlush(id, st); return; }
+        const done = (p) => { job[kind] = p; job.need--; this.#yuvFlush(id, st); };
+        if (frame.format === 'I420' || frame.format === 'NV12') {
+          const spare = st.spare[kind];                // (the planes this stream's picture before the last one had)
+          st.spare[kind] = null;
+          framePlanes(frame, spare).then(done);
+        }
+        else done({ frame });                          // (no planes given: the picture itself)
+      },
+      error: (e) => {
+        this.emit({ op: 'log', msg: 'H.264: ' + e.message });
+        for (const { job } of d.pending) job.need--;   // skip the lost pictures, keep the rest in order
+        d.pending = [];
+        if (st[kind] === d) st[kind] = null;
+        this.#yuvFlush(id, st);
+        this.#refresh();                               // (the next decoder needs a key frame)
+      },
+    });
+    d.dec.configure({ codec, optimizeForLatency: true, colorSpace: BT709, ...(this.software ? { hardwareAcceleration: 'prefer-software' } : {}) });
+    return d;
+  }
+
+  /** The AVC444 messages whose pictures are all out, in their order: their rectangles drawn (see #avc444). */
+  #yuvFlush(id, st) {
+    while (st.jobs.length && st.jobs[0].need === 0) {
+      // its places in the order freed whatever happens drawing it: an error there left everything after them waiting for
+      // good, the end of frame too (no acknowledgement: the server sent nothing more)
+      const job = st.jobs.shift();
+      try {
+        this.#yuvDraw(id, st, job);
+      } catch (e) {                                    // (its rectangles undrawn; the next messages still go)
+        this.emit({ op: 'log', msg: 'gfx: ' + e.message });
+      } finally {
+        for (const e of job.entries) e.ready = true;
+      }
+    }
+    this.#flush();
+  }
+
+  #yuvDraw(id, st, job) {
+    if (this.stats) {                                  // (diagnostic mode: which way its pictures were drawn)
+      const k = job.luma?.frame ? 'avc444:4:2:0 (no planes)' : job.chroma ? 'avc444:full colour' : 'avc444:luma only';
+      this.stats[k] = (this.stats[k] || 0) + 1;
+    }
+    if (job.chroma?.frame) job.chroma.frame.close();
+    if (job.luma?.frame) {                             // no planes: the luma picture through its own rectangles (4:2:0)
+      const rects = job.parts.find(([k]) => k === 'luma')[1];
+      if (job.entries.length) Object.assign(job.entries[0], { op: { op: 'video', id, rects, frame: job.luma.frame }, transfer: [job.luma.frame] });
+      else job.luma.frame.close();
+      return;
+    }
+    // (null: its planes could not be read; those it replaces kept for the stream's next picture)
+    if (job.luma !== undefined) { st.spare.luma = st.main; st.main = job.luma; }
+    if (job.chroma !== undefined && !job.chroma?.frame) { st.spare.chroma = st.aux; st.aux = job.chroma; }
+    const m = st.main, [sw, sh] = this.sizes.get(id) || [0, 0];
+    const a = st.aux && m && st.aux.w === m.w && st.aux.h === m.h ? st.aux : null;
+    // each rectangle within the surface and the picture; a stream's rectangles over more pixels in all than there overlap
+    // (a few KB brought 10,000 over a whole 1080p surface, each converted on its own): their bounding box instead, converted
+    // once and drawn by the stream's first entry (a message converts twice the surface at most, both streams over all of it)
+    const W = Math.min(sw, m?.w ?? 0), H = Math.min(sh, m?.h ?? 0);
+    let i = 0;
+    for (const [, rects] of job.parts) {
+      const areas = [];
+      let sum = 0, x0 = W, y0 = H, x1 = 0, y1 = 0;
+      for (const r of rects) {
+        const w = Math.min(r.r, W) - r.l, h = Math.min(r.b, H) - r.t;
+        if (w <= 0 || h <= 0) { areas.push(null); continue; }
+        areas.push([r.l, r.t, w, h]);
+        sum += w * h;
+        x0 = Math.min(x0, r.l); y0 = Math.min(y0, r.t); x1 = Math.max(x1, r.l + w); y1 = Math.max(y1, r.t + h);
+      }
+      if (sum > W * H) areas.splice(0, areas.length, [x0, y0, x1 - x0, y1 - y0]);
+      for (let k = 0; k < areas.length; k++) {
+        if (!areas[k]) continue;
+        const [x, y, w, h] = areas[k], px = yuv444Rect(m, a, job.v2, x, y, w, h, sw, sh);
+        Object.assign(job.entries[i + k], { op: { op: 'px', id, x, y, w, h, px }, transfer: [px.buffer] });
+      }
+      i += rects.length;
+    }
+  }
+
+  /** The watchdog of the pictures owed, once a second while there are some (see #unstall). */
+  #watch() {
+    if (this.watchdog) return;
+    this.watched = performance.now();
+    this.watchdog = setTimeout(() => this.#unstall(), STALL);
+  }
+
+  /**
+   * The pictures a decoder owes when it gave none since the watchdog started, STALL ms ago: their operations go out without
+   * them, in their order, and a full picture is asked for. Before, an entry waited for its picture for ever, and everything
+   * after it (the end of frame too: no acknowledgement, so the server sent nothing more).
+   */
+  #unstall() {
+    this.watchdog = 0;
+    const since = this.watched;                       // (not now less STALL: a timer may come a little early)
+    let owed = false, lost = false;
+    for (const d of this.decoders.values()) {
+      if (!d.pending.length) continue;
+      if (d.last > since) { owed = true; continue; }
+      for (const e of d.pending) e.ready = true;
+      d.pending = [];
+      lost = true;
+    }
+    for (const [id, st] of this.yuv) {
+      for (const d of [st.luma, st.chroma]) {
+        if (!d?.pending.length) continue;
+        if (d.last > since) { owed = true; continue; }
+        for (const { job } of d.pending) job.need--;
+        d.pending = [];
+        lost = true;
+      }
+      this.#yuvFlush(id, st);
+    }
+    this.#flush();
+    if (lost) this.#refresh();
+    if (owed) this.#watch();
+  }
+
+  /**
+   * Asks the page for a full picture from the server (Refresh Rect): a decoder failed or lost pictures, and the next one
+   * starts at a key frame, which may not come otherwise. Once in REFRESH_GAP ms at most (a broken stream errs on every frame).
+   */
+  #refresh() {
+    const now = performance.now();
+    if (now - this.refreshed < REFRESH_GAP) return;
+    this.refreshed = now;
+    this.emit({ op: 'refresh' });
+  }
+
+  /**
+   * The connection is over or starts again (stream-worker.js): every decoder closed, AVC444's too, the pictures held
+   * freed, nothing more sent (a late picture of the connection before was drawn on the new one, its frame acknowledged).
+   */
+  dispose() {
+    this.emit = () => {};
+    clearTimeout(this.watchdog);
+    for (const d of this.decoders.values()) try { d.dec.close(); } catch { /* already closed */ }
+    for (const st of this.yuv.values()) {
+      for (const d of [st.luma, st.chroma]) try { d?.dec.close(); } catch { /* already closed */ }
+      for (const job of st.jobs) { job.luma?.frame?.close(); job.chroma?.frame?.close(); }
+      st.jobs = [];
+    }
+    for (const e of this.queue) if (e.op.op === 'video') e.op.frame?.close();   // (an end of frame's is its number)
+    this.decoders.clear();
+    this.yuv.clear();
+    this.queue = [];
+    for (const r of this.idlers.splice(0)) r();
   }
 }

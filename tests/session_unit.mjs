@@ -8,9 +8,11 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
 // the test's own clock for the session's timers (retries, resize checks): the timers due run in their order, the answers
 // between them, the same on any computer, loaded or not (checks in real time failed now and then on a busy one); a timer
 // of 0 ms stays a real one (tick)
-const testClock = () => {
-  const real = [globalThis.setTimeout, globalThis.clearTimeout];
+const testClock = (o = {}) => {
+  const real = [globalThis.setTimeout, globalThis.clearTimeout, performance.now];
   let now = 0;
+  const base = performance.now();
+  if (o.now) performance.now = () => base + now;           // (opt-in: performance.now on the same clock)
   const due = [];
   globalThis.setTimeout = (f, ms = 0, ...a) => {
     if (!(+ms > 0)) return real[0](f, 0, ...a);
@@ -35,7 +37,7 @@ const testClock = () => {
       now = end;
       await settle();
     },
-    restore() { [globalThis.setTimeout, globalThis.clearTimeout] = real; },
+    restore() { [globalThis.setTimeout, globalThis.clearTimeout] = real; if (o.now) performance.now = real[2]; },
   };
 };
 
@@ -102,10 +104,14 @@ const { SCANCODES, typedText } = await import('../public/assets/keymap.js');
 const NAMES = {};
 for (const [k, v] of Object.entries(SCANCODES)) NAMES[v] ??= k;
 
-/** Input events sent since index `from`, as text: KeyA↓, mouse:9000 (flags in hex)...; sync events left out. */
-function events(from = 0) {
+/**
+ * Input events sent since index `from`, as text: KeyA↓, mouse:9000 (flags in hex)...; sync events left out. With sid, only
+ * that connection's (a session of an earlier test, late on a busy computer, can send meanwhile).
+ */
+function events(from = 0, sid = null) {
   const out = [];
-  for (const { payload: p } of sent.slice(from)) {
+  for (const { payload: p, url } of sent.slice(from)) {
+    if (sid && !String(url).includes(`sid=${sid}`)) continue;
     if (p[0] !== 1) { out.push('msg' + p[0]); continue; }
     for (let o = 2, i = 0; i < p[1]; i++) {
       const h = p[o], type = h >> 5;
@@ -124,7 +130,9 @@ async function session(o = {}) {
     onState: (st, i) => states.push(st + (i.end ? ':' + i.end : '')), ...o });
   s.start();
   await tick();
-  const wk = workers.at(-1);
+  // its own worker (the newest one could be another's: a session of an earlier test connecting again meanwhile, on a busy
+  // computer, took this one's token and "connected", and this one sent nothing)
+  const wk = s.worker;
   const status = (j) => wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify(j)) } });
   status({ token: 't' });
   status({ connected: true });
@@ -588,7 +596,97 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   check('worker: a recording made into a video at once, its pictures asked for in time and waited for (not for sound or the microphone), each frame with its time; played from a point its sound and microphone left out up to there',
     vid.seen.join() === 'f2@0,cap@0,ack,f1@10,f7@20,f32@25,f15@30,cap@67,ack,f1@200,cap@200,ack,f3@210,f7@215,f32@216,done'
       && vid.ms < 1000 && fromPoint.join() === 'f7@215,f32@216', JSON.stringify({ vid, fromPoint }));
+
+  // the WebSocket service, when the page found it: the session's request as its first message ({csrf, body}), the frames
+  // from its binary messages as over HTTP, the input and the token sent on it, the end as over HTTP; a refusal before the
+  // frames (a text message) ends the session with it; a service that does not open: HTTP at once
+  const sockets = [];
+  let wsMode = 'ok', fetched = 0;
+  globalThis.WebSocket = class {
+    constructor(url) {
+      Object.assign(this, { url, sent: [], readyState: 0, mode: wsMode });
+      sockets.push(this);
+      setTimeout(() => (this.mode === 'fail' ? this.onerror?.() : (this.readyState = 1, this.onopen?.())), 0);
+    }
+    send(d) { this.sent.push(d); }
+    close() { if (this.readyState !== 3) { this.readyState = 3; this.onclose?.(); } }
+  };
+  const wsStart = () => globalThis.onmessage({ data: { url: 'https://gateway.test/rdp.php?a=stream', ws: 'wss://gateway.test/ws', headers: { 'X-CSRF': 'k' },
+    body: JSON.stringify({ c: 'c1', sid: 's1' }) } });
+  posted.length = 0;
+  const w1 = wsStart();
+  await tick(); await tick();
+  const s1 = sockets.at(-1), state = new TextEncoder().encode('{"token":"tk"}'), f = new Uint8Array(5 + state.length);
+  f[0] = 3; new DataView(f.buffer).setUint32(1, state.length, true); f.set(state, 5);
+  s1.onmessage({ data: f.slice(0, 3).buffer });                  // (a frame in two messages, as the service passes reads on)
+  s1.onmessage({ data: f.slice(3).buffer });
+  await tick();
+  globalThis.onmessage({ data: { cmd: 'token', token: 'tk' } });
+  globalThis.onmessage({ data: { cmd: 'send', body: Uint8Array.of(0, 0, 0, 0, 1, 0) } });
+  s1.close();
+  await w1;
+  const viaWs = [s1.url, s1.sent[0], s1.sent[1], [...(s1.sent[2] || [])].join(), posted.map((m) => m.t).join(), posted.find((m) => m.t === 'frame')?.type, posted.at(-1).err, posted.at(-1).end];
+  posted.length = 0;
+  const w2 = wsStart();
+  await tick(); await tick();
+  sockets.at(-1).onmessage({ data: '{"error":"csrf"}' });
+  await w2;
+  const wsRefused = [posted.at(-1).t, posted.at(-1).end];
+  posted.length = 0;
+  wsMode = 'fail';
+  globalThis.fetch = async () => { fetched++; return { ok: false, status: 403, json: async () => ({ error: 'auth' }) }; };
+  await wsStart();
+  const wsFallback = [fetched, posted.some((m) => m.t === 'transport'), posted.at(-1).end];
+  // one that opens and closes before its first frame, with no word: this time over HTTP (it was tried again and again on
+  // the service); stopped while it opens: closed, no session goes on, no request
+  posted.length = 0;
+  wsMode = 'ok';
+  fetched = 0;
+  const w3 = wsStart();
+  await tick(); await tick();
+  sockets.at(-1).close();
+  await w3;
+  const wsEmpty = [fetched, posted.filter((m) => m.t === 'transport').map((m) => m.ws).join(), posted.at(-1).end];
+  posted.length = 0;
+  fetched = 0;
+  const w4 = wsStart();
+  globalThis.onmessage({ data: { cmd: 'stop' } });   // (before the socket opens)
+  await tick(); await tick();
+  const over = await Promise.race([w4.then(() => true), new Promise((r) => setTimeout(() => r(false), 300))]);   // (it went on, waiting)
+  const wsStopped = [over, fetched, sockets.at(-1).readyState, posted.some((m) => m.t === 'transport'), posted.at(-1)?.t];
+  delete globalThis.WebSocket;
+  check('worker: through the WebSocket service the request first, the frames as over HTTP (also cut across messages), the token and the input on it, the end as over HTTP; refused before the frames: said; a service that does not open: HTTP at once; one closed before its first frame: HTTP that time; stopped while it opens: nothing goes on',
+    JSON.stringify(viaWs) === JSON.stringify(['wss://gateway.test/ws', '{"csrf":"k","body":{"c":"c1","sid":"s1"}}', '{"token":"tk"}', '0,0,0,0,1,0', 'transport,frame,end', 3, null, undefined])
+      && JSON.stringify(wsRefused) === '["end","csrf"]' && JSON.stringify(wsFallback) === '[1,false,"auth"]'
+      && JSON.stringify(wsEmpty) === '[1,"true,false","auth"]' && JSON.stringify(wsStopped) === '[true,0,3,false,"end"]', JSON.stringify({ viaWs, wsRefused, wsFallback, wsEmpty, wsStopped }));
   globalThis.fetch = fetch0;
+}
+
+{
+  // a session through the WebSocket service (its worker said so): the worker is given the service's address with the
+  // request; the input token, the keys and the lane's messages go to the worker, no request to the gateway; without the
+  // service, as always
+  const container = new El(), canvas = new El(), keyboard = new El();
+  const s = new RdpSession({ container, canvas, keyboard, conn: { id: 'c', resize: 'fit' }, csrf: 'x', retries: 3, onState: () => {}, ws: 'ws' });
+  s.start();
+  await tick();
+  const wk = workers.at(-1), first = wk.msgs[0];
+  const status = (j) => wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify(j)) } });
+  wk.onmessage({ data: { t: 'transport', ws: true } });
+  status({ token: 't' });
+  status({ connected: true });
+  await tick();
+  const n0 = sent.length;
+  tap(keyboard, 'KeyA');
+  await tick();
+  s.sendCam(new Uint8Array(10), 4);
+  await tick();
+  const toWorker = wk.msgs.slice(1).map((m) => m.cmd + (m.cmd === 'send' ? ':' + m.body[4] : m.cmd === 'token' ? ':' + m.token : ''));
+  check('a session through the WebSocket service: the worker given its address; the token, the keys and the lane\'s messages to the worker, no request to the gateway',
+    first.ws === 'wss://gateway.test/ws' && first.url === 'https://gateway.test/rdp.php?a=stream' && sent.length === n0
+      && toWorker.includes('token:t') && toWorker.includes('send:1') && toWorker.includes('send:18') && s.inflight === 0,
+    JSON.stringify({ ws: first.ws, toWorker, fetched: sent.length - n0, inflight: s.inflight }));
+  s.stop();
 }
 
 // several screens: each window shows its remote monitor whole and in proportion; full screen on its screen, 1:1 (before,
@@ -679,6 +777,37 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
     && JSON.stringify(both) === '[[0,0,0,1920,1080],[1,1920,0,1280,1024]]'
     && JSON.stringify(removed) === JSON.stringify([[2, 1920 & 255, 1920 >> 8, 1080 & 255, 1080 >> 8]]) && JSON.stringify(after) === '[[0,1920,1080]]',
     JSON.stringify({ alone, asked, both, removed, after }));
+}
+
+// one screen, the window resized while connecting (Firefox goes to full screen with the click on Connect, the request had
+// gone with the window's size before it): the remote desktop follows once connected. Before, that check was dropped and
+// the desktop stayed at the first size, shown enlarged with black margins, until the window changed again
+{
+  const container = new El(), canvas = new El(), keyboard = new El();
+  Object.assign(container, { width: 1280, height: 843 });
+  const RO = globalThis.ResizeObserver;
+  let resized = null;
+  globalThis.ResizeObserver = class { constructor(f) { resized = f; } observe() {} disconnect() {} };
+  const s = new RdpSession({ container, canvas, keyboard, conn: { id: 'c', resize: 'dynamic' }, csrf: 'x', retries: 3, onState: () => {} });
+  globalThis.ResizeObserver = RO;
+  const clock = testClock();
+  s.start();
+  await tick();
+  const wk = workers.at(-1), sizeOf = (w) => { const b = JSON.parse(w.msgs.find((m) => m.body)?.body || '{}'); return [b.w, b.h]; };
+  const first = sizeOf(wk);
+  Object.assign(container, { width: 1920, height: 1080 });   // full screen, while connecting
+  resized();
+  await clock.advance(450);
+  wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify({ token: 't' })) } });   // its session id
+  await clock.advance(1800);                             // (checked; no Display Control yet: connected again with that size)
+  const quit = wk.msgs.some((m) => m.cmd === 'stop');
+  wk.onmessage({ data: { t: 'end' } });
+  await tick();
+  const again = workers.at(-1) === wk ? null : sizeOf(workers.at(-1));
+  s.stop();
+  clock.restore();
+  check('one screen: a window resized while connecting (full screen with the click on Connect) gets a desktop of its new size once connected',
+    JSON.stringify(first) === '[1280,843]' && quit && JSON.stringify(again) === '[1920,1080]', JSON.stringify({ first, quit, again }));
 }
 
 // a desktop over 32766 a side or 2^26 pixels is not taken (a hostile server made the page allocate gigabytes; the gateway
@@ -1093,6 +1222,23 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   s.stop();
 }
 {
+  // connected (or connected again) while the page is hidden: the server is told so, and told again when it is seen, with
+  // a picture asked anew (it kept "seen" from before: coming back said nothing, and the desktop stayed still)
+  const docL = {}, add0 = document.addEventListener;
+  document.addEventListener = (t, f) => (docL[t] ||= []).push(f);
+  document.hidden = true;
+  const { s, from } = await session();
+  document.addEventListener = add0;
+  document.hidden = false;
+  docL.visibilitychange?.forEach((g) => g());
+  await tick();
+  const vis = sent.slice(from - 1).filter((r) => r.payload[0] === 3).map((r) => r.payload[1]);
+  const refreshed = sent.slice(from).some((r) => r.payload[0] === 6);
+  check('visibility: connected while hidden, the server told so; seen again, told again with a picture asked', JSON.stringify(vis) === '[0,1]' && refreshed,
+    JSON.stringify({ vis, refreshed }));
+  s.stop();
+}
+{
   // several screens: hiding this window (minimized, another tab) stopped the server drawing while the other screen's
   // window was still in view; only when no window of the session is seen
   const docL = {}, add0 = document.addEventListener;
@@ -1198,15 +1344,36 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
 {
   // after the first retry (1 s), each wait is up to half as long again at random: after the gateway restarted, every page
   // tried again at the same moments and most found it busy
-  const { wk } = await session();
+  const { s, wk } = await session();
   const seen = [], st0 = globalThis.setTimeout;
   globalThis.setTimeout = (f, ms, ...a) => { if (ms >= 1000) seen.push(ms); return st0(f, ms, ...a); };
   wk.onmessage({ data: { t: 'end' } });
   await new Promise((r) => st0(r, 1100));
-  workers.at(-1).onmessage({ data: { t: 'end' } });
+  s.worker.onmessage({ data: { t: 'end' } });
   globalThis.setTimeout = st0;
   await new Promise((r) => st0(r, 50));
   check('reconnection: 1 s first, then waits with some chance in them (2 to 3 s the second)', seen[0] === 1000 && seen[1] > 2000 && seen[1] <= 3000, JSON.stringify(seen));
+  s.stop();                                              // (else its third try made a worker 2 to 3 s later, in another test)
+}
+{
+  // a worker that could not start (its script not loaded: the network down just as the connection was tried again) ends
+  // as a dropped connection and is tried again (it never said anything: the page stayed on "Reconnecting" for good); one
+  // that was running and hit an error goes on
+  const clock = testClock();
+  const { s, wk, states } = await session();
+  const n0 = workers.length;
+  wk.onerror?.({ preventDefault() {}, message: 'a decoder' });   // (running: it spoke before)
+  const stillOn = workers.length === n0 && !states.some((x) => x.startsWith('reconnecting'));
+  wk.onmessage({ data: { t: 'end' } });               // the connection drops
+  await clock.advance(1100);                          // the first try again: its worker cannot start
+  let prevented = false;
+  workers.at(-1).onerror?.({ preventDefault: () => { prevented = true; }, message: 'not loaded' });
+  await clock.advance(3500);                          // the second (2 to 3 s later)
+  const made = workers.length - n0;
+  clock.restore();
+  check('reconnection: a worker that could not start ends as a dropped connection and is tried again; a running one hitting an error goes on',
+    stillOn && prevented && made === 2 && states.filter((x) => x === 'reconnecting:network').length === 2, JSON.stringify({ stillOn, prevented, made, states }));
+  s.stop();
 }
 
 // ------------------------------------------------------------ copies within a canvas
@@ -1228,7 +1395,50 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   s.gfx.apply({ op: 's2s', src: 9, dst: 9, rect: { l: 0, t: 16, r: 200, b: 216 }, pts: [[0, 0]] });
   const scratchUsed = !!s.copyTmp;
   check('copies within the desktop or a surface: never a canvas drawn onto itself', selfDraws.length === 0 && scratchUsed, JSON.stringify({ selfDraws, scratchUsed }));
+  // a ScrBlt as large as its fields allow: its scratch canvas the desktop's size at most (before, 32767 x 8192: 1 GB kept)
+  wk.onmessage({ data: { t: 'op', cmd: { op: 'copy', sx: 0, sy: 0, w: 32767, h: 8192, x: 0, y: 0 } } });
+  check('a ScrBlt larger than the desktop: its scratch canvas the desktop\'s size at most', s.copyTmp.width <= s.surface.width && s.copyTmp.height <= s.surface.height,
+    `${s.copyTmp.width} x ${s.copyTmp.height}`);
   s.stop();
+}
+
+{
+  // pixel-by-pixel ROP drawing, 20 desktops a second at most: 50 PatBlts of the whole desktop (one byte each from a server)
+  // drew 20, the rest left out (before, all of them: a whole getImageData and putImageData each)
+  const { s, wk } = await session();
+  let reads = 0;
+  s.sctx.getImageData = (x, y, w, h) => { reads++; return { data: new Uint8ClampedArray(w * h * 4) }; };
+  s.sctx.putImageData = () => {};
+  for (let i = 0; i < 50; i++) {
+    wk.onmessage({ data: { t: 'op', cmd: { op: 'pattern', rop: 0x5a, x: 0, y: 0, w: s.surface.width, h: s.surface.height, brush: { style: 0, color: 0 }, color: 0, back: 0 } } });
+  }
+  check('ROP drawing: 20 desktops a second at most', reads === 20, `${reads} reads`);
+  s.stop();
+}
+{
+  // ... and drawn in a page less than a second old (performance.now() below 1000): before, the budget's fields were unset there,
+  // their sum NaN, and every such order left out
+  const now = performance.now;
+  performance.now = () => 500;
+  const { s, wk } = await session();
+  let reads = 0;
+  s.sctx.getImageData = (x, y, w, h) => { reads++; return { data: new Uint8ClampedArray(w * h * 4) }; };
+  s.sctx.putImageData = () => {};
+  wk.onmessage({ data: { t: 'op', cmd: { op: 'pattern', rop: 0x5a, x: 0, y: 0, w: 8, h: 8, brush: { style: 0, color: 0 }, color: 0, back: 0 } } });
+  performance.now = now;
+  check('ROP drawing: drawn in a page less than a second old', reads === 1, `${reads} reads`);
+  s.stop();
+}
+
+{
+  // a worker that never answers the 'stop' (busy in a long decode a hostile server asked for): ended by force after 3 s,
+  // the session said ended (before, Disconnect did nothing until the page was closed)
+  const { s, wk } = await session();
+  let gone = false;
+  wk.terminate = () => { gone = true; };
+  s.stop();
+  await new Promise((r) => setTimeout(r, 3200));
+  check('a worker that never ends after Disconnect: ended by force', gone && s.worker === null && s.ended?.end === 'user', JSON.stringify({ gone, ended: s.ended }));
 }
 
 // ------------------------------------------------------------ graphics ops of several areas
@@ -1712,6 +1922,9 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   fail = 404;
   s.sendFolderReply(82, new Uint8Array(3));
   await advance(700);
+  fail = 429;                                        // (the hosting's limit of requests: it was taken as delivered, and lost)
+  s.sendFolderReply(83, new Uint8Array(3));
+  await advance(700);
   const busy = lane.slice(g0).map((x) => `${x[1]}:${x[3]}`);
   clock.restore();
   fail = null;
@@ -1729,8 +1942,8 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
   hold = null;
   const reset = lane.slice(h0).map((x) => x[3]);
   globalThis.fetch = fetch0;
-  check('the lane: a folder\'s answer lost sent again 3 times at most, a picture not; again when the gateway was busy, not to a session gone; connected again for a guest: the camera let go, answers waiting left out',
-    JSON.stringify(lost) === JSON.stringify(['20:80', '18:4', '20:80', '20:80', '20:80']) && JSON.stringify(busy) === JSON.stringify(['20:81', '20:81', '20:82'])
+  check('the lane: a folder\'s answer lost sent again 3 times at most, a picture not; again when the gateway was busy or the hosting refused it (429), not to a session gone; connected again for a guest: the camera let go, answers waiting left out',
+    JSON.stringify(lost) === JSON.stringify(['20:80', '18:4', '20:80', '20:80', '20:80']) && JSON.stringify(busy) === JSON.stringify(['20:81', '20:81', '20:82', '20:83', '20:81', '20:83'])
     && camStops === 1 && JSON.stringify(reset) === '[90,91]', JSON.stringify({ lost, busy, camStops, reset }));
   // a recording started in the session, made in this page: begun when the gateway says so (record_video: its number), with
   // sound when the session has sound or the microphone (a browser that cannot record says so on the lane at once); the
@@ -1841,6 +2054,255 @@ const leftHeld = (ev) => ev.filter((e) => e === 'mouse:9000').length > ev.filter
       && JSON.stringify(left) === '["disposed on stop",null,"disposed on dispose",null]' && JSON.stringify(ended) === JSON.stringify(['ended,said false', null, 0]) && guestNone,
     JSON.stringify({ begun, sameKept, stopped, order1, order2, waited, resent, gaveUp, left, ended, guestNone }));
   s.stop();
+}
+
+{ // input refused by the hosting without being run (429, 503, 508: its limit of PHP processes at once reached): the same
+  // request (its number) sent again after 50, 100, 200, 400 and 800 ms at most, meanwhile and for 5 s after the last refusal
+  // one request at a time (before: lost, and a key released in it stayed pressed on the remote computer); lost on the way
+  // (no answer, a proxy's 502 or 504) again too, but not a guest's (taken as they come: a copy would type twice); a session
+  // gone (410) or a request the gateway refused (404) not again, nor one of a session ended meanwhile
+  const fetch0 = globalThis.fetch, posts = [], pend = [];
+  let answer = () => 204;
+  globalThis.fetch = (url, o) => {
+    posts.push({ seq: new DataView(o.body.buffer).getUint32(0, true), body: [...o.body].join() });
+    const a = answer(posts.length);
+    if (a === 'hold') return new Promise((r) => pend.push(() => r({ ok: true, status: 204 })));
+    return a === 'network' ? Promise.reject(new TypeError('network')) : Promise.resolve({ ok: a < 300, status: a });
+  };
+  const clock = testClock({ now: true }), advance = (ms) => clock.advance(ms);
+  const { s, keyboard: k, wk } = await session();
+  await advance(6000);                                   // (5 s after any refusal of the tests before)
+  // refused once: sent again with its own number after 50 ms; the keys typed meanwhile wait for it, then go one request at a time
+  let p0 = posts.length;
+  answer = (n) => (n === p0 + 1 ? 508 : 'hold');
+  key(k, 'keydown', 'ShiftLeft', { shift: true });
+  await advance(10);
+  tap(k, 'KeyA', { shift: true });
+  await advance(10);
+  const waited = posts.length - p0;                      // 1: the keys typed meanwhile wait
+  await advance(40);
+  const again = posts.slice(p0).map((x) => x.seq);
+  pend.splice(0).forEach((f) => f());
+  await advance(0);
+  key(k, 'keyup', 'ShiftLeft', { shift: true });
+  await advance(10);
+  const oneAtATime = posts.length - p0;                  // 3: the Shift up waits behind the KeyA request
+  pend.splice(0).forEach((f) => f());
+  await advance(0);
+  pend.splice(0).forEach((f) => f());
+  await advance(0);
+  const order = posts.slice(p0).map((x) => x.seq - posts[p0].seq);
+  // 5 s after the last refusal: four at once again
+  await advance(5000);
+  p0 = posts.length;
+  answer = () => 'hold';
+  for (const c of ['KeyB', 'KeyC', 'KeyD', 'KeyE', 'KeyF']) { tap(k, c); await advance(0); }
+  const backTo4 = posts.length - p0;
+  while (pend.length) { pend.splice(0).forEach((f) => f()); await advance(0); }
+  // refused every time: 6 tries (the first and 5 more, 1.55 s), then given up; the next request goes with the next number
+  await advance(6000);
+  p0 = posts.length;
+  answer = (n) => (n <= p0 + 6 ? 503 : 204);
+  tap(k, 'KeyG');
+  await advance(3000);
+  tap(k, 'KeyH');
+  await advance(0);
+  const gaveUp = [posts.slice(p0).map((x) => x.seq - posts[p0].seq).join(), new Set(posts.slice(p0, p0 + 6).map((x) => x.body)).size, s.inflight];
+  // lost on the way: again (a network error, 502, 504); not again: 410, 404
+  const tries = [];
+  for (const a of ['network', 502, 504, 410, 404]) {
+    await advance(6000);
+    p0 = posts.length;
+    answer = (n) => (n === p0 + 1 ? a : 204);
+    tap(k, 'KeyI');
+    await advance(1000);
+    tries.push(posts.length - p0);
+  }
+  // the session ended while one waits to go again: not sent again
+  await advance(6000);
+  p0 = posts.length;
+  answer = () => 508;
+  tap(k, 'KeyJ');
+  await advance(10);
+  wk.onmessage({ data: { t: 'end' } });
+  await advance(100);
+  const afterEnd = posts.length - p0;
+  s.stop();
+  // a guest given control: again when refused, not when lost on the way (a copy would type twice)
+  const g = new RdpSession({ container: new El(), canvas: new El(), keyboard: new El(), conn: { id: '', name: '' }, csrf: 'x', retries: 0, guest: { link: 'abc.SECRET' }, onState: () => {} });
+  g.start();
+  await advance(0);
+  workers.at(-1).onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify({ watch: 'control', owner: 'ana', conn: 'PC', sid: 'abc' })) } });
+  await advance(0);
+  const guest = [];
+  for (const a of [508, 'network']) {
+    await advance(6000);
+    p0 = posts.length;
+    answer = (n) => (n === p0 + 1 ? a : 204);
+    g.key('KeyK', false);
+    await advance(1000);
+    guest.push(posts.length - p0);
+  }
+  g.stop();
+  clock.restore();
+  globalThis.fetch = fetch0;
+  check('input refused by the hosting (429, 503, 508): sent again with its number, 5 times at most, one request at a time meanwhile and for 5 s; lost on the way again too (not a guest\'s); 404, 410 and a session ended not again',
+    waited === 1 && JSON.stringify(again) === JSON.stringify([again[0], again[0]]) && oneAtATime === 3 && JSON.stringify(order) === '[0,0,1,2]'
+      && backTo4 === 4 && JSON.stringify(gaveUp) === JSON.stringify(['0,0,0,0,0,0,1', 1, 0]) && JSON.stringify(tries) === '[2,2,2,1,1]'
+      && afterEnd === 1 && JSON.stringify(guest) === '[2,1]',
+    JSON.stringify({ waited, again, oneAtATime, order, backTo4, gaveUp, tries, afterEnd, guest }));
+}
+
+// ------------------------------------------------------------ keys and buttons held, a paste, the end of a session
+
+{
+  // a key typed before the session's token (still connecting): its lock keys were taken as synced, and never were after it
+  // (here and below: only this session's worker and requests, see session())
+  const syncs = (from) => sent.slice(from).filter((r) => r.payload[0] === 1 && r.url.includes(`sid=${s.sid}`)).reduce((n, { payload: p }) => {
+    for (let o = 2, i = 0; i < p[1]; i++) { const t = p[o] >> 5; if (t === 3) n++; o += t === 0 ? 2 : t === 3 ? 1 : t === 4 ? 3 : 7; }
+    return n;
+  }, 0);
+  const caps = (k, type) => k.fire(type, { code: 'KeyA', key: 'a', ctrlKey: false, metaKey: false, shiftKey: false, repeat: false, isComposing: false,
+    keyCode: 0, getModifierState: (m) => m === 'CapsLock' });
+  const keyboard = new El();
+  const s = new RdpSession({ container: new El(), canvas: new El(), keyboard, conn: { id: 'c', resize: 'fit' }, csrf: 'x', retries: 3, onState: () => {} });
+  s.start();
+  await tick();
+  const wk = s.worker, status = (j) => wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify(j)) } });
+  caps(keyboard, 'keydown'); caps(keyboard, 'keyup');     // connecting: nothing sent
+  status({ token: 't' });
+  status({ connected: true });
+  await tick();
+  const f = sent.length;
+  caps(keyboard, 'keydown'); caps(keyboard, 'keyup');
+  await tick();
+  check('lock keys: a key typed while connecting does not count them as synced; the first key after the token syncs them', syncs(f) === 1, String(syncs(f)));
+  s.stop();
+}
+{
+  // the session ended: Tab and Esc are the page's again, so the keyboard alone reaches its buttons (they were held on the
+  // remote screen, with nothing behind it); connected, they are the remote computer's
+  const { s, wk, keyboard: k } = await session();
+  const connected = ['Tab', 'Escape'].map((c) => !!key(k, 'keydown', c).prevented);
+  ['Tab', 'Escape'].forEach((c) => key(k, 'keyup', c));
+  s.stop();
+  wk.onmessage({ data: { t: 'end' } });
+  const ended = ['Tab', 'Escape'].map((c) => !!key(k, 'keydown', c).prevented);
+  check('keyboard: Tab and Esc go to the remote computer while connected, to the page once the session ended', connected.join() === 'true,true' && ended.join() === 'false,false',
+    JSON.stringify({ connected, ended }));
+}
+{
+  // Shift held while the connection drops and comes back: the new connection's computer has no key held, so the next key
+  // with Shift presses it there again (the page thought it still held there, and Shift+Arrow went as Arrow)
+  const clock = testClock();
+  const { s, wk, keyboard: k } = await session();
+  key(k, 'keydown', 'ShiftLeft', { shift: true });
+  wk.onmessage({ data: { t: 'end' } });
+  await clock.advance(1000);                             // the first retry
+  const w2 = s.worker, st = (j) => w2?.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify(j)) } });
+  st({ token: 't2' });
+  st({ connected: true });
+  await clock.advance(0);
+  const f = sent.length;
+  key(k, 'keydown', 'ArrowLeft', { shift: true });
+  key(k, 'keyup', 'ArrowLeft', { shift: true });
+  key(k, 'keyup', 'ShiftLeft');
+  await clock.advance(0);
+  clock.restore();
+  const keys = events(f, s.sid).join(' ');
+  check('reconnection: a Shift still held is pressed again on the new connection with the next key', !!w2 && w2 !== wk && keys === 'ShiftLeft↓ ArrowLeft↓ ArrowLeft↑ ShiftLeft↑',
+    keys);
+  s.stop();
+}
+{
+  // a mouse button whose release the page did not see (its pointerup lost, the pointer capture taken away, the focus gone
+  // to another window) stayed pressed on the remote computer: released at the next move, when the capture is lost, or when
+  // the session's keyboard loses the focus; a plain click as before
+  const { s, canvas: c, keyboard: k } = await session();
+  const seen = async (f) => { const n = sent.length; f(); await tick(); return events(n, s.sid).join(' '); };
+  const lostUp = await seen(() => { c.fire('pointerdown', mouse(0, 1)); c.fire('pointermove', mouse(-1, 0)); });
+  const lostCapture = await seen(() => { c.fire('pointerdown', mouse(2, 2)); c.fire('lostpointercapture', { pointerId: 1, pointerType: 'mouse' }); });
+  const blurred = await seen(() => { k.focus(); c.fire('pointerdown', mouse(0, 1)); k.blur(); });
+  const click = await seen(() => { c.fire('pointerdown', mouse(0, 1)); c.fire('pointerup', mouse(0, 0)); c.fire('lostpointercapture', { pointerId: 1, pointerType: 'mouse' }); });
+  check('mouse: a button released unseen is released over there (next move, capture lost, focus lost); a click as before',
+    JSON.stringify([lostUp, lostCapture, blurred, click]) === JSON.stringify(['mouse:9000 mouse:1000', 'mouse:a000 mouse:2000', 'mouse:9000 mouse:1000', 'mouse:9000 mouse:1000']),
+    JSON.stringify([lostUp, lostCapture, blurred, click]));
+  s.stop();
+}
+{
+  // Ctrl+V of files going up for minutes: the keys typed meanwhile wait 2.5 s at most, then go without the Ctrl+V (the files
+  // say when they are ready to paste; before, every key waited for the whole upload while clicks went on). An upload that
+  // failed presses no V (it pasted what the remote clipboard had before)
+  const clock = testClock();
+  const { s, keyboard: k, from } = await session();
+  let uploaded;
+  s.clipboard = { fromPasteEvent: () => new Promise((r) => { uploaded = r; }) };
+  key(k, 'keydown', 'ControlLeft', { ctrl: true });
+  key(k, 'keydown', 'KeyV', { ctrl: true });
+  k.fire('paste', { clipboardData: {} });
+  key(k, 'keyup', 'KeyV', { ctrl: true });
+  key(k, 'keyup', 'ControlLeft');
+  tap(k, 'KeyA');
+  await clock.advance(2000);
+  const waiting = events(from, s.sid).join(' ');
+  await clock.advance(600);
+  const capped = events(from, s.sid).join(' ');
+  uploaded();
+  await clock.advance(0);
+  const late = events(from, s.sid).join(' ');
+  const noUpload = [];
+  for (const answer of [() => Promise.reject(new Error('upload')), () => Promise.resolve(false)]) {   // an image's, the files'
+    s.clipboard = { fromPasteEvent: answer };
+    const f = sent.length;
+    key(k, 'keydown', 'ControlLeft', { ctrl: true });
+    key(k, 'keydown', 'KeyV', { ctrl: true });
+    k.fire('paste', { clipboardData: {} });
+    key(k, 'keyup', 'KeyV', { ctrl: true });
+    key(k, 'keyup', 'ControlLeft');
+    await clock.advance(10);
+    noUpload.push(events(f, s.sid).join(' '));
+  }
+  clock.restore();
+  check('paste: keys wait for a long upload 2.5 s at most, then go without the Ctrl+V; a failed upload presses no V',
+    waiting === 'ControlLeft↓' && capped === 'ControlLeft↓ ControlLeft↑ KeyA↓ KeyA↑' && late === capped && noUpload.every((x) => x === 'ControlLeft↓ ControlLeft↑'),
+    JSON.stringify({ waiting, capped, late, noUpload }));
+  s.stop();
+}
+{
+  // "Disconnect" (or the view left) while waiting to connect again: ended at once (there is no stream to say so: the page
+  // kept saying "Reconnecting" for ever), and no connection made after it
+  const clock = testClock();
+  const { s, wk, states } = await session();
+  wk.onmessage({ data: { t: 'end' } });
+  const waiting = states.at(-1);
+  s.stop();
+  await clock.advance(15000);
+  clock.restore();
+  check('end: stopped while waiting to reconnect, ended at once and not connected again', waiting === 'reconnecting:network' && states.at(-1) === 'ended:user'
+    && !s.worker, states.join(' > '));
+}
+{
+  // through the WebSocket service: nothing answers the input, so no latency is measured (null, not 0 ms said good); the
+  // goodbye (QUIT) goes over HTTP, as without the service: the page ends the worker at once after it (the view left),
+  // before the worker sent it, and the gateway took the end for a network drop
+  const keyboard = new El();
+  const s = new RdpSession({ container: new El(), canvas: new El(), keyboard, conn: { id: 'c', resize: 'fit' }, csrf: 'x', retries: 3, onState: () => {}, ws: 'ws' });
+  s.start();
+  await tick();
+  const wk = s.worker, status = (j) => wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify(j)) } });
+  wk.onmessage({ data: { t: 'transport', ws: true } });
+  status({ token: 't' });
+  status({ connected: true });
+  tap(keyboard, 'KeyA');
+  await tick();
+  const rtt = s.counts.rtt, n0 = sent.length, m0 = wk.msgs.length, sid = s.sid;
+  s.stop();
+  s.dispose();
+  await tick();
+  const quit = sent.slice(n0).filter((r) => r.payload[0] === 5 && r.url.includes(`sid=${sid}`)).map((r) => r.headers['X-MuDesk-Token']);
+  const toWorker = wk.msgs.slice(m0).filter((m) => m.cmd === 'send' && m.body[4] === 5).length;
+  check('WebSocket service: no latency said (not 0 ms); "Disconnect" sends its goodbye over HTTP, which the worker ended at once cannot lose',
+    rtt === null && JSON.stringify(quit) === '["t"]' && toWorker === 0, JSON.stringify({ rtt, quit, toWorker }));
 }
 
 console.log(failed ? `\n${failed} failed` : '\nAll tests passed');

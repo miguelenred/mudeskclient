@@ -58,6 +58,14 @@ button.info .ico { width: 18px; height: 18px; }
 .spacer { flex: 1; }
 .error { color: var(--danger); min-height: 1.2em; margin: .3rem 0 .6rem; }
 .warn { color: var(--warn); }
+.auth:has(.setup-checks) { width: min(640px, 100%); }
+.setup-checks { list-style: none; padding: 0; margin: 0 0 1rem; }
+.setup-checks li { display: flex; gap: .6rem; align-items: flex-start; padding: .45rem 0; border-bottom: 1px solid var(--border); }
+.setup-checks li > .ico { flex: none; margin-top: .15rem; }
+.setup-checks li.warn { color: var(--fg); }   /* (only its icon amber, not the whole line) */
+.setup-checks li.ok > .ico { color: var(--ok); } .setup-checks li.warn > .ico { color: var(--warn); } .setup-checks li.fail > .ico { color: var(--danger); }
+.setup-checks li.info > .ico, .setup-checks li.run > .ico { color: var(--muted); }
+.setup-checks small { display: block; color: var(--muted); margin-top: .15rem; }
 details { margin: .5rem 0 1rem; } summary { cursor: pointer; font-weight: 600; margin-bottom: .8rem; }
 
 /* auth screens */
@@ -352,6 +360,12 @@ table.audit tr.tampered td { background: color-mix(in srgb, var(--danger) 14%, t
 .rec-badge { position: absolute; top: 8px; left: 8px; z-index: 6; padding: .25rem .65rem; border-radius: 999px; background: rgba(0, 0, 0, .65);
   color: #fff; font-size: .8rem; pointer-events: none; }
 .rec-badge::before, .badge.rec::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #e5534b; margin-right: .35rem; }
+/* this computer's microphone or camera in use (app.js capBadge): under "Recording" while it shows, else in its place (the
+   session bar is at the top in the middle) */
+.cap-badge { position: absolute; top: 40px; left: 8px; z-index: 6; display: flex; align-items: center; gap: .3rem;
+  padding: .25rem .7rem; border-radius: 999px; background: rgba(0, 0, 0, .7); color: #fff; font-size: .8rem; pointer-events: none; }
+.rec-badge.hidden + .cap-badge { top: 8px; }
+.cap-badge svg { width: 15px; height: 15px; color: #e5534b; }
 .rec-bar { position: absolute; left: 0; right: 0; bottom: 0; z-index: 6; display: flex; align-items: center; gap: .6rem; padding: .4rem .8rem;
   background: rgba(0, 0, 0, .75); color: #fff; font-size: .85rem; flex-wrap: wrap; }
 .rec-bar a, .rec-bar button { color: #fff; background: transparent; border: 0; padding: .3rem; border-radius: 8px; cursor: pointer; display: grid; place-items: center; }

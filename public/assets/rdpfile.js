@@ -48,12 +48,11 @@ export function parseRdp(text, name = '') {
     name: name.replace(/\.rdp$/i, '').trim().slice(0, 80) || host,
     group: '', host, port: port || (Number.isInteger(v['server port']) ? v['server port'] : 3389), user, domain,
     kbd: 0x040A, bpp: [15, 16, 24, 32].includes(v['session bpp']) ? v['session bpp'] : 16, gfx: 'auto',
-    security: off('enablecredsspsupport') ? 'tls' : 'auto',
+    security: off('enablecredsspsupport') ? 'tls' : 'nla',   // (NLA only, as a new connection: Automatic is chosen by hand)
     resize: on('smart sizing') && !on('dynamic resolution') ? 'fit' : 'dynamic',
-    clipboard: !off('redirectclipboard'), paste: 'auto', printer: !off('redirectprinters'),
-    drive: !!v.drivestoredirect || on('redirectdrives'),   // the computer's drives there: the shared folder here
-    // the microphone and the camera are one option here: either one asked for there takes both
-    audio: (v.audiomode ?? 0) === 0, mic: on('audiocapturemode') || !!String(v.camerastoredirect ?? '').trim(), ask: true,
+    // what the file asks this computer to share there (see the notes below): never turned on by an import
+    clipboard: false, paste: 'auto', printer: false, drive: false,
+    audio: (v.audiomode ?? 0) === 0, mic: false, ask: true,
     app: on('remoteapplicationmode') ? String(v.remoteapplicationprogram || '') : '',    // RemoteApp: its program alone
     app_args: on('remoteapplicationmode') ? String(v.remoteapplicationcmdline || '') : '',
     perf: { wallpaper: off('disable wallpaper'), themes: off('disable themes'), smoothing: v['allow font smoothing'] !== 0,
@@ -61,8 +60,16 @@ export function parseRdp(text, name = '') {
   };
   const notes = [];
   if (on('remoteapplicationmode') && !v.remoteapplicationprogram) notes.push(['rdp_remoteapp', String(v.remoteapplicationname || '')]);
-  // a Remote Desktop Gateway (always used, or detected: 1, 2) and a connection broker's load balance info, taken
+  // what the file asks to share from this computer (its drives there: the shared folder here; the microphone and the camera
+  // are one option here): said, and left off, as Windows has done since April 2026 for a file it cannot verify. A file sent
+  // by someone else may name his own computer, which would then read the shared folder and the clipboard (CERT-UA and CISA,
+  // October 2024). Before, turned on as the file said, without a word
+  const asked = [!off('redirectclipboard') && 'clipboard', (!!v.drivestoredirect || on('redirectdrives')) && 'drive',
+    (on('audiocapturemode') || !!String(v.camerastoredirect ?? '').trim()) && 'mic', !off('redirectprinters') && 'printer'].filter(Boolean);
+  if (asked.length) notes.push(['rdp_asked', asked]);
+  // a Remote Desktop Gateway (always used, or detected: 1, 2), said too, and a connection broker's load balance info, taken
   if (v.gatewayhostname && v.gatewayusagemethod !== 0 && v.gatewayusagemethod !== 4) conn.gw = String(v.gatewayhostname).trim().toLowerCase();
+  if (conn.gw) notes.push(['rdp_gateway', conn.gw]);
   if (v.loadbalanceinfo) conn.lb = String(v.loadbalanceinfo).trim().slice(0, 512);
   if (v['alternate shell'] && !on('remoteapplicationmode')) notes.push(['rdp_shell', String(v['alternate shell'])]);
   if (/^\s*password 51\s*:\s*b\s*:/im.test(text)) notes.push(['rdp_file_password', '']);

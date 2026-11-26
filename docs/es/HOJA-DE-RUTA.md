@@ -11,7 +11,7 @@ Hecho con Windows 11 Pro (ver [PRUEBAS.md › Windows 11 Pro](PRUEBAS.md#windows
 Ya hecho:
 
 - Flujo de pantalla decodificado en un Web Worker; tablas precalculadas y rutas críticas optimizadas en el RLE.
-- Entrada sin sesión PHP, hasta 4 peticiones en paralelo con número de secuencia, `TCP_NODELAY`.
+- Entrada sin sesión PHP, hasta 4 peticiones en paralelo con número de secuencia (la que el hosting rechaza se envía de nuevo, una cada vez mientras tanto), `TCP_NODELAY`.
 - La pasarela no decodifica mapas de bits (0,19 s de CPU para 34 MB).
 - Compresión RDP en los dos tramos: MPPC ≈3,5 veces menos tráfico, XCRUSH (RDP 6.1, ofrecida por defecto) en torno a un tercio menos que MPPC y con menos CPU en la pasarela; caché de mapas de bits + MemBlt (con `drawing_orders`): 1,6 MB en vez de 10,9 MB juntas en la prueba con xrdp.
 - Canal gráfico con H.264 (lo usa el modo automático con Windows 8.1 o posterior): 21 KB/s en vez de 4,2 MB/s con la misma pantalla animada (FreeRDP). Con Windows 11 se ofrece la versión 10.7 (con 8.1 Windows no usa H.264) y la animación pasa de 18 a unos 45 fotogramas/s.
@@ -22,7 +22,7 @@ Ya hecho:
 
 - Modo de gráficos automático (por defecto): la versión de Windows que llega en el desafío NTLM decide (con Kerberos, que no la da: un Windows de dominio, el canal gráfico); Windows 8.1 o posterior → canal gráfico con H.264 si el navegador lo admite; xrdp, solo TLS y Windows antiguos → mapas de bits. Una conexión RemoteApp usa siempre mapas de bits y órdenes de dibujo (sin canal gráfico).
 
-Siguiente: AVC444 con el color a resolución completa.
+Hecho: AVC444 con el color a resolución completa (v1 y v2, comprobado contra la disposición del protocolo; con Windows 11 su imagen de luma se muestra a través de él). Pendiente: ver a Windows enviar la segunda imagen (codificando su tarjeta gráfica, solo envió la primera).
 
 Pendiente (ganancias aún por medir):
 
@@ -67,8 +67,9 @@ Pendiente:
 - **Hecho: la grabación de sesiones** (1.1), reproducida en el navegador con los mismos decodificadores, abierta desde la auditoría. Decidido: desactivada salvo que el administrador grabe una conexión; al usuario se le avisa antes de mostrar nada y mientras dura la sesión; cifrada con una clave del servidor; se guarda 30 días (un ajuste) y como mucho 2 GB cada una (`record_max_mb`); solo la ven administradores y auditores, y cada visionado queda en la auditoría. **Hecho después de 1.1:** su sonido y el del micrófono (ni el teclado ni el portapapeles); empezarla y detenerla en cualquier momento, los administradores (en la sesión o en *Sesiones activas*) y los usuarios si se permite; descargarla como vídeo WebM hecho en el navegador (WebCodecs y un escritor de WebM del propio proyecto); la empezada en la sesión la hace el navegador del usuario, de lo que muestra (MediaRecorder: sin conectar de nuevo); se guardan hasta que se eliminan a mano, de serie; las eliminan los administradores; las de cada usuario en **Grabaciones**. Queda: saltarse los tramos sin cambios.
 - **Hecho: compartir una sesión** (1.1) con un enlace, solo ver o con control (ver [USO](USO.md#compartir-una-sesión)).
 - **Hecho: puerta de enlace de Escritorio remoto y agente de conexión** (1.1): una conexión a través de una RD Gateway (MS-TSGU sobre WebSocket, sobre dos conexiones HTTPS o RPC sobre HTTP para Windows Server 2008 y 2008 R2; en PHP puro) y con la información de equilibrio de carga de una granja, siguiendo las redirecciones del agente (su contraseña para el equipo siguiente, entregada con RDSTLS); probado a través de una puerta de enlace de código abierto delante de Windows 11 (RPC sobre HTTP, contra una puerta de enlace escrita según las especificaciones), aún no contra la puerta de enlace de Windows Server ni contra un agente real.
-- **Hecho: Windows antiguos** (1.1): la seguridad RDP estándar para Windows XP y Server 2003 (solo con la seguridad *Automática*), TLS 1.0 y CredSSP 3 para Windows 7 y Server 2008 R2, Kerberos con RC4 para los dominios de Windows Server 2003; sus límites, en [SECURITY](../../SECURITY.md).
+- **Hecho: Windows antiguos** (1.1): la seguridad RDP estándar para Windows XP y Server 2003 (solo con la seguridad *Automática*), TLS 1.0 y CredSSP 3 para Windows 7 y Server 2008 R2 (CredSSP 3 ahora solo con `credssp_unpatched`: CVE-2018-0886), Kerberos con RC4 para los dominios de Windows Server 2003; sus límites, en [SECURITY](../../SECURITY.md). Después de 1.2.0, probado en los propios Windows Server 2003, 2008, 2008 R2, 2012 y 2012 R2, y TLS 1.0 hecho por MuDeskClient para Windows 7 y 2008 R2 tal como salieron (el de PHP no llega a ellos).
 - **Hecho en la 1.2**: la primera conexión a un equipo confirmada por sus huellas (SHA-256 y SHA-1), o una que un administrador fijó para todos; *Administración → Estado* con gráficos de los últimos 30 días y `health.php` para monitores; copias de seguridad cifradas y su restauración; enlaces por un tiempo y el control de los invitados que se pierde si no se usa; nada funciona mientras la carpeta de datos se puede leer desde la web.
+- **Hecho en la 1.3**: una primera puesta en marcha guiada que comprueba el servidor paso a paso; un servicio WebSocket opcional para servidores propios (menos retraso y menos procesos; cada sesión una copia del servicio); un chart de Helm, un instalador para Debian y Ubuntu y un contenedor LXC para Proxmox VE; la imagen de Docker lista para producción; las teclas y clics que un hosting rechaza, enviados de nuevo; CredSSP sin la actualización de 2018 rechazado (CVE-2018-0886); fuzzing cada noche; AVC444 en color completo y Mem3Blt. Probado contra Windows Server 2022: su propia puerta de enlace RD con sus tres transportes, el Host de sesión con dos usuarios a la vez, RemoteApp y la impresora MuDeskPDF.
 
 Otras ideas: caché persistente de mapas de bits, copia de la auditoría a un servidor syslog externo (prueba más fuerte que la cadena HMAC, cuya clave está en el mismo servidor). Las tarjetas inteligentes no son posibles: un navegador no puede dejar que la pasarela use la clave privada de la tarjeta.
 
@@ -76,7 +77,7 @@ Otras ideas: caché persistente de mapas de bits, copia de la auditoría a un se
 
 | Decisión | Motivo |
 |---|---|
-| Una petición HTTP larga por sesión | Hosting compartido: sin demonios ni WebSocket |
+| Una petición HTTP larga por sesión, un WebSocket solo donde lo hay | Hosting compartido: sin demonios ni WebSocket. En un servidor propio un servicio opcional lleva la misma sesión por un WebSocket (menos retraso, menos procesos), ejecutada por el mismo `rdp.php`, así que nada depende de él |
 | Mapas de bits reenviados y decodificados en JavaScript | Poco consumo de CPU y memoria en el hosting |
 | Extensión OpenSSL obligatoria | RDP exige TLS; TLS en PHP puro sería lento e inseguro. OpenSSL viene de serie con PHP |
 | Kerberos si se llega a un controlador de dominio; si no, NTLM | Desde un hosting los controladores de dominio no suelen estar a mano: entonces NTLM, como Windows sin KDC (no donde el dominio lo bloquea). Kerberos con AES y, para los dominios de Windows Server 2003 y las contraseñas anteriores a las claves AES de su dominio, RC4 (ofrecido el último), solo si el administrador lo permite (desactivado de serie: quien se ponga en medio podría forzarlo, y la contraseña se rompe entonces mucho antes); solo contraseñas (sin tarjetas inteligentes) |

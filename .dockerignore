@@ -8,6 +8,7 @@ data/*
 !data/web.config
 tests
 docs
+deploy
 vendor
 *.zip
 compose.yaml

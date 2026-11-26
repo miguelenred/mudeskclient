@@ -8,7 +8,7 @@
 const QUALITY = 0.75;                                    // JPEG quality: 640 x 480 in about 30-50 KB
 
 export class CamCapture {
-  /** o: {send(Uint8Array jpeg, start's number), fail(start's number), onError(i18n key)} */
+  /** o: {send(Uint8Array jpeg, start's number), fail(start's number), onError(i18n key), onLive(on): the camera taken or let go} */
   constructor(o) {
     Object.assign(this, o);
     this.run = 0;                                        // each start; an older one still starting gives up
@@ -68,6 +68,7 @@ export class CamCapture {
         }, 'image/jpeg', QUALITY);
       };
       const live = this.live = { stream, video, timer: 0, worker: null };
+      this.onLive?.(true);
       const own = () => { live.worker?.terminate(); live.worker = null; live.timer = setInterval(tick, 1000 / fps); };
       try {
         live.worker = new Worker(new URL('./tick-worker.js', import.meta.url));
@@ -93,6 +94,7 @@ export class CamCapture {
     this.live.stream.getTracks().forEach((t) => t.stop());
     this.live.video.srcObject = null;
     this.live = null;
+    this.onLive?.(false);
   }
 
   #fail(no, key) {

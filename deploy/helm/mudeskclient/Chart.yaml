@@ -1,0 +1,10 @@
+# MuDeskClient - https://miguelenred.es/mudeskclient - Apache License 2.0
+apiVersion: v2
+name: mudeskclient
+description: Remote Desktop (RDP) client in the browser, written in PHP with no dependencies (one pod, its data on a volume)
+type: application
+version: 0.1.0
+appVersion: "1.3.0"
+home: https://miguelenred.es/mudeskclient
+sources:
+  - https://github.com/miguelenred/mudeskclient

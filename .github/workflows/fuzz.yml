@@ -1,0 +1,102 @@
+# MuDeskClient - https://miguelenred.es/mudeskclient - Apache License 2.0
+# Continuous fuzzing: every night (and on demand) the gateway's and the browser's fuzzers, with some 50 times the cases of
+# the tests workflow and a new seed each run, three at once: each night tries inputs never tried before (the tests
+# workflow keeps seed 1, so a push is never failed by an input found by chance). A failure shows its input and the command
+# that replays it, in the log and in the run's summary; the log is kept for 30 days.
+name: fuzz
+
+on:
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: Base seed (empty for the run's own number); each shard adds its number to ten times it
+        required: false
+        default: ''
+      iterations:
+        description: Cases per target for the gateway (the browser's fuzzer takes twice as many)
+        required: false
+        default: '10000'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  php:
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.1', '8.5']
+        shard: [1, 2, 3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: openssl
+          ini-values: error_reporting=-1, display_errors=On, display_startup_errors=On, log_errors=Off
+          coverage: none
+      - name: Fuzz the RDP core and the channels (random and mutated PDUs)
+        env:
+          BASE: ${{ inputs.seed || github.run_id }}
+          CASES: ${{ inputs.iterations || '10000' }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          seed=$(( BASE * 10 + SHARD ))
+          echo "PHP ${{ matrix.php }}, seed $seed, $CASES cases per target" >> "$GITHUB_STEP_SUMMARY"
+          php tests/fuzz.php --strict --seed="$seed" --iterations="$CASES" 2>&1 | tee fuzz.log
+      - name: No PHP warning, notice or deprecation
+        if: always()
+        run: |
+          if grep -E '^(PHP )?(Warning|Notice|Deprecated|Fatal error|Parse error)' fuzz.log; then
+            exit 1
+          fi
+      - name: What failed, and the command that replays it
+        if: failure()
+        run: |
+          { echo '```'; grep -E -A4 '^(FAIL|PEND|PHP )' fuzz.log | head -300; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: fuzz-php-${{ matrix.php }}-${{ matrix.shard }}
+          path: fuzz.log
+          retention-days: 30
+
+  js:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: lts/*
+      - name: Fuzz the browser decoders (bitmaps, drawing orders, RemoteFX, graphics pipeline, bulk decompression)
+        env:
+          BASE: ${{ inputs.seed || github.run_id }}
+          CASES: ${{ inputs.iterations || '10000' }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          seed=$(( BASE * 10 + SHARD ))
+          echo "Node, seed $seed, $(( CASES * 2 )) cases per target" >> "$GITHUB_STEP_SUMMARY"
+          node tests/fuzz.mjs --strict --seed="$seed" --iterations="$(( CASES * 2 ))" 2>&1 | tee fuzz.log
+      - name: What failed, and the command that replays it
+        if: failure()
+        run: |
+          { echo '```'; grep -E -A4 '^(FAIL|PEND)' fuzz.log | head -300; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: fuzz-js-${{ matrix.shard }}
+          path: fuzz.log
+          retention-days: 30

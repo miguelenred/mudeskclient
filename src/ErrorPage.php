@@ -79,7 +79,7 @@ final class ErrorPage
     public static function send(int $status, string $error): never
     {
         self::output($status, $error);
-        exit(PHP_SAPI === 'cli' ? 1 : 0);
+        exit(PHP_SAPI === 'cli' && Http::$serviceIn === null ? 1 : 0);
     }
 
     /**
@@ -88,8 +88,12 @@ final class ErrorPage
      */
     public static function output(int $status, string $error): void
     {
-        if (PHP_SAPI === 'cli') {
+        if (PHP_SAPI === 'cli' && Http::$serviceIn === null) {
             fwrite(STDERR, "MuDeskClient: $error\n");
+            return;
+        }
+        if (Http::$serviceIn !== null) {               // the WebSocket service: what the page would read over HTTP
+            echo '{"error":"' . $error . '"}';
             return;
         }
         $html = strpos((string)($_SERVER['HTTP_ACCEPT'] ?? ''), 'text/html') !== false;   // else the interface, the stream, a download

@@ -35,6 +35,8 @@ final class Sessions
     private array $since = [];
     /** Messages for the stream loop that are not the browser's input: a guest joined (0x21 + share id) */
     private array $events = [];
+    /** register() holds the registry's lock: a dead session found meanwhile is removed under it (see bury) */
+    private static bool $registering = false;
 
     public const MAX_VIEWERS = 5;              // guests at once on one session
     public const MAX_SHARES  = 10;             // links of one session at once
@@ -86,10 +88,12 @@ final class Sessions
         return 'mudesk-' . substr(hash('sha256', (string)(realpath(Config::dir()) ?: Config::dir())), 0, 12) . '-';
     }
 
+    /** A running session's registration, or null (also when it ends while being read: its file may go at any moment). */
     public static function info(string $sid): ?array
     {
-        $f = self::file($sid, 'json');
-        return self::validSid($sid) && is_file($f) ? json_decode((string)file_get_contents($f), true) : null;
+        $j = self::validSid($sid) ? @file_get_contents(self::file($sid, 'json')) : false;
+        $i = $j === false ? null : json_decode($j, true);
+        return is_array($i) ? $i : null;
     }
 
     /** Whether session $sid runs: registered, and its file touched within STALE seconds (a process killed leaves it behind). */
@@ -124,12 +128,7 @@ final class Sessions
             $s     = json_decode((string)@file_get_contents($f), true);
             $mtime = @filemtime($f);
             if ($mtime !== false && $mtime < time() - self::STALE) {
-                // (its process killed by the hosting, say: what its clipboard files and print jobs took of its user's
-                // quota goes back with them, as its own end would have given it back)
-                if (is_array($s) && is_string($s['uid'] ?? null) && self::validSid(basename($f, '.json'))) {
-                    Files::charge($s['uid'], -self::quotaBytes(basename($f, '.json')));
-                }
-                self::cleanup(basename($f, '.json'));
+                self::bury(basename($f, '.json'));
                 continue;
             }
             if (!is_array($s)) {
@@ -140,6 +139,35 @@ final class Sessions
             }
         }
         return $out;
+    }
+
+    /**
+     * Removes a dead session (its process killed by the hosting, say): what its clipboard files and print jobs took of its
+     * user's quota goes back with them, as its own end would have given it back. Under the registry's lock, and only while
+     * its file is still there and untouched: two requests listing the sessions at once each gave it back (twice the room).
+     */
+    private static function bury(string $sid): void
+    {
+        $lock = self::$registering ? null : fopen(Config::dir('run/register.lock'), 'c');   // (register() holds it already)
+        $lock && flock($lock, LOCK_EX);
+        try {
+            $f = self::file($sid, 'json');
+            clearstatcache(true, $f);
+            $mtime = @filemtime($f);
+            if ($mtime === false || $mtime >= time() - self::STALE) {
+                return;                                  // removed meanwhile by another request (or alive again)
+            }
+            $s = self::info($sid);
+            if (is_string($s['uid'] ?? null)) {
+                Files::charge($s['uid'], -self::quotaBytes($sid));
+            }
+            self::cleanup($sid);
+        } finally {
+            if ($lock) {
+                flock($lock, LOCK_UN);
+                fclose($lock);
+            }
+        }
     }
 
     /**
@@ -177,6 +205,7 @@ final class Sessions
     {
         $lock = fopen(Config::dir('run/register.lock'), 'c');
         flock($lock, LOCK_EX);
+        self::$registering = true;
         try {
             $all = self::active();
             if ($perUser > 0 && count(array_filter($all, static fn($s) => $s['uid'] === $info['uid'])) >= $perUser) {
@@ -189,6 +218,7 @@ final class Sessions
                 return 'busy';
             }
         } finally {
+            self::$registering = false;
             flock($lock, LOCK_UN);
             fclose($lock);
         }
@@ -273,16 +303,19 @@ final class Sessions
                 while (($d = fread($c, 65536)) !== false && $d !== '') {
                     $this->parts[$i] = ($this->parts[$i] ?? '') . $d;
                 }
-                if (strlen($this->parts[$i] ?? '') > 4 * 1048576 + 64 || isset($this->since[$i]) && microtime(true) - $this->since[$i] > 10
-                    && !str_contains(substr($this->parts[$i] ?? '', 0, 40), self::WATCH)) {
-                    fclose($c);                                  // more than a message can be, or never finished: dropped
+                $b = $this->parts[$i] ?? '';
+                // dropped: more than a message can be, never finished, or (TCP: any process of this computer can connect) not
+                // started with the session's secret, as soon as its 32 bytes are there. Before, such a connection was kept until
+                // its 10 s, 128 at once with up to 4 MB each, and one that said it was a guest never: a local process held the
+                // session's input and memory (a guest's whole is taken out of these at once, below)
+                if (strlen($b) > 4 * 1048576 + 64 || isset($this->since[$i]) && microtime(true) - $this->since[$i] > 10
+                    || $this->secret !== null && strlen($b) >= 32 && !hash_equals($this->secret, substr($b, 0, 32))) {
+                    fclose($c);
                     unset($this->conns[$i], $this->parts[$i], $this->since[$i]);
                     continue;
                 }
-                $b = $this->parts[$i] ?? '';
                 $p = $this->secret === null ? 0 : 32;
-                if (strlen($b) >= $p + 22 && substr($b, $p, 6) === self::WATCH                  // a guest: kept open, shown the session
-                    && ($this->secret === null || hash_equals($this->secret, substr($b, 0, 32)))) {
+                if (strlen($b) >= $p + 22 && substr($b, $p, 6) === self::WATCH) {   // a guest (its secret checked above): kept open, shown the session
                     $id = substr($b, $p + 6, 16);
                     unset($this->conns[$i], $this->parts[$i], $this->since[$i]);
                     if (count($this->viewers) + count($this->joining) >= self::MAX_VIEWERS || !preg_match('/^[0-9a-f]{16}$/', $id)) {
@@ -295,9 +328,8 @@ final class Sessions
                 }
                 if (feof($c)) {
                     fclose($c);
-                    $b = $this->parts[$i] ?? '';
-                    if ($this->secret !== null) {     // TCP: only with the session's secret first (any local process can connect)
-                        $b = strlen($b) > 32 && hash_equals($this->secret, substr($b, 0, 32)) ? substr($b, 32) : '';
+                    if ($this->secret !== null) {     // TCP: what comes after the session's secret (checked above)
+                        $b = strlen($b) > 32 ? substr($b, 32) : '';
                     }
                     if (strlen($b) >= 4 && strlen($b) === 4 + unpack('V', $b)[1]) {   // a sender that died halfway: nothing
                         $this->pending .= $b;
@@ -354,6 +386,69 @@ final class Sessions
             $this->gapSince = null;
         }
         return $out;
+    }
+
+    /**
+     * Whether $token is the input token of running session $sid: its file keeps the token's SHA-256, never the token (a copy
+     * of the data folder gives no keyboard); a session started before that change kept the token itself (32 characters).
+     * rdp.php?a=send reads a message only then, and the WebSocket service takes one only then.
+     */
+    public static function tokenOk(string $sid, string $token): bool
+    {
+        $want = (string)(self::info($sid)['token'] ?? '');
+        return $want !== '' && $token !== '' && hash_equals($want, strlen($want) === 64 ? hash('sha256', $token) : $token);
+    }
+
+    /**
+     * A message of the session's own browser, its input token checked before: 204 delivered, 410 the session is gone, 404
+     * not one it may send (types 9 and up are not the browser's; out of order, Sessions::OUT_OF_BAND, only its camera's
+     * pictures, its folder's answers and its recording's video, which no key waits behind). rdp.php?a=send.
+     */
+    public static function fromBrowser(string $sid, string $body): int
+    {
+        if (!self::browserOk($body)) {
+            return 404;
+        }
+        return self::send($sid, $body) ? 204 : 410;
+    }
+
+    /** Whether $body is a message the browser may send (see fromBrowser). */
+    public static function browserOk(string $body): bool
+    {
+        return strlen($body) >= 5 && ord($body[4]) !== 9 && ord($body[4]) < 0x20
+            && (unpack('V', $body)[1] < self::GUEST_INPUT || (unpack('V', $body)[1] === self::OUT_OF_BAND && in_array(ord($body[4]), [18, 20, 21, 22], true)));
+    }
+
+    /**
+     * For the WebSocket service, which must never wait on one session (a session busy writing its picture does not read
+     * its input; waiting there froze every other session): a message of the browser (see fromBrowser) for session $sid as
+     * [a non-blocking connection to it, the bytes to write there, as they go]; [] when delivered at once (the queue file);
+     * null when it cannot be (the session gone, or not a message the browser may send).
+     *
+     * @return array{0:resource,1:string}|array{}|null
+     */
+    public static function sendLater(string $sid, string $body): ?array
+    {
+        if (!self::validSid($sid) || !self::browserOk($body)) {
+            return null;
+        }
+        $frame = pack('V', strlen($body)) . $body;
+        $mode  = (string)@file_get_contents(self::file($sid, 'mode'));
+        if ($mode === 'file') {
+            return self::send($sid, $body) ? [] : null;
+        }
+        if (preg_match('/^tcp:(\d{1,5}):([0-9a-f]{32})$/', $mode, $t)) {
+            [$c, $frame] = [@stream_socket_client('tcp://127.0.0.1:' . $t[1], $en, $es, 2), $t[2] . $frame];
+        } elseif ($mode === 'sock') {
+            $c = @stream_socket_client('unix://' . self::sockPath($sid), $en, $es, 2);
+        } else {
+            return null;
+        }
+        if ($c === false) {
+            return null;
+        }
+        stream_set_blocking($c, false);
+        return [$c, $frame];
     }
 
     /** Delivers a message to a running session. */

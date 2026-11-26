@@ -22,6 +22,24 @@ if [ ! -f /etc/mudesk/tls/cert.pem ] || [ ! -f /etc/mudesk/tls/key.pem ]; then
     echo "MuDeskClient: self-signed certificate made for ${MUDESK_HOSTNAME:-localhost}"
 fi
 chown -R www-data:www-data /var/www/mudesk/data
+# Apache processes at once (docker/apache.conf): a whole number from 10 to 20000, else 256
+case "${MUDESK_WORKERS:-}" in
+    ''|*[!0-9]*) MUDESK_WORKERS=256 ;;
+esac
+if [ "${#MUDESK_WORKERS}" -gt 5 ] || [ "$MUDESK_WORKERS" -lt 10 ] || [ "$MUDESK_WORKERS" -gt 20000 ]; then
+    echo "MuDeskClient: MUDESK_WORKERS must be from 10 to 20000; 256 taken"
+    MUDESK_WORKERS=256
+fi
+export MUDESK_WORKERS
+echo "MuDeskClient: up to $MUDESK_WORKERS Apache processes at once"
+# the optional WebSocket service (tools/ws-server.php), as Apache's user, behind Apache (docker/apache.conf, /ws): started
+# again when it stops; config.php's websocket => false ends it at once, for good
+(
+    while :; do
+        runuser -u www-data -- php /var/www/mudesk/tools/ws-server.php && break
+        sleep 5
+    done
+) &
 if [ -f /var/www/mudesk/data/setup-code.php ]; then
     echo "MuDeskClient: first run; the setup code is the second line of /var/www/mudesk/data/setup-code.php"
 fi

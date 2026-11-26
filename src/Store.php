@@ -111,7 +111,13 @@ final class Store
             }
             $ok = file_put_contents($tmp, $json) === strlen($json);   // (a full disk: a part written is no store)
             @chmod($tmp, 0600);                       // before it takes the file's place: never readable by others, even for a moment
-            if (!$ok || !@rename($tmp, $file)) {          // (said by the exception below, not by a warning as well)
+            // on Windows a file another process has open cannot be replaced ("Access denied"): a reader that does not take the
+            // lock (a backup being made, an antivirus) made the update fail at once (500). Tried again for up to half a second
+            for ($i = 0; $ok && !@rename($tmp, $file); $i++) {   // (said by the exception below, not by a warning as well)
+                $ok = $i < 50;
+                $ok && usleep(10000);
+            }
+            if (!$ok) {
                 @unlink($tmp);
                 throw new RuntimeException('Cannot write store');
             }

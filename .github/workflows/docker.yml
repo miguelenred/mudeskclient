@@ -1,6 +1,8 @@
 # MuDeskClient - https://miguelenred.es/mudeskclient - Apache License 2.0
 # The Docker image of each released version, published in GitHub's container registry as
-# ghcr.io/miguelenred/mudeskclient:<version> and :latest (the image is tested by the "docker" job of tests.yml on every push).
+# ghcr.io/miguelenred/mudeskclient:<version> and :latest, and on Docker Hub as miguelenred/mudeskclient when the repository has
+# the secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (a Docker Hub access token with write access); the image is tested by the
+# "docker" job of tests.yml on every push.
 name: docker
 
 on:
@@ -15,20 +17,34 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Image built and pushed with its version and as latest
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           v="${GITHUB_REF_NAME#v}"
-          image=ghcr.io/miguelenred/mudeskclient
+          images=ghcr.io/miguelenred/mudeskclient
           echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          # the same image on Docker Hub too, when its secrets are set (without them: GitHub's registry only, as before)
+          if [ -n "$HUB_USER" ] && [ -n "$HUB_TOKEN" ]; then
+            echo "$HUB_TOKEN" | docker login -u "$HUB_USER" --password-stdin
+            images="$images docker.io/miguelenred/mudeskclient"
+          fi
           # :latest only for a release (not for one such as 1.2.0-rc1)
-          tags="-t $image:$v"
-          case "$v" in *-*) ;; *) tags="$tags -t $image:latest" ;; esac
+          latest=yes
+          case "$v" in *-*) latest= ;; esac
+          tags=
+          for i in $images; do
+            tags="$tags -t $i:$v"
+            if [ -n "$latest" ]; then tags="$tags -t $i:latest"; fi
+          done
           docker build $tags \
             --label org.opencontainers.image.source=https://github.com/miguelenred/mudeskclient \
             --label org.opencontainers.image.version="$v" \
             --label org.opencontainers.image.licenses=Apache-2.0 .
-          docker push "$image:$v"
-          case "$v" in *-*) ;; *) docker push "$image:latest" ;; esac
+          for i in $images; do
+            docker push "$i:$v"
+            if [ -n "$latest" ]; then docker push "$i:latest"; fi
+          done

@@ -51,7 +51,7 @@ if (getenv('TRACE')) {
 $dvc = new Drdynvc($c, getenv('GFX') === 'avc' || getenv('GFX') === 'auto');
 $c->addChannel($dvc);
 if (getenv('AUDIO')) {
-    $c->addChannel(new MuDesk\Rdp\Rdpsnd($c));
+    $c->addChannel($snd = new MuDesk\Rdp\Rdpsnd($c));
 }
 if (getenv('DRIVE_UID')) {
     $c->addChannel(new MuDesk\Rdp\Rdpdr($c, getenv('DRIVE_UID'), true, (bool)getenv('PRINTER'), sys_get_temp_dir() . '/mudesk-print'));
@@ -64,7 +64,8 @@ try {
     while (microtime(true) - $t0 < $seconds) {
         $r = $pipe ? [$c->t->sock, $pipe] : [$c->t->sock];
         $w = $e = null;
-        @stream_select($r, $w, $e, 0, 200000);
+        $played = isset($snd) ? $snd->tick() : null;  // (the sound's confirms, as each block is played: as rdp.php)
+        @stream_select($r, $w, $e, 0, (int)(min(0.2, $played ?? 0.2) * 1e6));
         if (!$c->poll()) {
             echo "server closed\n";
             break;

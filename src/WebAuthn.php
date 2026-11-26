@@ -38,11 +38,22 @@ final class WebAuthn
         return (string)base64_decode(strtr($s, '-_', '+/'), true);
     }
 
-    /** New challenge for $purpose, kept in the session for 2 minutes. */
+    /** Challenges waiting in a session at most (a sign-in and adding a passkey in two tabs, the sign-in page opened again). */
+    private const CHALLENGES = 8;
+
+    /**
+     * New challenge for $purpose, kept in the session for 2 minutes with the others still waiting (before, in one place:
+     * a second tab's sign-in or passkey took the first one's, which then failed as "invalid"); the oldest go past
+     * CHALLENGES.
+     */
     private static function challenge(string $purpose): string
     {
-        $c = random_bytes(32);
-        $_SESSION['wa'] = ['c' => $c, 'p' => $purpose, 'exp' => time() + 120];
+        $c    = random_bytes(32);
+        $now  = time();
+        $wait = array_filter(is_array($_SESSION['wa'] ?? null) ? $_SESSION['wa'] : [],
+            static fn($w): bool => is_array($w) && is_string($w['c'] ?? null) && ($w['exp'] ?? 0) >= $now);   // (a version's single one: dropped)
+        $wait[] = ['c' => $c, 'p' => $purpose, 'exp' => $now + 120];
+        $_SESSION['wa'] = array_values(array_slice($wait, -self::CHALLENGES));
         return self::b64u($c);
     }
 
@@ -119,14 +130,22 @@ final class WebAuthn
 
     // ---- internals ----
 
+    /** Whether $json is the browser's data for a challenge of $purpose still waiting; that challenge is used once (taken away). */
     private static function clientData(string $json, string $type, string $purpose): bool
     {
-        $wa = $_SESSION['wa'] ?? null;
-        unset($_SESSION['wa']);                          // each challenge is used once
-        $c = json_decode($json, true);
-        return is_array($wa) && is_array($c) && $wa['exp'] >= time() && hash_equals($wa['p'], $purpose)
-            && ($c['type'] ?? '') === $type && is_string($c['challenge'] ?? null) && is_string($c['origin'] ?? null)   // (lists: warnings)
-            && hash_equals(self::b64u($wa['c']), $c['challenge']) && hash_equals(self::origin(), $c['origin']) && empty($c['crossOrigin']);
+        $c  = json_decode($json, true);
+        $wa = null;
+        if (is_array($c) && is_string($c['challenge'] ?? null) && is_array($_SESSION['wa'] ?? null)) {   // (a list there: warnings)
+            foreach ($_SESSION['wa'] as $i => $w) {
+                if (is_array($w) && is_string($w['c'] ?? null) && hash_equals(self::b64u($w['c']), $c['challenge'])) {
+                    $wa = $w;
+                    unset($_SESSION['wa'][$i]);
+                }
+            }
+        }
+        return $wa !== null && ($wa['exp'] ?? 0) >= time() && hash_equals((string)($wa['p'] ?? ''), $purpose)
+            && ($c['type'] ?? '') === $type && is_string($c['origin'] ?? null)
+            && hash_equals(self::origin(), $c['origin']) && empty($c['crossOrigin']);
     }
 
     /** Parses authenticator data; checks the RP id hash and the user present + verified flags. */

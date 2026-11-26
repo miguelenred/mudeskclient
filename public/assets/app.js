@@ -58,6 +58,7 @@ const ICONS = {
   grid: 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z',
   check: 'M4 12l5 5L20 6',
   camera: 'M4 8h3l2-3h6l2 3h3v11H4zM12 16.5a3.5 3.5 0 1 0 0-7a3.5 3.5 0 0 0 0 7z',
+  mic: 'M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zM5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21M8.5 21h7',
   crop: 'M6 2v14a2 2 0 0 0 2 2h14M2 6h14a2 2 0 0 1 2 2v14',
   copy: 'M9 9h11v11H9zM5 15H4V4h11v1',
   pause: 'M8 5v14M16 5v14',
@@ -103,13 +104,22 @@ const btn = (label, onclick, cls = '', ic = null, title = null) =>
 const fingerprint = (hex) => String(hex || '').toUpperCase().replace(/(.{4})(?=.)/g, '$1 ');
 const field = (label, input, hint = null) => h('label', { class: 'field' }, h('span', {}, label), input, hint && h('small', { class: 'muted' }, hint));
 const check = (label, attrs) => h('label', { class: 'check' }, h('input', { type: 'checkbox', ...attrs }), label);
+/**
+ * A redirection the user cannot turn on (Connections::max on the server): off in an administrator's connection, or in a user's
+ * own one when the user may not make connections. Shown unticked and disabled, with why on hover.
+ */
+const capped = (c, k) => (c.max ? c.max[k] === false : S.user.create_conns === false && !c.managed && !c.occasional && !!c.id && !c[k]);
+const redirect = (c, k, label) => check(label, { name: k, checked: !!c[k] && !capped(c, k), disabled: capped(c, k), title: capped(c, k) ? t('redirect_off') : null });
 const select = (name, options, value) =>
   h('select', { name }, Object.entries(options).map(([v, l]) => h('option', { value: v, selected: String(v) === String(value) }, l)));
-/** Quality indicator of the session toolbar, always 29 characters (monospace): the toolbar does not change width. */
+/**
+ * Quality indicator of the session toolbar, always 29 characters (monospace): the toolbar does not change width. A latency
+ * not known (ms null: through the WebSocket service nothing answers the input) is a dash, not 0.
+ */
 const statsText = (fps, ms, kbs) => {
   const pad = (v, n) => String(v).padStart(n);
   const rate = kbs < 999.5 ? pad(Math.round(kbs), 4) + ' KB/s' : pad((kbs / 1024).toFixed(kbs < 10189 ? 1 : 0), 4) + ' MB/s';
-  return `${pad(Math.min(999, Math.round(fps)), 3)} fps · ${pad(Math.min(9999, Math.round(ms)), 4)} ms · ${rate}`;
+  return `${pad(Math.min(999, Math.round(fps)), 3)} fps · ${pad(ms === null ? '–' : Math.min(9999, Math.round(ms)), 4)} ms · ${rate}`;
 };
 const fmtSize = (n) => n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : n < 1073741824 ? (n / 1048576).toFixed(1) + ' MB' : (n / 1073741824).toFixed(2) + ' GB';
 const fmtDate = (s) => s ? new Date(s).toLocaleString(getLang()) : t('never');
@@ -196,6 +206,25 @@ function modal(title, body, actions) {
 }
 const confirmDialog = (text) => modal(text, '', (close) => [btn(t('cancel'), () => close(false)), btn(t('yes'), () => close(true), 'primary')]);
 const formData = (form) => Object.fromEntries(new FormData(form).entries());
+
+/**
+ * The optional WebSocket service (S.ws: its path, see tools/ws-server.php): tried once in the background; sessions use it
+ * when it answered (WS.ok), else HTTP, as always. A promise of whether it answered.
+ */
+const WS = { ok: false, tried: null };
+function probeWs() {
+  if (WS.tried) return WS.tried;
+  if (!S?.ws || typeof WebSocket !== 'function') return Promise.resolve(false);
+  WS.tried = new Promise((resolve) => {
+    let s = null, done = false;
+    const end = (ok) => { if (done) return; done = true; WS.ok = ok; try { s?.close(); } catch { /* (closed) */ } resolve(ok); };
+    try { s = new WebSocket(new URL(S.ws, location.href).href.replace(/^http/, 'ws')); } catch { end(false); return; }
+    s.onopen = () => end(true);
+    s.onerror = s.onclose = () => end(false);
+    setTimeout(() => end(false), 2000);
+  });
+  return WS.tried;
+}
 
 async function loadState() {
   const j = await (await fetch('api.php', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"action":"state"}' })).json()
@@ -318,12 +347,20 @@ function render() {
   if (r.view !== 's' && currentRdp) endRdp();
   if (S.setup) return authScreen(viewSetup());
   if (!S.user) return authScreen(S.second ? viewSecond() : viewLogin());
+  // back from the provider with an error while signed in (linking the account from the profile: cancelled there, a domain not
+  // allowed, the flow expired): said in the profile, once (before, only the sign-in screen said it: lost here)
+  const ssoErr = new URLSearchParams(location.search).get('oidc_error');
+  const toProfile = !!ssoErr && !!S.user.oidc_link;      // (where it was asked: the account can still be linked)
+  if (ssoErr) {
+    history.replaceState(null, '', location.pathname + (toProfile ? '#/profile' : location.hash));
+    setTimeout(() => toast(oidcErrText(ssoErr), true, 10000), 0);
+  }
   if (S.user.must_change) return authScreen(viewForcePassword());
-  if (r.view === 's' && !needSecond()) return viewSession(r.arg);
-  if (r.view === 'rec' && !needSecond()) return viewRecording(r.arg);   // (the gateway gives each user only what they may watch)
+  if (r.view === 's' && !needSecond() && !toProfile) return viewSession(r.arg);
+  if (r.view === 'rec' && !needSecond() && !toProfile) return viewRecording(r.arg);   // (the gateway gives each user only what they may watch)
   recFrom = location.hash;                               // where a recording's player goes back to
   const views = { conns: viewConns, files: viewFiles, recordings: viewMyRecordings, profile: viewProfile, admin: viewAdmin };
-  const view = needSecond() ? 'profile' : (views[r.view] ? r.view : 'conns');
+  const view = needSecond() || toProfile ? 'profile' : (views[r.view] ? r.view : 'conns');
   layout(view, views[view](r.arg));
 }
 
@@ -357,7 +394,8 @@ function layout(active, content) {
         render();
       }), 'small')),
     h('main', { class: 'page' }, previousNotice(), admin && S.user.targets_all && h('p', { class: 'warn banner' }, t('targets_all_warn')),
-      admin && S.user.check_php && h('p', { class: 'error banner' }, t('check_php_left')), content),   // (tools/check.php copied there)
+      admin && S.user.check_php && h('p', { class: 'error banner' }, t('check_php_left')),   // (tools/check.php copied there)
+      admin && S.user.proxy_undeclared && h('p', { class: 'warn banner' }, t('proxy_undeclared_warn')), content),   // (Http::undeclaredProxy)
     h('footer', { class: 'project small' }, h('a', { href: 'https://miguelenred.es/mudeskclient', target: '_blank', rel: 'noopener' }, 'miguelenred.es/mudeskclient')));
 }
 
@@ -373,21 +411,148 @@ function previousNotice() {
 
 // ------------------------------------------------------------------ auth views
 
+// ---- the first run, guided: the setup code, then the server checked (by itself and from this browser), then the
+// administrator; the checks are the server's and need the code (api.php setup.*, MuDesk\Setup) ----
+
 function viewSetup() {
-  const err = errBox();
+  const err = errBox(), out = h('div', {});
+  const ask = h('form', {
+    onsubmit: (e) => {
+      e.preventDefault();
+      const code = formData(ask).setup_code.trim();
+      attempt(async () => { const r = await api('setup.check', { setup_code: code }); ask.remove(); fill(out, setupChecks(code, r.checks, out)); }, err);
+    },
+  },
+  h('p', { class: 'muted' }, t('setup_intro')),
+  field(t('setup_code'), h('input', { name: 'setup_code', required: true, autocomplete: 'off', spellcheck: 'false' }), t('setup_code_help')),
+  err, h('button', { class: 'btn primary', style: 'width:100%' }, t('setup_check')));
+  return h('div', { class: 'setup' }, h('h1', {}, t('setup_title')), ask, out);
+}
+
+/** What to do about check k (chk_...) in its state: its text for that state (k_warn, k_fail), else its one fix (k_fix). */
+const setupFix = (k, state) => (t(k + '_' + state) !== k + '_' + state ? t(k + '_' + state) : t(k + '_fix'));
+
+/** One line of the checks: its state (ok, warn, fail, info: optional, or running), what it is, what was found, and what to do when not ok. */
+function setupRow(state, title, value, fix) {
+  return h('li', { class: 'setup-check ' + state }, icon(state === 'ok' ? 'check' : state === 'fail' ? 'x' : state === 'warn' ? 'info' : 'refresh'),
+    h('div', {}, h('b', {}, title), value ? h('span', { class: 'muted' }, ' · ' + value) : null, ['warn', 'fail', 'info'].includes(state) ? h('small', {}, fix) : null));
+}
+
+/** The server's checks, then the two only a browser can make (a long request, requests at once), a remote computer if asked. */
+function setupChecks(code, checks, out) {
+  const list = h('ul', { class: 'setup-checks' }, ...checks.map((c) => setupRow(c.state, t('chk_' + c.id), c.value, setupFix('chk_' + c.id, c.state))));
+  let stream = setupRow('run', t('chk_stream'), t('setup_running')), procs = setupRow('run', t('chk_procs'), t('setup_waiting'));
+  list.append(stream, procs);
+  const note = h('p', { class: 'warn' }), rdpOut = h('p', { class: 'muted' });
+  let limit = 0, fails = checks.filter((c) => c.state === 'fail').length;
+  const next = btn(t('setup_continue'), () => fill(out, setupAdmin(code, limit)), 'primary');
+  next.disabled = true;
+  (async () => {
+    const s = await setupStream(code);
+    stream.replaceWith(stream = setupRow(s.state, t('chk_stream'), s.value, t('chk_stream_fix')));
+    procs.replaceWith(procs = setupRow('run', t('chk_procs'), t('setup_running')));
+    const p = await setupProcs(code);
+    procs.replaceWith(procs = setupRow(p.state, t('chk_procs'), p.value, t('chk_procs_fix')));
+    limit = p.limit;
+    fails += (s.state === 'fail') + (p.state === 'fail');
+    const ws = await probeWs();                          // (optional: none is no fault, its advantages said)
+    list.append(setupRow(ws ? 'ok' : 'info', t('chk_websocket'), ws ? t('setup_ws_on') : '', t('chk_websocket_info')));
+    note.textContent = fails ? t('setup_fails') : '';
+    next.disabled = false;
+  })();
+  const rdp = h('form', {
+    class: 'row',
+    onsubmit: (e) => {
+      e.preventDefault();
+      const d = formData(rdp);
+      rdpOut.textContent = t('setup_running');
+      attempt(async () => {
+        const r = await api('setup.rdp', { setup_code: code, host: d.host.trim(), port: +d.port || 3389 });
+        rdpOut.textContent = r.ok ? t('setup_rdp_ok', t('setup_proto_' + r.protocol), r.ms, r.tls ? ` (${r.tls}${r.cn ? ', ' + r.cn : ''})` : '')
+          : t('setup_rdp_' + r.problem);
+      }, rdpOut);
+    },
+  }, h('input', { name: 'host', required: true, placeholder: t('setup_rdp_host'), autocomplete: 'off', spellcheck: 'false' }),
+  h('input', { name: 'port', type: 'number', min: 1, max: 65535, value: 3389, style: 'width:6rem', 'aria-label': t('setup_rdp_port') }),
+  h('button', { class: 'btn' }, t('setup_rdp_try')));
+  return [h('h2', {}, t('setup_checks')), list, h('h2', {}, t('setup_rdp')), rdp, rdpOut, note, h('div', { class: 'row end' }, next)];
+}
+
+/** The long request a session needs: a line a second for 12 s, each as it comes (a server or proxy holding it back, or cutting it). */
+async function setupStream(code, seconds = 12) {
+  const t0 = performance.now(), at = [];
+  try {
+    const r = await fetch('api.php', { method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/json', 'X-CSRF': S?.csrf || '' },
+      body: JSON.stringify({ action: 'setup.stream', setup_code: code, seconds }) });
+    if (r.ok && r.body) {
+      const rd = r.body.getReader(), dec = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { value, done } = await rd.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (const l of lines) if (l.trim()) at.push(performance.now() - t0);
+      }
+    }
+  } catch { /* (cut on the way: said below) */ }
+  const gap = Math.max(0, ...at.map((v, i) => v - (i ? at[i - 1] : 0)));
+  if (at.length < seconds) return { state: 'fail', value: t('setup_cut', Math.round((at.at(-1) ?? 0) / 1000), seconds) };
+  if (gap > 2500) return { state: 'warn', value: t('setup_held', (gap / 1000).toFixed(1)) };
+  return { state: 'ok', value: '' };
+}
+
+/**
+ * Requests at once: 20 of a second each, how many the server took together (its own clock), those it refused without
+ * running them (429, 503, 508: a hosting's limit of processes) and the limit of sessions that follows, as tools/check.php
+ * counts it (docs/HOSTING.md, Capacity): a fifth of them when it refuses the rest, else 2 fewer. limit 0: nothing to set.
+ */
+async function setupProcs(code, n = 20) {
+  try {
+    const all = await Promise.all(Array.from({ length: n }, async () => {
+      const r = await fetch('api.php', { method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/json', 'X-CSRF': S?.csrf || '' },
+        body: JSON.stringify({ action: 'setup.wait', setup_code: code }) });
+      if ([429, 503, 508].includes(r.status)) return { refused: r.status };
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }));
+    const served = all.filter((x) => !x.refused);
+    let cur = 0, max = 0;
+    for (const [, d] of served.flatMap((x) => [[x.start, 1], [x.end, -1]]).sort((a, b) => a[0] - b[0] || a[1] - b[1])) max = Math.max(max, cur += d);
+    const state = (limit) => (limit < 1 ? 'fail' : limit < 20 ? 'warn' : 'ok');   // (20: the sessions at once allowed by default)
+    if (served.length < all.length) {
+      const limit = Math.floor(max / 5);
+      return { state: state(limit), value: t('setup_procs_refused', max, Math.max(limit, 0)), limit: Math.max(limit, 0) };
+    }
+    const h1 = performance.getEntriesByType?.('resource').some((e) => /api\.php/.test(e.name) && e.nextHopProtocol === 'http/1.1');
+    if (max >= n || (h1 && max >= 6)) return { state: 'ok', value: t('setup_procs_many', max), limit: 0 };   // (no limit found)
+    return { state: state(max - 2), value: t('setup_procs', max, Math.max(max - 2, 0)), limit: Math.max(max - 2, 0) };
+  } catch (e) {
+    return { state: 'warn', value: e.message, limit: 0 };
+  }
+}
+
+/** The administrator, as before; with a limit of sessions found below the default, offered (ticked) to be set too. */
+function setupAdmin(code, limit) {
+  const err = errBox(), apply = limit > 0 && limit < 20;
   const form = h('form', {
     onsubmit: (e) => {
       e.preventDefault();
       const d = formData(form);
       if (d.password !== d.password2) { err.textContent = t('pw_mismatch'); return; }
-      attempt(async () => { await api('setup', { setup_code: d.setup_code, username: d.username, password: d.password }); render(); }, err);
+      attempt(async () => {
+        await api('setup', { setup_code: code, username: d.username, password: d.password });
+        if (apply && d.limit) await api('admin.settings', { settings: { max_sessions_total: limit } });
+        render();
+      }, err);
     },
   },
-  h('h1', {}, t('setup_title')), h('p', { class: 'muted' }, t('setup_text')),
-  field(t('setup_code'), h('input', { name: 'setup_code', required: true, autocomplete: 'off', spellcheck: 'false' }), t('setup_code_help')),
+  h('h2', {}, t('setup_admin')), h('p', { class: 'muted' }, t('setup_text')),
   field(t('username'), h('input', { name: 'username', required: true, autocomplete: 'username' })),
   field(t('password'), h('input', { name: 'password', type: 'password', required: true, minlength: 12, autocomplete: 'new-password' }), t('pw_rule')),
   field(t('repeat_password'), h('input', { name: 'password2', type: 'password', required: true, autocomplete: 'new-password' })),
+  apply ? check(t('setup_limit', limit), { name: 'limit', checked: true }) : null,
   err, h('button', { class: 'btn primary', style: 'width:100%' }, t('create_admin')));
   return form;
 }
@@ -423,12 +588,15 @@ async function passkeySignIn() {
   render();
 }
 
+/** The text of an error the provider's sign-in came back with (oidc.php's ?oidc_error=): only one of ours, never as given. */
+const oidcErrText = (back) => t('e_' + back) !== 'e_' + back && back.startsWith('oidc_') || back === 'outside_hours' ? errText(back) : errText('oidc_provider');
+
 function viewLogin() {
   const err = errBox();
   const back = new URLSearchParams(location.search).get('oidc_error');   // back from the provider without signing in
   if (back) {
     history.replaceState(null, '', location.pathname + location.hash);
-    err.textContent = t('e_' + back) !== 'e_' + back && back.startsWith('oidc_') || back === 'outside_hours' ? errText(back) : errText('oidc_provider');
+    err.textContent = oidcErrText(back);
   }
   const form = h('form', {
     onsubmit: (e) => {
@@ -562,6 +730,9 @@ const rdpPicker = (onFiles) => {
  * .rdp files chosen: one is opened in the connection editor, filled in, to check and save (with what MuDesk does not take,
  * such as a start program, said there); several are saved at once and the result said. Resolves when done.
  */
+/** An import note's text ([i18n key, value]: a list of option keys is named). */
+const noteText = ([k, v]) => t(k, Array.isArray(v) ? v.map((x) => t(x)).join(', ') : v);
+
 async function importRdp(files, edit, save) {
   const read = [];
   for (const f of files) {
@@ -576,7 +747,7 @@ async function importRdp(files, edit, save) {
     try {
       await save(r.conn);
       ok++;
-      r.notes.forEach(([k, v]) => toast(`${r.file}: ${t(k, v)}`, false, 8000));
+      r.notes.forEach((n) => toast(`${r.file}: ${noteText(n)}`, false, 8000));
     } catch (e) { toast(`${r.file}: ${errText(e.message)}`, true); }
   }
   if (ok) toast(t('rdp_imported', ok));
@@ -742,7 +913,7 @@ function editConn(c, keyboards, opts = {}) {
   const { admin, owner, occasional } = opts, locked = !!opts.locked;
   // a user who may not make connections: their own keep their target (the computer, port, user, domain and security)
   const keepTarget = !admin && !owner && !locked && !!c?.id && S.user.create_conns === false;
-  c = c || { port: 3389, kbd: 0x040A, bpp: 16, gfx: 'auto', security: 'auto', resize: 'dynamic', clipboard: true, paste: 'auto', drive: true, audio: true, mic: false, printer: true, ask: true, perf: { smoothing: true } };
+  c = c || { port: 3389, kbd: 0x040A, bpp: 16, gfx: 'auto', security: 'nla', resize: 'dynamic', clipboard: true, paste: 'auto', drive: true, audio: true, mic: false, printer: true, ask: true, perf: { smoothing: true } };
   const err = errBox();
   const kb = Object.fromEntries(keyboards.map((k) => [k, KB_NAMES[k] || '0x' + k.toString(16)]));
   // an administrator's: the computer's certificate fixed for every connection to it (by its name or address), read now; it
@@ -761,7 +932,7 @@ function editConn(c, keyboards, opts = {}) {
   }
   // wide, its fields and options in columns where they fit (one on a phone): less scrolling (app.css, .conn-edit)
   const form = h('form', { class: 'conn-edit', onsubmit: (e) => e.preventDefault() },
-    opts.notes?.length > 0 && h('div', { class: 'notice small' }, opts.notes.map(([k, v]) => h('p', {}, t(k, v)))),
+    opts.notes?.length > 0 && h('div', { class: 'notice small' }, opts.notes.map((n) => h('p', {}, noteText(n)))),
     locked && h('div', { class: 'notice small' }, h('p', {}, t('managed_hint'))),
     keepTarget && h('div', { class: 'notice small' }, h('p', {}, t('conns_locked_hint'))),
     occasional && h('div', { class: 'notice small' }, h('p', {}, t('occasional_note'))),
@@ -812,11 +983,11 @@ function editConn(c, keyboards, opts = {}) {
         // (two columns wide where they fit: its choices are the longest)
         h('div', { class: 'conn-paste' }, field([t('paste_typing'), ' ', infoBtn(pasteInfo)], select('paste', PASTE_MODES(), c.paste || 'auto'), t('paste_hint')))),
       h('div', { class: 'conn-checks' },                // in columns, each box with its note
-        check(t('clipboard'), { name: 'clipboard', checked: c.clipboard }),
-        check(t('drive'), { name: 'drive', checked: c.drive }),
-        check(t('audio'), { name: 'audio', checked: c.audio }),
-        check(t('mic'), { name: 'mic', checked: !!c.mic }),
-        check(t('printer'), { name: 'printer', checked: c.printer }),
+        redirect(c, 'clipboard', t('clipboard')),
+        redirect(c, 'drive', t('drive')),
+        redirect(c, 'audio', t('audio')),
+        redirect(c, 'mic', t('mic')),
+        redirect(c, 'printer', t('printer')),
         h('div', {}, check(t('touch_multi'), { name: 'touch', checked: !!c.touch }), h('small', { class: 'muted' }, t('touch_multi_hint'))),
         // the administrator's to set: in their editors and in their own one (not a managed connection's, nor a manual one)
         (admin || owner || (S.user.role === 'admin' && !locked && !occasional)) && h('div', {}, check(t('record'), { name: 'record', checked: !!c.record }), h('small', { class: 'muted' }, t('record_hint'))),
@@ -1721,6 +1892,18 @@ function viewFiles(arg) {
 
 function viewProfile() {
   const u = S.user;
+  // back from linking the account to the single sign-on provider's (oidc.php): said once
+  const linked = new URLSearchParams(location.search).get('oidc_link');
+  if (linked) {
+    history.replaceState(null, '', location.pathname + location.hash);
+    setTimeout(() => toast(t(linked === 'ok' ? 'oidc_link_ok' : 'oidc_link_failed'), linked !== 'ok'), 0);
+  }
+  // a local account is linked to it by its user, signed in here (never by a name the provider gives: see oidc.php)
+  const oidcErr = errBox();
+  const oidcCard = (u.oidc_link || u.oidc_linked) && h('div', { class: 'card' }, h('h2', {}, t('oidc_account')),
+    u.oidc_linked ? h('p', { class: 'muted' }, t('oidc_account_linked'))
+      : [h('p', { class: 'small muted' }, t('oidc_account_help', u.oidc_link)),
+        btn(t('oidc_account_link', u.oidc_link), () => attempt(async () => { location.href = (await api('oidc.link')).url; }, oidcErr), 'primary'), oidcErr]);
   const twofa = h('div', {});
   const draw2fa = () => {
     if (S.user.totp) {
@@ -1772,6 +1955,7 @@ function viewProfile() {
     u.source !== 'oidc' && h('div', { class: 'card' }, h('h2', {}, t('twofa')), twofa),
     u.source !== 'oidc' && h('div', { class: 'card' }, h('h2', {}, t('passkeys')), passkeys),
     h('div', { class: 'card' }, h('h2', {}, t('change_password')), u.source ? h('p', { class: 'muted' }, t('password_external_' + u.source)) : passwordForm(() => {})),
+    oidcCard,
     profileActivity());
 }
 
@@ -2100,7 +2284,7 @@ function adminConns() {
               'small danger', 'trash', t('delete'))))))
           : h('p', { class: 'muted small' }, t('no_user_conns'))));
   };
-  const importer = rdpPicker((files) => data && importRdp(files, (c, notes) => managed(c, notes), (conn) => api('admin.conn.save', { conn, users: [] }))
+  const importer = rdpPicker((files) => data && importRdp(files, (c, notes) => managed({ ...c, users: [] }, notes), (conn) => api('admin.conn.save', { conn, users: [] }))
     .then(() => { if (files.length > 1) toast(t('rdp_imported_admin'), false, 8000); load(); }));
   const csv = h('input', { type: 'file', accept: '.csv,text/csv', class: 'hidden' });
   csv.addEventListener('change', () => { const f = csv.files[0]; csv.value = ''; if (f) importCsv(f).then(load); });
@@ -2123,6 +2307,22 @@ function hoursCard(hrs) {
     h('small', { class: 'muted' }, t('hours_help')));
 }
 
+/**
+ * A local user linked to the company account (from their profile): the administrator undoes it after yes (a wrong one
+ * linked); its sessions end, and the user links one again from their profile.
+ */
+function unlinkRow(u, err) {
+  const row = h('div', { class: 'row', style: 'margin-top:.6rem' }, h('span', { class: 'small muted', style: 'flex:1' }, t('oidc_user_linked')),
+    btn(t('oidc_unlink'), () => attempt(async () => {
+      if (!await confirmDialog(t('oidc_unlink_q', u.username))) return;
+      await api('admin.user.oidc_unlink', { id: u.id });
+      u.oidc_linked = false;
+      row.remove();
+      toast(t('oidc_unlinked'));
+    }, err), 'danger'));
+  return row;
+}
+
 function editUser(u) {
   const err = errBox();
   const form = h('form', { onsubmit: (e) => e.preventDefault() },
@@ -2138,7 +2338,8 @@ function editUser(u) {
       h('h3', {}, t('reset_password')), h('p', { class: 'small muted' }, t('reset_warning')),
       h('div', { class: 'row' }, h('input', { id: 'np', type: 'text', placeholder: t('temp_password'), autocomplete: 'off', style: 'flex:1' }),
         btn(t('reset_password'), () => attempt(async () => { await api('admin.user.password', { id: u.id, password: document.getElementById('np').value }); toast(t('saved')); }, err))),
-      (u.totp || u.passkeys.length > 0) && h('div', { class: 'row', style: 'margin-top:.6rem' }, btn(t('reset_2fa'), () => attempt(async () => { await api('admin.user.totp_reset', { id: u.id }); toast(t('saved')); }, err), 'danger'))),
+      (u.totp || u.passkeys.length > 0) && h('div', { class: 'row', style: 'margin-top:.6rem' }, btn(t('reset_2fa'), () => attempt(async () => { await api('admin.user.totp_reset', { id: u.id }); toast(t('saved')); }, err), 'danger')),
+      u.oidc_linked && unlinkRow(u, err)),
     err);
   return modal(u ? u.username : t('new_user'), form, (close) => [btn(t('cancel'), () => close(false)), btn(t('save'), () => {
     if (!form.reportValidity()) return;
@@ -2401,7 +2602,7 @@ async function viewSession(id) {
 
   const canvas = h('canvas', { width: 1024, height: 768, tabindex: -1 });
   const keyboard = h('textarea', { class: 'kbd', autocapitalize: 'off', autocomplete: 'off', spellcheck: 'false', 'aria-label': conn.name });
-  const overlay = h('div', { class: 'overlay' });
+  const overlay = h('div', { class: 'overlay', 'aria-live': 'polite' });   // (connecting, reconnecting, ended: read out as it changes)
   const panel = h('div', { class: 'panel hidden' });
   const bar = h('div', { class: 'bar' });
   // RemoteApp: its windows over the page, with a taskbar at the bottom (a minimized window is restored from there)
@@ -2416,10 +2617,20 @@ async function viewSession(id) {
   const fullOk = !!root.requestFullscreen;
   const mainFull = fullOnStart(canvas, window, root, () => s.focus());
   let startFull = false;
-  const s = new RdpSession({ container: root, canvas, keyboard, conn, csrf: S.csrf, retries: S.user.reconnect ?? 10, onState });
+  const s = new RdpSession({ container: root, canvas, keyboard, conn, csrf: S.csrf, retries: S.user.reconnect ?? 10, onState, ws: WS.ok ? S.ws : null });
   // recorded (by the connection, an administrator or the user): said while it lasts; the bar's button follows it
   const recBadge = h('div', { class: 'rec-badge hidden', role: 'status' }, t('rec_badge'));
   root.append(recBadge);
+  // this computer's microphone or camera in use by the remote computer: said by the session itself while it lasts (before,
+  // only by the browser's own sign, which a full screen or another window hides)
+  const capBadge = h('div', { class: 'cap-badge hidden', role: 'status' });
+  root.append(capBadge);
+  const capturing = { mic: false, cam: false };
+  const drawCapture = () => {
+    const what = capturing.mic && capturing.cam ? 'cap_both' : capturing.cam ? 'cap_cam' : 'cap_mic';
+    fill(capBadge, capturing.mic && icon('mic'), capturing.cam && icon('camera'), ' ', t(what));
+    capBadge.classList.toggle('hidden', !capturing.mic && !capturing.cam);
+  };
   let recOn = false, recBy = null, recBtn = null;
   const drawRec = () => {
     if (!recBtn) return;
@@ -2555,6 +2766,9 @@ async function viewSession(id) {
   // ---- screenshot of the remote desktop: whole (every monitor) or a part framed with the mouse or a finger; saved as PNG,
   // copied to this computer's clipboard or put on the remote one. Its pixels only: no toolbar, panels or pointer.
   let shot = null, shooting = false;                     // the last one: { blob, url, w, h }; being made (PNG can take a second)
+  // the view left: its pictures freed with it, the screenshot and the clipboard's images (an object URL holds its image as
+  // long as the page lasts, and the page stays for the next session)
+  s.leave.signal.addEventListener('abort', () => { if (shot) URL.revokeObjectURL(shot.url); clip?.dispose(); });
   const shotName = () => `${conn.name} ${new Date().toLocaleString('sv').replace(/:/g, '-')}.png`.replace(/[\\/:*?"<>|]+/g, '_');
   async function takeShot(area = null) {
     if (shooting || (area && (area[2] < 2 || area[3] < 2))) return;   // one at a time; a click is not a frame
@@ -2932,9 +3146,11 @@ async function viewSession(id) {
     clip = opts.clipboard ? new ClipboardBridge(s, { toast, t, onChange: () => panelOpen === 'clip' && showClip() }, clipHistory) : null;
     s.clipboard = clip;
     s.audio = opts.audio ? new AudioPlayer() : null;
-    s.mic = opts.mic ? new MicCapture({ send: (pcm, max, frame) => s.sendMic(pcm, max, frame), onError: (k) => toast(t(k), true, 10000) }) : null;
+    s.mic = opts.mic ? new MicCapture({ send: (pcm, max, frame) => s.sendMic(pcm, max, frame), onError: (k) => toast(t(k), true, 10000),
+      onLive: (on) => { capturing.mic = on; drawCapture(); } }) : null;
     // the camera with the microphone (one option): a program there that uses it turns it on (an empty picture: it could not)
-    s.cam = opts.mic ? new CamCapture({ send: (jpeg, no) => s.sendCam(jpeg, no), fail: (no) => s.sendCam(new Uint8Array(0), no), onError: (k) => toast(t(k), true, 10000) }) : null;
+    s.cam = opts.mic ? new CamCapture({ send: (jpeg, no) => s.sendCam(jpeg, no), fail: (no) => s.sendCam(new Uint8Array(0), no), onError: (k) => toast(t(k), true, 10000),
+      onLive: (on) => { capturing.cam = on; drawCapture(); } }) : null;
     // a folder of this computer, with the shared folder's option (chosen in the Files panel)
     s.folder = opts.drive ? new LocalFolder({
       send: (no, b) => s.sendFolderReply(no, b),
@@ -2962,7 +3178,8 @@ async function viewSession(id) {
         kbs = (c.bytes >= last.bytes ? c.bytes - last.bytes : c.bytes) / 1.024 / (c.bytesAt - last.bytesAt);   // a reconnection restarts the count
       }
       stats.textContent = statsText((c.frames - last.frames) / sec, c.rtt, kbs);
-      bar.dataset.q = c.rtt < 100 ? 'good' : c.rtt < 250 ? 'fair' : 'poor';
+      if (c.rtt === null) bar.removeAttribute('data-q');   // (not known through the WebSocket service: not said good)
+      else bar.dataset.q = c.rtt < 100 ? 'good' : c.rtt < 250 ? 'fair' : 'poor';
       last = { ...c, at: now };
       if (s.inputSeen && now - pinged > 60000) {         // the remote session is in use: keep the web session alive
         s.inputSeen = false;                               // (it expires when idle; reconnecting and printing need it)
@@ -3122,13 +3339,13 @@ async function viewSession(id) {
     // phone): Connect without scrolling down to it
     h('details', { class: 'conn-more' }, h('summary', {}, t('connect_options')),
       h('div', { class: 'conn-opts' },
-        check(t('audio'), { name: 'audio', checked: conn.audio }),
-        h('div', { class: 'check-info' }, check(t('mic'), { name: 'mic', checked: !!conn.mic }), infoBtn(micInfo, t('more_info'))),
-        check(t('clipboard'), { name: 'clipboard', checked: conn.clipboard }),
+        redirect(conn, 'audio', t('audio')),
+        h('div', { class: 'check-info' }, redirect(conn, 'mic', t('mic')), infoBtn(micInfo, t('more_info'))),
+        redirect(conn, 'clipboard', t('clipboard')),
         h('div', {}, h('div', { class: 'check-info' }, check(t('paste_typing'), { name: 'paste', checked: pasteFor(conn.paste) }), infoBtn(pasteInfo)),
           h('small', { class: 'muted', style: 'display:block;margin:-.2rem 0 .4rem 1.6rem' }, t('paste_hint'))),
-        check(t('drive'), { name: 'drive', checked: conn.drive }),
-        check(t('printer'), { name: 'printer', checked: conn.printer }),
+        redirect(conn, 'drive', t('drive')),
+        redirect(conn, 'printer', t('printer')),
         hasScreenApi() ? screen.isExtended !== false   // only with several screens
           && h('div', { class: 'check-info' }, check(t('all_screens'), { name: 'multi', checked: conn.multi !== false }), infoBtn(screensInfo, t('more_info')))   // (on unless turned off and remembered)
           : !touchOnly() && h('div', {}, h('div', { class: 'check-info' }, check(t('all_screens'), { name: 'multi', checked: !!knownScreen() && conn.multi !== false }),   // Firefox, Safari: looked for (on once found)
@@ -3250,8 +3467,9 @@ async function viewSession(id) {
     if (['cert_new', 'cert_changed', 'cert_unexpected'].includes(info.end)) {
       const k = info.end.slice(5), prints = h('div', { class: 'cert-prints' }, h('p', { class: 'small' }, t('cert_sha256')), h('p', { class: 'mono small' }, fingerprint(info.detail)),
         info.sha1 && h('p', { class: 'small' }, t('cert_sha1')), info.sha1 && h('p', { class: 'mono small' }, fingerprint(info.sha1)));
-      // an administrator trusts it for every user of this computer (a renewed one in place of the one fixed: only so)
-      const all = S.user.role === 'admin' && !info.host && h('input', { type: 'checkbox', checked: true, disabled: info.end === 'cert_unexpected' });
+      // an administrator trusts it for every user of this computer when he ticks it (a renewed one in place of the one fixed:
+      // only so). Before, ticked already: one accepted without a thought (a computer an imported file named) was fixed for all
+      const all = S.user.role === 'admin' && !info.host && h('input', { type: 'checkbox', checked: info.end === 'cert_unexpected', disabled: info.end === 'cert_unexpected' });
       return box(h('h2', {}, info.host ? t(`r_cert_${k}_host`, info.host) : t(`r_cert_${k}`)), h('p', {}, t(`cert_${k}_text`)), prints,
         all && h('label', { class: 'check' }, all, t('cert_all')),
         h('div', { class: 'row end' }, info.end === 'cert_unexpected' && !all ? btn(t('close'), closeTab, 'primary')
@@ -3260,7 +3478,9 @@ async function viewSession(id) {
     if (['auth_failed', 'gateway_auth'].includes(info.end) && !conn.has_pass) return askCredentials();   // (the gateway's: the same password)
     const ei = info.errorInfo && t('ei_' + info.errorInfo) !== 'ei_' + info.errorInfo ? t('ei_' + info.errorInfo) : null;
     const msg = ei || (t('r_' + info.end) !== 'r_' + info.end ? t('r_' + info.end) : t('disconnected'));
-    box(h('h2', {}, t('disconnected')), h('p', {}, msg), h('div', { class: 'row end' }, btn(t('close'), closeTab), btn(t('reconnect'), () => s.start(extra), 'primary')));
+    const again = btn(t('reconnect'), () => s.start(extra), 'primary');
+    box(h('h2', {}, t('disconnected')), h('p', {}, msg), h('div', { class: 'row end' }, btn(t('close'), closeTab), again));
+    again.focus();                                       // (the keyboard was left on the remote screen, with nothing behind it)
   }
 
   if (conn.ask || !conn.has_pass) connectDialog();
@@ -3479,7 +3699,7 @@ function viewWatch(link) {
 // ------------------------------------------------------------------ start
 
 // the server cannot answer: what happened, in the browser's language, and a way to try again
-loadState().then(() => { render(); checkDataFolder({ api, pref: tabPref, reload: () => location.reload() }); }, (e) => {
+loadState().then(() => { render(); probeWs(); checkDataFolder({ api, pref: tabPref, reload: () => location.reload() }); }, (e) => {
   setLang(browserLang());
   authScreen(h('div', {}, h('p', { class: 'error' }, e instanceof ApiError ? errText(e.message) : t('r_network')),
     h('div', { class: 'row end' }, btn(t('retry'), () => location.reload(), 'primary'))));

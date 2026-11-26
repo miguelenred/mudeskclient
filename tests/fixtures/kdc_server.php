@@ -15,7 +15,9 @@
 // the services TERMSRV/viejo.test.local and HTTP/viejo.test.local (RC4 keys only). User "iter1": a salt with
 // an iteration count of 1. User "cortaclave": a session key of 16 bytes said to be AES256. User "falso": as "viejo", but
 // its RC4 said whatever the client offers (as someone between it and the KDC would). User "rc4sesion": an AES key, its
-// session key RC4 whatever the client offers. "<user>@empresa.com": an alternate
+// session key RC4 whatever the client offers. User "rc4rep": its AS-REP in RC4 without pre-authentication, whatever the
+// client offers (its session key AES). User "lejano": a clock error with the KDC three days ahead. User "dossal": a timestamp that does not open with the key of a second salt
+// answered with PREAUTH_REQUIRED naming that one (as when the account's keys changed meanwhile). "<user>@empresa.com": an alternate
 // UPN suffix of the user's account (an enterprise name). A request for another realm with an enterprise name:
 // KDC_ERR_WRONG_REALM, this realm in its crealm. Service TERMSRV/pc.otro.local: a referral to OTRO.LOCAL's KDC.
 declare(strict_types=1);
@@ -119,12 +121,30 @@ while ($c = @stream_socket_accept($srv, 120)) {
             $rc4     = $account === 'viejo' || $account === 'falso';
             $rc4Ses  = $rc4 || $account === 'rc4sesion';                // (its session key RC4)
             $salt    = KrbFixture::REALM . $account . "#salt";             // (not the default one: the client must take it from PA-ETYPE-INFO2)
+            if ($account === 'dossal' && isset($padata[2])) {          // only the second salt's key from the timestamp on
+                try {
+                    KC::decrypt(KC::stringToKey(18, $password, "$salt-2"), 1, Der::value(Der::fields(Der::value($padata[2]))[2]));
+                } catch (Throwable) {
+                    unset($padata[2]);                                 // (asked again, with that salt)
+                }
+                $salt .= '-2';
+            }
             if ($realm !== KrbFixture::REALM) {                        // another realm: an enterprise name referred here
                 echo $ntype === 10 ? "as $cname referral\n" : "as $cname unknown\n";
                 $out = $ntype === 10 ? $error(68, '', null, KrbFixture::REALM) : $error(6);
-            } elseif (!in_array($account, [$user, 'locked', 'locked2', 'skewed', 'viejo', 'iter1', 'cortaclave', 'falso', 'rc4sesion'], true)) {
+            } elseif (!in_array($account, [$user, 'locked', 'locked2', 'skewed', 'viejo', 'iter1', 'cortaclave', 'falso', 'rc4sesion', 'dossal', 'rc4rep', 'lejano'], true)) {
                 echo "as $cname unknown\n";
                 $out = $error(6);
+            } elseif ($account === 'lejano') {                          // (the client must not take a clock so far away)
+                echo "as $cname far\n";
+                $out = $error(37, '', time() + 3 * 86400);
+            } elseif ($account === 'rc4rep') {                          // (as someone between the client and the KDC would)
+                echo "as $cname rc4rep\n";
+                $key     = hash('md4', Text::toUtf16($password), true);
+                $session = random_bytes(32);
+                $tgt     = KrbFixture::ticket(KrbFixture::key('krbtgt/' . KrbFixture::REALM), ['krbtgt', KrbFixture::REALM], $account, $session, time() + 36000, 18);
+                $out     = $reply(11, $account, $tgt, $key, 3, $session, $nonce, ['krbtgt', KrbFixture::REALM],
+                    static fn(string $part): string => Der::seq(Der::ctx(0, Der::int(23)), Der::ctx(2, Der::octet($rc4hmac($key, 8, $part, true)))), 18);
             } elseif ($account === 'viejo' && !in_array(23, $etypes, true)) {   // KDC_ERR_ETYPE_NOSUPP: the client offers no key the account has
                 echo "as $cname etype\n";
                 $out = $error(14);

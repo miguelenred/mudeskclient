@@ -67,6 +67,17 @@ final class Http
             || (self::fromProxy() && strtolower($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
     }
 
+    /**
+     * A reverse proxy on this same machine not listed in trusted_proxies: the request comes from this machine with an
+     * X-Forwarded-For. Then every client counts as this machine (its locks and allowed addresses shared, HTTPS not required):
+     * said to administrators in the panel, always (before, only by the first run's checks).
+     */
+    public static function undeclaredProxy(): bool
+    {
+        $from = self::canon($_SERVER['REMOTE_ADDR'] ?? '');
+        return in_array($from, ['127.0.0.1', '::1'], true) && !empty($_SERVER['HTTP_X_FORWARDED_FOR']) && !self::fromProxy();
+    }
+
     /** Whether the request came from a trusted proxy (its address compared as an address, however it is written). */
     private static function fromProxy(): bool
     {
@@ -148,6 +159,25 @@ final class Http
     public static string $action = '';
     public static bool $auditFailures = true;
 
+    /**
+     * A session's request handed over by the WebSocket service (tools/ws-session.php): its body, given instead of php://input,
+     * and the service's end of its standard input, whose closing says the browser left (connection_aborted() knows nothing
+     * there). Both null: an ordinary web request.
+     */
+    public static ?string $serviceBody = null;
+    /** @var resource|null */
+    public static mixed $serviceIn = null;
+
+    /** Whether the browser left: the web server says so, or, for the WebSocket service, its standard input closed. */
+    public static function aborted(): bool
+    {
+        if (self::$serviceIn === null) {
+            return connection_aborted() !== 0;
+        }
+        $c = is_resource(self::$serviceIn) ? @fread(self::$serviceIn, 64) : false;   // (non-blocking: nothing else ever comes)
+        return $c === false || ($c === '' && feof(self::$serviceIn));
+    }
+
     /** Answers {"error": key} (plus $more, e.g. why the session closed) and ends the request. */
     public static function fail(string $error, int $code = 400, array $more = []): never
     {
@@ -168,6 +198,9 @@ final class Http
     public static function body(): string
     {
         static $raw = null;
+        if ($raw === null && self::$serviceBody !== null) {   // (a session's request handed over by the WebSocket service)
+            $raw = strlen(self::$serviceBody) > self::BODY_MAX ? self::fail('too_large', 413) : self::$serviceBody;
+        }
         if ($raw === null) {
             $len = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
             $raw = $len > self::BODY_MAX ? '' : (string)@file_get_contents('php://input', false, null, 0, $len > 0 ? $len : self::BODY_MAX + 1);
@@ -185,6 +218,15 @@ final class Http
     public static function int(mixed $v, int $default = 0): int
     {
         return is_int($v) ? $v : (is_float($v) || (is_string($v) && is_numeric($v)) ? (int)max(-1e15, min(1e15, (float)$v)) : (is_bool($v) ? (int)$v : $default));
+    }
+
+    /**
+     * A yes/no field of a request: true or false (1 or 0 too); null for anything else, which the caller refuses. Before,
+     * cast: "false", "no", "0.0" or a list were taken as yes.
+     */
+    public static function yes(mixed $v): ?bool
+    {
+        return is_bool($v) ? $v : ($v === 1 || $v === 0 ? $v === 1 : null);
     }
 
     /** The request's JSON object or list ([] when it is not one), decoded once. */

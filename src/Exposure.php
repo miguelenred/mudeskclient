@@ -18,7 +18,7 @@ namespace MuDesk;
  * there, and no browser could stop it).
  *
  * Where it was found readable (the address, port, name and folder) is kept, and asked again with the request's: a request
- * with another name or path (the Host of another site, a path after the script's) never finds it protected alone.
+ * with another name or path (another of the server's names, a path after the script's) never finds it protected alone.
  */
 final class Exposure
 {
@@ -28,7 +28,9 @@ final class Exposure
     public static function guard(): void
     {
         $s = self::state();
-        if (self::due($s, time())) {
+        // (a session run by the WebSocket service is no web request: what is known is only read; the web server's own
+        // requests look again, and a 'unknown' saved from there would have let the application work while exposed)
+        if (self::due($s, time()) && Http::$serviceIn === null) {
             $s = PHP_SAPI === 'cli' || PHP_SAPI === 'cli-server' ? self::save('unknown', 'server') : (self::probe($_SERVER) ?? $s);
         }
         if ($s['state'] === 'exposed') {
@@ -48,15 +50,17 @@ final class Exposure
     }
 
     /**
-     * Where request $srv ($_SERVER) came: the address and port it came to, TLS, its Host, and its script's folder (from
-     * SCRIPT_NAME, the server's: never a path the client adds after the script).
+     * Where request $srv ($_SERVER) came: the address and port it came to, TLS, the site's name, and its script's folder
+     * (from SCRIPT_NAME, the server's: never a path the client adds after the script). The name is public_url's when set,
+     * else the server's own (SERVER_NAME), never the request's Host: with another site's (a neighbour on a shared server that
+     * serves such a file), the gateway asked that site, and stopped for everyone.
      */
     public static function target(array $srv): array
     {
         $script = (string)($srv['SCRIPT_NAME'] ?? '');
         $path   = $script !== '' ? $script : (string)parse_url((string)($srv['REQUEST_URI'] ?? '/'), PHP_URL_PATH) . 'x';
         return ['SERVER_ADDR' => (string)($srv['SERVER_ADDR'] ?? ''), 'SERVER_PORT' => (int)($srv['SERVER_PORT'] ?? 0),
-            'HTTPS' => (string)($srv['HTTPS'] ?? ''), 'HTTP_HOST' => (string)($srv['HTTP_HOST'] ?? ''),
+            'HTTPS' => (string)($srv['HTTPS'] ?? ''), 'HTTP_HOST' => Config::publicUrl()['host'] ?? (string)($srv['SERVER_NAME'] ?? ''),
             'dir' => rtrim(str_replace('\\', '/', dirname('/' . ltrim($path, '/'))), '/')];
     }
 
@@ -71,8 +75,9 @@ final class Exposure
 
     /**
      * Looks now, from the request $srv describes ($_SERVER): data/web-check.txt asked for at the address and port the request
-     * came to, with its Host, next to the page's folder and one above it (where the project's root is served, or public/
-     * under it). One reader at a time (the others keep what is known: null). The file gets a new code each time.
+     * came to, with the site's name (see target), next to the page's folder and one above it (where the project's root is
+     * served, or public/ under it). One reader at a time (the others keep what is known: null). The file gets a new code each
+     * time.
      */
     public static function probe(array $srv): ?array
     {
@@ -154,7 +159,7 @@ final class Exposure
         $host = (string)($srv['HTTP_HOST'] ?? '') !== '' ? (string)$srv['HTTP_HOST'] : $addr;
         $name = (string)preg_replace('~:\d+$~', '', trim($host, '[]'));
         $ctx  = stream_context_create(['ssl' => ['verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true, 'SNI_enabled' => true,
-            'peer_name' => $name, 'security_level' => 0]]);
+            'peer_name' => $name, 'security_level' => 1]]);   // (this site's own certificate: a key of 1024 bits or more)
         $s = @stream_socket_client(($tls ? 'tls://' : 'tcp://') . (str_contains($addr, ':') ? "[$addr]" : $addr) . ':' . ((int)($srv['SERVER_PORT'] ?? 0) ?: ($tls ? 443 : 80)),
             $en, $es, 2, STREAM_CLIENT_CONNECT, $ctx);
         if ($s === false) {

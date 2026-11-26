@@ -144,7 +144,9 @@ final class Drdynvc implements Channel
                 break;
             case 2: // data first
                 $total = self::readVar($r, $sp);
-                if ($total > 67108864 || $total > Client::memoryRoom() || (!isset($this->total[$id]) && count($this->total) >= 8)) {
+                unset($this->buf[$id], $this->total[$id]);   // (one this channel was joining: this one takes its place)
+                // (the memory the messages being joined of every channel leave: see Client::messageRoom)
+                if ($total > 67108864 || $total > $this->c->messageRoom() || count($this->total) >= 8) {
                     throw new ProtocolException("Dynamic channel message of $total bytes", 'protocol');
                 }
                 $this->total[$id] = $total;
@@ -189,11 +191,20 @@ final class Drdynvc implements Channel
 
     private function complete(int $id): void
     {
-        if (strlen($this->buf[$id]) >= $this->total[$id]) {
+        if (strlen($this->buf[$id]) > $this->total[$id]) {   // (before, passed on longer than its Data First said)
+            throw new ProtocolException('Dynamic channel data longer than announced', 'protocol');
+        }
+        if (strlen($this->buf[$id]) === $this->total[$id]) {
             $msg = $this->buf[$id];
             unset($this->buf[$id], $this->total[$id]);
             $this->dispatch($id, $msg);
         }
+    }
+
+    /** Bytes the messages being joined announced (their share of the memory: see Client::messageRoom). */
+    public function joining(): int
+    {
+        return array_sum($this->total);
     }
 
     private function dispatch(int $id, string $msg): void

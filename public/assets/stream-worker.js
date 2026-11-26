@@ -66,9 +66,7 @@ function playCmd({ cmd, v }) {
 
 /** The gateway connected again (a guest joined a shared session): every decoder starts anew, as on a new connection. */
 function reset() {
-  for (const d of gfx.decoders.values()) {
-    try { d.dec.close(); } catch { /* already closed */ }
-  }
+  gfx.dispose();                                         // (AVC444's decoders too: their late pictures went to the new one)
   const { stats, software } = gfx;
   gfx = new GfxPipeline(gfxOut);
   Object.assign(gfx, { stats, software });
@@ -121,9 +119,10 @@ function frame(type, d) {
   } else if (type === 1 && d[0] === 2) {
     paletteUpdate(d.subarray(1), palette);
   } else if (type !== 0 && type !== 6) {
-    if (type === 2) {
+    if (type === 2) {                                    // a Demand Active (also a reactivation): the orders' history starts anew
       bpp = d[4];
       maxBitmap = Math.min(1 << 26, (((d[0] | (d[1] << 8)) + 63) & ~63) * (((d[2] | (d[3] << 8)) + 63) & ~63));   // (desktops past that are refused)
+      orders.resetState();
     }
     // a recording: its sound left out while what comes before `from` is decoded at once (its formats kept); with its time
     if (play.on && !play.exp && play.cur < play.from && ((type === 7 && d[0] !== 70) || type === 32)) return;
@@ -175,8 +174,47 @@ async function read(reader) {
   }
 }
 
+/**
+ * The WebSocket service (tools/ws-server.php), when the page found it: opened with the session's request ({csrf, body}),
+ * or null when it does not open within 2 s (then HTTP, as always).
+ */
+function openWs(url, csrf, body) {
+  return new Promise((resolve) => {
+    let s;
+    const fail = () => { clearTimeout(timer); try { s?.close(); } catch { /* (already closed) */ } resolve(null); };
+    const timer = setTimeout(fail, 2000);
+    try { s = new WebSocket(url); } catch { fail(); return; }
+    s.binaryType = 'arraybuffer';
+    s.onerror = fail;
+    s.onclose = fail;
+    s.onopen = () => { clearTimeout(timer); s.onerror = s.onclose = null; s.send(JSON.stringify({ csrf, body: JSON.parse(body) })); resolve(s); };
+  });
+}
+
+/**
+ * The service's messages as a stream reader, for read(): binary ones are the frames, as over HTTP; a text one, the session
+ * refused before its first frame (its answer, as HTTP would have given it: refusal), ends it. got: whether a frame came.
+ */
+function wsReader(s) {
+  const chunks = [], waiting = [];
+  const r = { refusal: null, got: false };
+  const give = (x) => (waiting.length ? waiting.shift()(x) : chunks.push(x));
+  s.onmessage = (e) => {
+    if (typeof e.data === 'string') { try { r.refusal = JSON.parse(e.data); } catch { r.refusal = {}; } give({ done: true }); return; }
+    r.got = true;
+    give({ value: new Uint8Array(e.data), done: false });
+  };
+  s.onclose = s.onerror = () => give({ done: true });
+  r.read = () => (chunks.length ? Promise.resolve(chunks.shift()) : new Promise((res) => waiting.push(res)));
+  return r;
+}
+
+let ws = null;                                           // the session's WebSocket, when it came through the service
+
 onmessage = async ({ data }) => {
-  if (data.cmd === 'stop') { ctrl?.abort(); play.ack?.(); for (const r of gfx.idlers.splice(0)) r(); clearInterval(diag); clearInterval(rate); return; }
+  if (data.cmd === 'stop') { ctrl?.abort(); ws?.close(); play.ack?.(); for (const r of gfx.idlers.splice(0)) r(); clearInterval(diag); clearInterval(rate); return; }
+  if (data.cmd === 'send') { if (ws?.readyState === 1) ws.send(data.body); return; }   // (input, through the service)
+  if (data.cmd === 'token') { if (ws?.readyState === 1) ws.send(JSON.stringify({ token: data.token })); return; }
   if (data.cmd === 'diag') { gfx.stats = {}; diag ||= setInterval(diagTick, 10000); return; }
   if (data.cmd) { playCmd(data); return; }
   Object.assign(play, { on: !!data.timed, from: data.from || 0, speed: data.speed || 1, paused: false, at: 0, ms: data.from || 0, told: 0, whole: false,
@@ -189,16 +227,42 @@ onmessage = async ({ data }) => {
   rate ||= setInterval(() => postMessage({ t: 'bytes', n: received, at: Date.now() }), 1000);   // for the quality indicator
   let err = null, end, reason;
   try {
-    const res = await fetch(data.url, { method: 'POST', signal: ctrl.signal, cache: 'no-store', headers: data.headers, body: data.body });
-    if (!res.ok || !res.body) {
-      ({ error: end, reason } = await res.json().catch(() => ({})));   // the gateway's refusal: 'auth', 'csrf', 'pending'... (and why)
-      throw new Error('http ' + res.status);
+    ws = data.ws ? await openWs(data.ws, data.headers['X-CSRF'], data.body) : null;
+    if (ws && ctrl.signal.aborted) {                     // stopped while it opened (the session was not to go on)
+      ws.close();
+      ws = null;
+      throw new Error('stopped');
     }
-    await read(res.body.getReader());
+    let http = !ws;
+    if (ws) {                                            // the WebSocket service: the same frames, the input back on it
+      postMessage({ t: 'transport', ws: true });
+      const reader = wsReader(ws);
+      await read(reader);
+      if (reader.refusal) {
+        ({ error: end, reason } = reader.refusal);
+        throw new Error('refused');
+      }
+      // closed before its first frame, with no word (the service could not start the session, say): this time over HTTP,
+      // which may well work (every attempt went to the service again, the page said "network" each time)
+      if (!reader.got && !ctrl.signal.aborted) {
+        ws = null;
+        postMessage({ t: 'transport', ws: false });
+        http = true;
+      }
+    }
+    if (http) {                                          // over HTTP, as always
+      const res = await fetch(data.url, { method: 'POST', signal: ctrl.signal, cache: 'no-store', headers: data.headers, body: data.body });
+      if (!res.ok || !res.body) {
+        ({ error: end, reason } = await res.json().catch(() => ({})));   // the gateway's refusal: 'auth', 'csrf', 'pending'... (and why)
+        throw new Error('http ' + res.status);
+      }
+      await read(res.body.getReader());
+    }
   } catch (e) {
     err = String(e.message || e);
     if (err === 'recording damaged') end = 'recording_damaged';
     ctrl.abort();                                        // a broken stream: the gateway stops writing it
+    ws?.close();                                         // (through the WebSocket service: the same)
   }
   postMessage({ t: 'end', err, end, reason });
 };

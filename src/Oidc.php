@@ -60,10 +60,15 @@ final class Oidc
     }
 
     /** The provider's address to send the browser to, with this browser's state, nonce and PKCE verifier kept. */
-    public static function start(): string
+    /**
+     * $link: the id of a user linking their own account to the provider's (from their profile, signed in: see oidc.php), kept
+     * in the flow, sealed with the rest (the provider's redirect back brings no Strict session cookie).
+     */
+    public static function start(?string $link = null): string
     {
         $conf = self::configuration() ?? throw new \RuntimeException('oidc_provider');
-        $flow = ['state' => self::random(), 'nonce' => self::random(), 'verifier' => self::random(), 'exp' => time() + self::FLOW];
+        $flow = ['state' => self::random(), 'nonce' => self::random(), 'verifier' => self::random(), 'exp' => time() + self::FLOW]
+            + ($link !== null ? ['link' => $link] : []);
         self::cookie(self::b64(Crypto::encrypt(Crypto::appKey(), json_encode($flow), 'oidc-flow')), time() + self::FLOW);
         return $conf['authorization_endpoint'] . (str_contains($conf['authorization_endpoint'], '?') ? '&' : '?') . http_build_query([
             'response_type' => 'code', 'client_id' => Settings::get('oidc_client_id'), 'redirect_uri' => self::redirectUri(),
@@ -81,7 +86,8 @@ final class Oidc
         $raw  = self::unb64((string)($_COOKIE[self::COOKIE] ?? ''));
         $flow = $raw === false ? null : json_decode((string)Crypto::decrypt(Crypto::appKey(), $raw, 'oidc-flow'), true);
         self::cookie('', 1);                                // used once, whatever happens
-        if (!is_array($flow) || $flow['exp'] < time() || !is_string($q['state'] ?? null) || !hash_equals($flow['state'], $q['state'])) {
+        if (!is_array($flow) || !is_int($flow['exp'] ?? null) || $flow['exp'] < time() || !is_string($flow['state'] ?? null)
+            || !is_string($q['state'] ?? null) || !hash_equals($flow['state'], $q['state'])) {   // (one without them: as expired, no warning)
             return 'oidc_state';
         }
         if (isset($q['error']) || !is_string($q['code'] ?? null) || $q['code'] === '') {
@@ -114,7 +120,7 @@ final class Oidc
         if ($domains !== [] && !in_array(strtolower(substr((string)strrchr($name, '@'), 1)), $domains, true)) {
             return 'oidc_domain';
         }
-        return ['name' => $name, 'sub' => $claims['sub'], 'iss' => (string)$claims['iss']];
+        return ['name' => $name, 'sub' => $claims['sub'], 'iss' => (string)$claims['iss'], 'link' => is_string($flow['link'] ?? null) ? $flow['link'] : null];
     }
 
     /** The claims of a valid ID token, or 'oidc_token' (bad signature, issuer, audience, time or nonce). */

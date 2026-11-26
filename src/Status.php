@@ -126,8 +126,9 @@ final class Status
             return 'data_exposed';
         }
         foreach (['users', 'settings'] as $store) {
-            $f = Config::dir("$store.json");
-            if (is_file($f) && !is_array(json_decode((string)@file_get_contents($f), true))) {
+            try {
+                Store::read($store);     // (under its lock: read without it, on Windows an update at that moment failed)
+            } catch (\RuntimeException) {
                 return 'store';
             }
         }

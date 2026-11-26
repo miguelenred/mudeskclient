@@ -2,7 +2,7 @@
 // Unit tests of the browser side of RDP bulk compression: node tests/bulk_unit.mjs
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { Bulk, CompressedStream, Mppc, Ncrush } from '../public/assets/bulk.js';
+import { Bulk, CompressedStream, Mppc, Ncrush, Xcrush } from '../public/assets/bulk.js';
 
 let failed = 0;
 const check = (name, ok) => { console.log((ok ? 'OK   ' : 'FAIL ') + name); if (!ok) failed++; };
@@ -64,6 +64,15 @@ const no = new Ncrush();
 check('NCRUSH: literal then end of stream', no.decompress(Uint8Array.of(0xc4, 0xff, 0x05, 0x00), 0x22).join() === '0');
 no.pos = 65540;
 check('NCRUSH: history overflow', attempt(() => no.decompress(Uint8Array.of(0xc4, 0xff, 0x05, 0x00), 0x22)) === 'NCRUSH: history overflow');
+
+// XCRUSH: the level-2 flags count without level-2 compression too (MS-RDPBCGR 3.1.8.2.1): flushed, its MPPC history starts
+// again, as the compressor's did (a copy from before the flush gave the old bytes). Level 1 not compressed; MPPC literals
+// below 0x80 are their own bytes; F8 80: a copy of 3 bytes from 4 back
+{
+  const x = new Xcrush(), block = (l2, ...data) => x.decompress(Uint8Array.of(0x02, l2, ...data), 0x23);
+  const out = [block(0x21, 0x41, 0x42, 0x43, 0x44), block(0x80, 0x78, 0x79), block(0x21, 0xf8, 0x80)].map((b) => [...b].join()).join(' | ');
+  check('XCRUSH: level 2 flushed without compression', out === '65,66,67,68 | 120,121 | 0,0,0');
+}
 
 // fast-path reassembly stops at the MaxRequestSize the gateway announces (16 MB)
 const big = new Uint8Array(3 + (1 << 24));

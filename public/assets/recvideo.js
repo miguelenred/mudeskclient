@@ -256,8 +256,11 @@ export async function recordingVideo({ sid, info, csrf, onProgress = () => {}, s
     aenc.configure(audioConfig);
     sound = new SoundLine((planar, frames, first) => {
       const data = new AudioData({ format: 'f32-planar', sampleRate: RATE, numberOfFrames: frames, numberOfChannels: 2, timestamp: Math.round(first * 1e6 / RATE), data: planar });
-      aenc.encode(data);
-      data.close();
+      try {
+        aenc.encode(data);
+      } finally {
+        data.close();                                    // (as the pictures: also when the encoder threw)
+      }
     });
   }
 
@@ -286,8 +289,11 @@ export async function recordingVideo({ sid, info, csrf, onProgress = () => {}, s
     const frame = new VideoFrame(out, { timestamp: Math.round(ms * 1000) });
     const key = ms - lastKey >= KEY_EVERY;
     if (key) lastKey = ms;
-    venc.encode(frame, { keyFrame: key });
-    frame.close();
+    try {
+      venc.encode(frame, { keyFrame: key });
+    } finally {
+      frame.close();                                     // (also when the encoder threw: it holds a whole picture)
+    }
     end = Math.max(end, ms);
     await waitQueue();
   };

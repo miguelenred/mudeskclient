@@ -36,6 +36,35 @@ try { pointerDecode(ptr(32, 1000, 1000, []), 11); } catch (e) { msg = e.message;
 check('pointer: oversized one refused', msg === 'pointer: bad size', msg);
 const white = pointerDecode(ptr(16, 1, 1, [0xff, 0xff]), 11).rgba[0];
 check('pointer: 16 bpp white', white === 0xffffffff, white.toString(16));
+// ... the way up of each: 1 bpp masks top-down, colour ones bottom-up. A 1 bpp cross of 32 x 32 whose arms meet at its hot spot
+// (7, 7), as the one Windows shows over a sheet's cells: before, drawn upside down, its horizontal arm at row 24, 17 px below
+// where the click goes (the click fell on the cell above the one seen)
+{
+  const masks = (bpp, w, h, hx, hy, xor, and) => {
+    const u = new Uint8Array(16 + xor.length + and.length), dv = new DataView(u.buffer);
+    dv.setUint16(0, bpp, true); dv.setUint16(4, hx, true); dv.setUint16(6, hy, true); dv.setUint16(8, w, true); dv.setUint16(10, h, true);
+    dv.setUint16(12, and.length, true); dv.setUint16(14, xor.length, true); u.set(xor, 16); u.set(and, 16 + xor.length);
+    return u;
+  };
+  const xor = new Uint8Array(32 * 4), and = new Uint8Array(32 * 4);          // (rows of 4 bytes: 32 bits, already even)
+  xor.fill(0xff, 7 * 4, 8 * 4);                                               // row 7 of the data, the horizontal arm
+  for (let r = 0; r < 32; r++) xor[r * 4] |= 0x01;                             // column 7, the vertical arm
+  const p = pointerDecode(masks(1, 32, 32, 7, 7, xor, and), 11);
+  const armRow = [...Array(32).keys()].find((y) => p.rgba[y * 32 + 20] === 0xffffffff);
+  // 24 bpp, 2 x 2: the data's first row is the bottom one
+  const c = pointerDecode(masks(24, 2, 2, 0, 0, Uint8Array.of(255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), new Uint8Array(4)), 11);
+  const got = [p.x, p.y, armRow, p.rgba[7 * 32 + 7], c.rgba[2], c.rgba[0]].map((v) => v >>> 0).join();
+  check('pointer: 1 bpp masks top-down (the cross at its hot spot), colour ones bottom-up',
+    got === [7, 7, 7, 0xffffffff, 0xffffffff, 0xff000000].join(), got);
+}
+// ... and as the gateway offers them (src/Rdp/Client.php): 96 x 96 at most and a cache of 25 (the protocol's 384 x 384 was
+// accepted, and any of 65,536 cache indexes, each kept by the page)
+{
+  const at = (w, h, index) => { const u = ptr(32, w, h, []); new DataView(u.buffer).setUint16(2, index, true); return u; };
+  const one = (u, kind = 11) => { try { pointerDecode(u, kind); return 'ok'; } catch (e) { return e.message; } };
+  msg = [one(at(96, 96, 24)), one(at(97, 1, 0)), one(at(1, 384, 0)), one(at(1, 1, 25)), one(at(1, 1, 65535), 12)].join(' | ');
+  check('pointer: up to 96 x 96 and cache index 24', msg === 'ok | pointer: bad size | pointer: bad size | pointer: bad cache index | pointer: bad cache index', msg);
+}
 
 // bitmap updates: no more pixels than the desktop (passed by stream-worker.js) and only the RDP colour depths; the sizes taken
 // from the data asked for up to 16 GB (and a depth of 5376 bpp was decoded)

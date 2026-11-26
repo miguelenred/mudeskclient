@@ -67,13 +67,19 @@ const SC = { minimize: 0xF020, maximize: 0xF030, restore: 0xF120, close: 0xF060 
 const DIAG_MAX = 300;                                    // browser notes per session in diagnostic mode
 const REC_BACKLOG = 32 << 20;                            // bytes of a recording made in the page waiting to go, at most
 const REC_TRIES = 10;                                    // times a piece of it is sent (again with each next piece, about a second apart)
+const INPUT_RETRY = [50, 100, 200, 400, 800];            // ms before each new try of an input request that did not get there (1.55 s in all)
+const REFUSED = new Set([429, 503, 508]);                // answered without being run (a hosting's limit of processes at once, its own rate limit)
+const REFUSED_QUIET = 5000;                              // ms after the last of those with one input request at a time
+const PASTE_CAP = 2500;                                  // ms a paste holds the keys typed after it, at most (see the paste event)
 
 export class RdpSession {
   /**
    * @param {object} o {container, canvas, keyboard (textarea), conn, csrf, retries (automatic reconnections), onState(state, info)};
    *   guest: {link} to watch a session shared with a link (view only, or with control when the owner gave it);
    *   replay: {sid, from (ms), speed} to play a session's recording (administrators and auditors); with video: true, read as
-   *   fast as it goes to make a video of it (see recvideo.js: onCapture(ms) takes each picture, the sound comes with its time)
+   *   fast as it goes to make a video of it (see recvideo.js: onCapture(ms) takes each picture, the sound comes with its time);
+   *   ws: the WebSocket service's path when it answered (see tools/ws-server.php): the session's stream and input go through
+   *   it, everything else as always (the worker falls back to HTTP when it does not open)
    */
   constructor(o) {
     Object.assign(this, o);
@@ -96,6 +102,10 @@ export class RdpSession {
     this.views = [{ canvas: this.canvas, keyboard: this.keyboard, x: 0, y: 0 }];
     this.multi = false;
     this.pointers = new Map();
+    // pixel-by-pixel ROP drawing's budget (#ropOk): its second and the pixels drawn in it. Before, unset: in a page less than
+    // a second old the sum was NaN and every such order was left out
+    this.ropAt = -Infinity;
+    this.ropPx = 0;
     this.counts = { frames: 0, bytes: 0, bytesAt: 0, rtt: 0 };   // quality indicator: painted frames, bytes received (and when), input latency (ms)
     this.tap = { at: 0, x: -1, y: -1, keyboard: null };   // last touch tap: the text cursor after it opens the keyboard
     this.touchOn = false;                                // multitouch to Windows (the gateway's {"touch": true})
@@ -106,6 +116,7 @@ export class RdpSession {
     this.outbox = [];
     this.inflight = 0;
     this.keepalive = 0;                                  // bytes of keepalive requests in flight
+    this.refusedAt = -Infinity;                          // when the hosting last refused an input request (performance.now)
     this.inputSeen = false;                              // set on every input; the page clears it (keeps the web session alive)
     this.disp = false;
     this.attempt = 0;
@@ -146,7 +157,25 @@ export class RdpSession {
     this.recorder = null;
     this.mic?.stop();
     this.cam?.stop();
+    if (!this.worker && this.again) {                   // waiting to connect again: no stream to end, so it ends here (before,
+      clearTimeout(this.again);                          // the page kept saying "Reconnecting" for ever)
+      this.again = 0;
+      this.ended = { end: 'user' };
+      this.#finish();
+      return;
+    }
     if (this.sid) this.#post([MSG.QUIT]);
+    // a worker that never ends (busy in a long decode a hostile server asked for: it never reads the 'stop') is ended by force
+    // after 3 s. Before, Disconnect did nothing until the page was closed
+    const wk = this.worker;
+    setTimeout(() => {
+      if (!wk || wk !== this.worker || this.ended) return;
+      wk.terminate();
+      this.worker = null;
+      this.sid = this.token = null;
+      this.ended = { end: 'user' };
+      this.#finish();
+    }, 3000);
     if (this.replay || this.guest) { this.worker?.postMessage({ cmd: 'stop' }); return; }   // (nothing of theirs to say goodbye with)
     setTimeout(() => this.worker?.postMessage({ cmd: 'stop' }), 300);
   }
@@ -173,9 +202,12 @@ export class RdpSession {
     if (this.multi) this.#setLayout(this.#wanted());     // the screens whose window is open now
     const one = this.multi && this.mons.length === 1 ? this.mons[0] : null;   // only this window's: a plain one-monitor session
     const { w, h } = one ? { w: one.w, h: one.h } : this.viewSize();
-    // (gen: requests of the connection before still in flight no longer count; locks: synced again on the next key)
-    Object.assign(this, { sid: null, token: null, seq: 0, inflight: 0, gen: (this.gen || 0) + 1, outbox: [], events: [], move: null, ack: null, ackOwed: false,
-      locks: -1, inView: true, disp: false, ended: null, bcache: new Map(), gcache: new Map(), lane: { busy: 0, cam: null, folder: [], rec: [], recOut: false, recWait: false } });
+    // (gen: requests of the connection before still in flight no longer count; locks: synced again on the next key; down,
+    // autoShift, cmd: a new connection's computer has no key held, so a Shift still held is pressed there again by the next
+    // key's own state, see #syncShift: kept, Shift+Arrow went as Arrow)
+    Object.assign(this, { sid: null, token: null, viaWs: false, seq: 0, inflight: 0, gen: (this.gen || 0) + 1, outbox: [], events: [], move: null, ack: null, ackOwed: false,
+      locks: -1, inView: true, disp: false, ended: null, again: 0, down: new Set(), autoShift: false, cmd: null, bcache: new Map(), gcache: new Map(),
+      lane: { busy: 0, cam: null, folder: [], rec: [], recOut: false, recWait: false } });
     if (this.rail) {                                     // the server sends its windows again
       clearTimeout(this.rail.closing);
       Object.assign(this.rail, { active: 0, ready: false, seen: false, closing: 0, asked: 0 });
@@ -187,8 +219,10 @@ export class RdpSession {
     this.onState(this.attempt ? 'reconnecting' : 'connecting', { attempt: this.attempt, quiet: this.quiet || undefined });
     this.worker?.terminate();
     const wk = this.worker = new Worker(new URL('./stream-worker.js', import.meta.url), { type: 'module' });
+    let spoke = false;                                   // (whether it ever said anything: see onerror)
     wk.onmessage = ({ data: m }) => {
       if (wk !== this.worker) { m.op?.frame?.close?.(); return; }   // (a video frame of a worker replaced: freed)
+      spoke = true;
       if (m.t === 'rects') {                             // bitmaps of an update
         for (const r of m.rects) {
           if (r.w && r.h) {                              // a bitmap of no size draws nothing (ImageData of 0 threw)
@@ -207,6 +241,10 @@ export class RdpSession {
       else if (m.t === 'diag') this.diag(m.d);
       else if (m.t === 'bytes') Object.assign(this.counts, { bytes: m.n, bytesAt: m.at });
       else if (m.t === 'pos') this.onReplayPos?.(m.ms, !!m.done);
+      else if (m.t === 'transport') {                    // the stream came through the WebSocket service: the input goes back the same
+        this.viaWs = !!m.ws;                             // way, with no answer to time, so its latency is not known (null: not 0 ms)
+        if (this.viaWs) this.counts.rtt = null;
+      }
       else if (m.t === 'end') {
         wk.terminate();
         this.worker = null;
@@ -214,6 +252,18 @@ export class RdpSession {
         if (!this.ended) this.ended = { end: m.end || (this.stopped ? 'user' : 'network'), reason: m.reason };   // m.end: the gateway's refusal ('auth', 'csrf'...)
         this.#finish();
       }
+    };
+    // a worker that could not start (its script not loaded: the network down just as a connection was tried again, or an
+    // update half there) ends as a dropped connection, tried again as one: it never said anything, and the page stayed on
+    // "Reconnecting" for good
+    wk.onerror = (ev) => {
+      if (wk !== this.worker || spoke) { if (spoke) this.#log(`worker: ${ev.message || 'error'}`); return; }   // (one running goes on)
+      ev.preventDefault?.();
+      wk.terminate();
+      this.worker = null;
+      this.sid = this.token = null;
+      if (!this.ended) this.ended = { end: this.stopped ? 'user' : 'network' };
+      this.#finish();
     };
     if (this.replay) {                                   // a recording: its frames at their pace, nothing sent
       wk.postMessage({ url: new URL('rdp.php?a=replay', location.href).href, headers: { 'Content-Type': 'application/json', 'X-CSRF': this.csrf },
@@ -227,6 +277,7 @@ export class RdpSession {
     }
     wk.postMessage({
       url: new URL('rdp.php?a=stream', location.href).href,
+      ws: this.ws ? new URL(this.ws, location.href).href.replace(/^http/, 'ws') : undefined,
       headers: { 'Content-Type': 'application/json', 'X-CSRF': this.csrf },
       body: JSON.stringify({ c: this.conn.id, sid, w, h, tz: new Date().getTimezoneOffset(), lang: document.documentElement?.lang, avc: this.avc, diag: this.#browserInfo(), ...this.extra, mons: this.multi && !one ? this.mons.map((m) => [m.vx, m.vy, m.w, m.h, m.primary ? 1 : 0]) : undefined,
         // RemoteApp: again, reconnected after the connection dropped; resume, the program was open in this page: either way
@@ -253,6 +304,7 @@ export class RdpSession {
       },
       log: (msg) => this.#log(msg),
       note: (msg) => this.diag({ note: msg }),
+      refresh: () => { if (g === this.gfx) this.refresh(); },   // (a video decoder lost or behind: a whole picture asked for)
     });
   }
 
@@ -281,7 +333,7 @@ export class RdpSession {
       if (Date.now() - this.railSince < this.rail.giveUpMs) {
         this.quiet = true;
         this.onRail?.(this.railWindows());
-        setTimeout(() => !this.stopped && this.#run(), 300);
+        this.again = setTimeout(() => !this.stopped && this.#run(), 300);
         return;
       }
       e = { end: 'app_not_opened' };
@@ -295,7 +347,7 @@ export class RdpSession {
       // after the first retry, up to half as long again at random: after the gateway restarts, every page tried again at
       // the same moments and most found it busy
       const wait = [1000, 2000, 3000, 5000, 8000][this.attempt - 1] ?? 10000;
-      setTimeout(() => !this.stopped && this.#run(), this.attempt > 1 ? wait * (1 + Math.random() / 2) : wait);
+      this.again = setTimeout(() => !this.stopped && this.#run(), this.attempt > 1 ? wait * (1 + Math.random() / 2) : wait);   // (see stop)
       return;
     }
     this.onState('ended', e);
@@ -344,9 +396,10 @@ export class RdpSession {
     if (s.token) {
       this.token = s.token;
       this.sid = this.pendingSid;
+      if (this.viaWs) this.worker?.postMessage({ cmd: 'token', token: s.token });   // (the service takes the input with it)
       this.#pump();
       this.#lanePump();
-      if (this.pendingLayout) { this.pendingLayout = false; this.#sizeSoon(); }   // a window opened or closed while connecting
+      if (this.pendingLayout) { this.pendingLayout = false; this.#sizeSoon(); }   // a window opened, closed or resized while connecting
     }
     if (s.trace) { this.diagLeft = DIAG_MAX; this.worker?.postMessage({ cmd: 'diag' }); }
     if (s.waking) this.onState('waking', s);           // Wake-on-LAN: the computer did not answer and is being turned on
@@ -386,7 +439,8 @@ export class RdpSession {
       this.attempt = 0;
       this.connectedOnce = true;
       this.onState('connected', s);
-      this.#post([MSG.VISIBLE, document.hidden ? 0 : 1]);
+      this.inView = this.#seen();                        // (kept: connected while hidden, coming back said it; it was not)
+      this.#post([MSG.VISIBLE, this.inView ? 1 : 0]);
       if (this.folder?.shared) this.shareFolder(this.folder.name, this.folder.readonly);   // connected again: shared again
     }
     if (s.errorInfo) this.lastErrorInfo = s.errorInfo;
@@ -486,11 +540,16 @@ export class RdpSession {
     // what waits for a frame of a window just hidden: asked again from one in view (the first to come draws it)
     if (this.dirtyRect) this.#onFrame(() => this.#copyDirty());
     if (this.rail?.soon) this.#onFrame(() => this.#railSoon());
-    const seen = [document, ...this.views.map((v) => v.canvas.ownerDocument || document)].some((d) => !d.hidden);
+    const seen = this.#seen();
     if (seen === this.inView) return;
     this.inView = seen;
     this.#post([MSG.VISIBLE, seen ? 1 : 0]);
     if (seen) this.refresh();
+  }
+
+  /** Whether any window of the session is seen (this page's, or another screen's). */
+  #seen() {
+    return [document, ...this.views.map((v) => v.canvas.ownerDocument || document)].some((d) => !d.hidden);
   }
 
   #viewsChanged() {
@@ -589,6 +648,10 @@ export class RdpSession {
    * Cleared first, so what lies outside the desktop draws nothing, as with a direct copy.
    */
   #selfCopy(sx, sy, w, h, x, y) {
+    // (the desktop's size at most: one ScrBlt of 32767 x 8192 made a 1 GB canvas kept for the session, or one past the
+    // browser's limit, and then no scroll drew)
+    w = Math.min(w, this.surface.width);
+    h = Math.min(h, this.surface.height);
     if (!(w > 0 && h > 0)) return;
     let t = this.copyTmp;
     if (!t || t.width < w || t.height < h) {
@@ -621,9 +684,9 @@ export class RdpSession {
     else if (o.op === 'mem') {
       const b = this.bcache.get(o.id * 65536 + o.idx);
       if (b && o.rop === 0xcc) c.drawImage(b, o.sx, o.sy, o.w, o.h, o.x, o.y, o.w, o.h);
-      else if (b) drawRop(c, o, b);                      // SRCAND, SRCPAINT, SRCINVERT...: pixel by pixel
+      else if (b && this.#ropOk(o)) drawRop(c, o, b);    // SRCAND, SRCPAINT, SRCINVERT...: pixel by pixel
     }
-    else if (o.op === 'pattern') { if (o.rop === 0xf0) drawPattern(c, o); else drawRop(c, o); }
+    else if (o.op === 'pattern') { if (o.rop === 0xf0) drawPattern(c, o); else if (this.#ropOk(o)) drawRop(c, o); }
     else if (o.op === 'fill') {
       c.fillStyle = `rgb(${o.color & 255},${(o.color >> 8) & 255},${(o.color >> 16) & 255})`;
       c.fillRect(o.x, o.y, o.w, o.h);
@@ -713,6 +776,20 @@ export class RdpSession {
     m[0] = MSG.DIAG;
     m.set(json, 1);
     this.#post(m);
+  }
+
+  /**
+   * Pixel-by-pixel ROP drawing, 20 desktops of it a second at most (each a whole getImageData and putImageData): a server
+   * repeating one PatBlt of the whole desktop with one byte an order made the session unusable. Windows' own are small (a
+   * selection, a dragged outline); past the budget they are left out, said once in the diagnostic log.
+   */
+  #ropOk(o) {
+    const now = performance.now(), sw = this.surface.width, sh = this.surface.height;
+    if (now - this.ropAt > 1000) { this.ropAt = now; this.ropPx = 0; }
+    this.ropPx += Math.min(Math.max(0, o.w), sw) * Math.min(Math.max(0, o.h), sh);
+    if (this.ropPx <= 20 * sw * sh) return true;
+    if (!this.ropSaid) { this.ropSaid = true; this.#log('drawing: ROP operations past 20 desktops a second left out'); }
+    return false;
   }
 
   #log(msg) {
@@ -1045,12 +1122,18 @@ export class RdpSession {
       const body = new Uint8Array(payload.length + 4);
       new DataView(body.buffer).setUint32(0, LANE, true);
       body.set(payload, 4);
+      if (this.viaWs && this.worker) {                   // (the WebSocket service: no request to wait for)
+        this.worker.postMessage({ cmd: 'send', body }, [body.buffer]);
+        if (rec) this.lane.recOut = false;
+        continue;
+      }
       this.lane.busy++;
       let again = 0;
       let refused = false;
       fetch(`rdp.php?a=send&sid=${this.sid}`, { method: 'POST', body, cache: 'no-store', headers: { 'X-MuDesk-Token': this.token } })
         .then((r) => {
-          if (r?.status >= 500 || (rec && (r?.status === 410 || r?.status === 429))) throw new Error('busy');
+          // (refused by the hosting without being run, 429 too: sent again, a folder's answer as a piece of a recording)
+          if (r?.status >= 500 || r?.status === 429 || (rec && r?.status === 410)) throw new Error('busy');
           refused = rec && !r?.ok;                        // (404: not a piece the gateway takes)
         })
         .catch(() => {
@@ -1084,11 +1167,13 @@ export class RdpSession {
    * Sends queued messages, up to 4 requests in flight; the server reorders them by sequence number. Mouse moves and frame
    * acknowledgements take 3 of them at most, so a key or a click never waits behind them, and an acknowledgement owed
    * goes out between two batches of moves: sent only when nothing else waited, a mouse kept moving delayed them up to
-   * 0.8 s (with 200 ms to the gateway), and Windows paces its frames by them: the screen stalled while dragging.
+   * 0.8 s (with 200 ms to the gateway), and Windows paces its frames by them: the screen stalled while dragging. While the
+   * hosting refuses some (see #send), one at a time.
    */
   #pump() {
     const gen = this.gen;
-    const most = this.guest ? 1 : 4;                    // a guest's requests are taken as they come: one at a time keeps their order
+    // a guest's requests are taken as they come: one at a time keeps their order
+    const most = this.guest || performance.now() - this.refusedAt < REFUSED_QUIET ? 1 : 4;
     while (this.token && this.inflight < most && (this.outbox.length || this.events.length || ((this.move || this.ack) && this.inflight < Math.max(1, most - 1)))) {
       if (!this.outbox.length) {
         if (this.events.length || (this.move && !(this.ack && this.ackOwed))) { this.#packEvents(); this.ackOwed = !!this.ack; }
@@ -1099,19 +1184,50 @@ export class RdpSession {
       new DataView(body.buffer).setUint32(0, this.seq++, true);
       body.set(payload, 4);
       this.inflight++;
-      const t0 = performance.now();
-      const keepalive = this.keepalive + body.length <= 65536;   // browsers refuse more than 64 KiB of these in flight
-      if (keepalive) this.keepalive += body.length;
-      // the token in a header: in the URL it ended up in the web server's and proxies' access logs
-      fetch(`rdp.php?a=send&sid=${this.sid}`, { method: 'POST', body, cache: 'no-store', keepalive, headers: { [this.guest ? 'X-MuDesk-Share' : 'X-MuDesk-Token']: this.token } })
-        .then(() => { const c = this.counts, d = performance.now() - t0; c.rtt = c.rtt ? c.rtt * 0.8 + d * 0.2 : d; })
-        .catch(() => {}).finally(() => {
-          if (keepalive) this.keepalive -= body.length;
-          if (gen !== this.gen) return;                  // of a connection before this one: counted there, not here
-          this.inflight--;
-          this.#pump();
-        });
+      this.#send(body, gen, 0);
     }
+  }
+
+  /**
+   * One request of #pump, in flight until it got there or was given up. Refused by the hosting without being run (REFUSED:
+   * its limit of PHP processes at once reached, say) it goes again after INPUT_RETRY[tries] ms, 5 times at most: before,
+   * the keys and clicks in it were lost (the gateway waits 0.5 s for one missing, then goes on without it), and a key
+   * released in it stayed pressed on the remote computer. Lost on the way (no answer, a proxy's 502 or 504) it goes again
+   * too, but not a guest's: the gateway takes the owner's by their number (a copy of one that got there is left out), a
+   * guest's as they come (a copy would type twice). A session gone (410) or a request refused by the gateway (404): not again.
+   */
+  #send(body, gen, tries) {
+    // the WebSocket service: in order, on the session's own connection. Not the goodbye (QUIT): the page ends the worker at
+    // once after it (dispose), before the worker sent it, and the gateway took the end for a network drop; over HTTP, as on
+    // that path, it gets there (the gateway takes it by its number, and from a page closing too)
+    if (this.viaWs && this.worker && body[4] !== MSG.QUIT) {
+      this.worker.postMessage({ cmd: 'send', body }, [body.buffer]);
+      this.inflight--;
+      return;
+    }
+    const t0 = performance.now();
+    const keepalive = this.keepalive + body.length <= 65536;   // browsers refuse more than 64 KiB of these in flight
+    if (keepalive) this.keepalive += body.length;
+    // the token in a header: in the URL it ended up in the web server's and proxies' access logs
+    fetch(`rdp.php?a=send&sid=${this.sid}`, { method: 'POST', body, cache: 'no-store', keepalive, headers: { [this.guest ? 'X-MuDesk-Share' : 'X-MuDesk-Token']: this.token } })
+      .then((r) => r?.status, () => 0)
+      .then((status) => {
+        if (keepalive) this.keepalive -= body.length;
+        if (gen !== this.gen) return;                    // of a connection before this one: counted there, not here
+        const refused = REFUSED.has(status);
+        if (refused) this.refusedAt = performance.now();
+        if ((refused || (!this.guest && (status === 0 || status === 502 || status === 504))) && tries < INPUT_RETRY.length && this.token) {
+          setTimeout(() => {
+            if (gen !== this.gen) return;
+            if (this.token) this.#send(body, gen, tries + 1);
+            else this.inflight--;                        // (the session ended meanwhile)
+          }, INPUT_RETRY[tries]);
+          return;
+        }
+        if (status !== 0 && !refused) { const c = this.counts, d = performance.now() - t0; c.rtt = c.rtt ? c.rtt * 0.8 + d * 0.2 : d; }
+        this.inflight--;
+        this.#pump();
+      });
   }
 
   #packEvents() {
@@ -1214,21 +1330,30 @@ export class RdpSession {
     this.#input(ev.mouse(0x1000, x, y));
   }
 
-  #button(e, down) {
-    if (e.button <= 2) this.#mouse(BUTTONS[e.button] | (down ? 0x8000 : 0), e);
-    else if (e.button <= 4) {
-      const p = this.#pos(e);
-      if (p) this.#input(ev.mouseX((e.button === 3 ? 1 : 2) | (down ? 0x8000 : 0), p[0], p[1]));
-    }
+  /** Mouse button b (PointerEvent.button) pressed or released: where event e is, or at the remote point at. */
+  #button(e, down, b = e.button, at = null) {
+    const p = at || this.#pos(e);
+    if (!p) return;
+    if (b <= 2) {
+      if (!at) this.mouseAt = p;                         // (as #mouse)
+      this.#input(ev.mouse(BUTTONS[b] | (down ? 0x8000 : 0), p[0], p[1]));
+    } else if (b <= 4) this.#input(ev.mouseX((b === 3 ? 1 : 2) | (down ? 0x8000 : 0), p[0], p[1]));
   }
 
   #bindPointer(c, view) {
     const touch = { id: null, timer: 0, start: null, moved: false, right: false, pts: new Map() };
     let held = 0;                                        // mouse buttons pressed on the remote (PointerEvent.buttons bits)
-    const press = (e, down) => {
-      held = down ? held | BUTTON_BITS[e.button] : held & ~BUTTON_BITS[e.button];
-      this.#button(e, down);
+    const press = (e, down, b = e.button) => {
+      held = down ? held | BUTTON_BITS[b] : held & ~BUTTON_BITS[b];
+      this.#button(e, down, b);
     };
+    // the page lost sight of the mouse (the focus went to another window, the pointer capture was taken away): its pointerup
+    // may never come, so every button still held is released where the pointer was last (it stayed pressed over there)
+    view.letGo = () => {
+      BUTTON_BITS.forEach((bit, b) => { if (held & bit && this.mouseAt) this.#button(null, false, b, this.mouseAt); });
+      held = 0;
+    };
+    c.addEventListener('lostpointercapture', (e) => { if (e.pointerType !== 'touch') view.letGo(); });
 
     c.addEventListener('contextmenu', (e) => e.preventDefault());
     c.addEventListener('pointermove', (e) => {
@@ -1247,13 +1372,14 @@ export class RdpSession {
         if (touch.moved) this.#mouse(0x0800, e);
         return;
       }
-      if (e.button >= 0) {                               // another button pressed or released while one is held:
-        const bit = BUTTON_BITS[e.button];               // Pointer Events report it as a move, not as pointerdown/up
-        if (bit && !(e.buttons & bit) !== !(held & bit)) {
-          this.#mouse(0x0800, e);
-          press(e, !!(e.buttons & bit));
-          return;
-        }
+      // another button pressed or released while one is held: Pointer Events report it as a move (e.button), not as
+      // pointerdown/up. And any button held whose release the page did not see (its pointerup lost) is released now: only
+      // e.button was compared, which a plain move does not have, so it stayed pressed on the remote computer
+      const pressed = e.button >= 0 ? BUTTON_BITS[e.button] & e.buttons & ~held : 0, released = held & ~e.buttons;
+      if (pressed || released) {
+        this.#mouse(0x0800, e);
+        BUTTON_BITS.forEach((bit, b) => { if ((pressed | released) & bit) press(e, !!(pressed & bit), b); });
+        return;
       }
       // moves replace each other until they are sent: only the last of the coalesced ones is placed (each one read the
       // canvas's position, a layout read, for nothing)
@@ -1413,14 +1539,20 @@ export class RdpSession {
     k.addEventListener('paste', (e) => {
       e.preventDefault();
       clearTimeout(this.pasteTimer);
-      const done = () => this.#pasteDone();
-      if (this.clipboard) this.clipboard.fromPasteEvent(e.clipboardData).then(done, done);
-      else done();
+      // the keys typed meanwhile wait for the Ctrl+V, PASTE_CAP ms at most: files or an image going up for minutes held every
+      // key (clicks went on); after that the keys go and the Ctrl+V is left to the user (the files say when they are ready
+      // to paste). Nothing put on the remote clipboard (its upload failed): no Ctrl+V, it pasted what was there before.
+      // (done: only for this paste, not one started after the cap)
+      const timer = this.pasteTimer = setTimeout(() => done(false), PASTE_CAP);
+      const done = (ok) => { if (this.pasteTimer === timer) this.#pasteDone(ok); };
+      if (this.clipboard) this.clipboard.fromPasteEvent(e.clipboardData).then((r) => done(r !== false), () => done(false));
+      else done(true);
     });
     k.addEventListener('blur', () => {
       if (this.refocusing) return;
       if (this.pasting) { this.pasting = false; clearTimeout(this.pasteTimer); this.deferred = []; }   // no Ctrl+V once focus is gone
       this.releaseAll();
+      this.views.find((v) => v.keyboard === k)?.letGo?.();   // the mouse buttons held in its window too
       if (this.sticky.size) this.#releaseSticky();
       this.softKeyboard = false;
     });
@@ -1518,8 +1650,12 @@ export class RdpSession {
   #keydown(e) {
     this.dead = false;
     if ((e.isComposing || e.keyCode === 229) && this.composing !== 'keys') return;
+    // nothing to send them to (the session ended, or is not connected yet): Tab and Esc stay the page's, so the keyboard
+    // alone can leave the remote screen for the page's buttons (before, they were held here)
+    if (!this.token && (e.code === 'Tab' || e.code === 'Escape')) return;
+    // (the locks recorded only when sent: a key before the session's token sent nothing, and they were never synced after it)
     const locks = (e.getModifierState('ScrollLock') ? 1 : 0) | (e.getModifierState('NumLock') ? 2 : 0) | (e.getModifierState('CapsLock') ? 4 : 0);
-    if (locks !== this.locks && !['CapsLock', 'NumLock', 'ScrollLock'].includes(e.code)) {
+    if (locks !== this.locks && this.token && !['CapsLock', 'NumLock', 'ScrollLock'].includes(e.code)) {
       this.locks = locks;
       this.#input(ev.sync(locks));
     }
@@ -1567,9 +1703,11 @@ export class RdpSession {
     if (this.autoShift) { this.autoShift = false; if (this.down.delete('ShiftLeft')) this.key('ShiftLeft', true); }
   }
 
-  #pasteDone() {
+  /** The paste's Ctrl+V (ok: what was pasted is on the remote clipboard; else none), then the keys typed meanwhile. */
+  #pasteDone(ok = true) {
     if (!this.pasting) return;
     this.pasting = false;
+    clearTimeout(this.pasteTimer);
     const meta = this.pasteMeta && ['MetaLeft', 'MetaRight', 'OSLeft', 'OSRight'].find((c) => this.down.has(c));
     if (meta) {                                          // Cmd+V on a Mac: Ctrl takes the place of Win, pressed before Win
       this.key('ControlLeft', false);                    // is released so Windows opens neither Start nor Win+V
@@ -1578,8 +1716,10 @@ export class RdpSession {
       this.down.add('ControlLeft');
       this.cmd = meta;
     }
-    this.key('KeyV', false);
-    this.key('KeyV', true);
+    if (ok) {
+      this.key('KeyV', false);
+      this.key('KeyV', true);
+    }
     for (const [code, up] of this.deferred) if (up) this.#up(code); else this.#press(code);
     this.deferred = [];
   }
@@ -1595,10 +1735,12 @@ export class RdpSession {
 
   #checkSize() {
     if (this.guest) return;                             // (a guest sees the desktop as the owner has it)
-    // connecting, several screens: a window took another size meanwhile (Firefox gives the other screen's window the size of
-    // its screen just after it opens, and the request had gone with its first one, 400 x 300): checked once connected
-    // (before, that monitor kept the first size until the server opened Display Control, a minute later in Windows 11)
-    if (!this.sid) { if (this.multi && this.worker) this.pendingLayout = true; return; }
+    // connecting: a window took another size meanwhile, checked once connected. Firefox goes to full screen with the click
+    // on Connect, and the request had gone with the size of the window before it (before, that size stayed: the desktop
+    // shown enlarged, with black margins, until the window changed again); with several screens, Firefox gives the other
+    // screen's window the size of its screen just after it opens, and the request had gone with its first one, 400 x 300
+    // (before, that monitor kept it until the server opened Display Control, a minute later in Windows 11)
+    if (!this.sid) { if (this.worker) this.pendingLayout = true; return; }
     if (this.multi) { this.#checkMonitors(); return; }
     if (this.conn.resize !== 'dynamic' || this.softKeyboard) return;
     const { w, h } = this.viewSize();

@@ -10,7 +10,14 @@ use MuDesk\Text;
 final class Ntlm
 {
     private const FLAGS = 0xE2088235; // 56|KEY_EXCH|128|VERSION|ESS|ALWAYS_SIGN|NTLM|SEAL|SIGN|REQUEST_TARGET|UNICODE
+    private const REQUIRED = 0x20080030; // 128|ESS|SEAL|SIGN (see authenticate())
     private const KEY_EXCH = 0x40000000;
+    /**
+     * NTLMSSP_NEGOTIATE_TARGET_INFO: echoed in the AUTHENTICATE message when the challenge has it, as Windows' own clients do.
+     * Windows 7 and Server 2008 R2 as first released (build 7600) refuse an NTLMv2 answer without it (a TLS "access denied",
+     * whatever the password): NLA with them failed. Later Windows take it either way.
+     */
+    private const TARGET_INFO = 0x00800000;
     private const VERSION  = "\x06\x01\xb1\x1d\x00\x00\x00\x0f";
 
     private string $negotiateMsg = '';
@@ -67,7 +74,12 @@ final class Ntlm
         if (strlen($challengeMsg) < 48 || !str_starts_with($challengeMsg, "NTLMSSP\0") || unpack('V', $challengeMsg, 8)[1] !== 2) {
             throw new ProtocolException('Invalid NTLM challenge', 'auth');
         }
-        $this->flags     = self::FLAGS & unpack('V', $challengeMsg, 20)[1];
+        $this->flags     = (self::FLAGS | self::TARGET_INFO) & unpack('V', $challengeMsg, 20)[1];
+        // what Windows' own client requires: 128-bit keys, extended session security, signing and sealing. Before, a server
+        // (or someone in between) could leave them out: the sealing key cut to 5 bytes
+        if (($this->flags & self::REQUIRED) !== self::REQUIRED) {
+            throw new ProtocolException('NTLM: the server does not offer 128-bit keys, extended session security, signing and sealing', 'auth');
+        }
         if ($this->flags & 0x02000000 && strlen($challengeMsg) >= 56) { // NTLMSSP_NEGOTIATE_VERSION: product version at offset 48
             $this->serverVersion = [ord($challengeMsg[48]), ord($challengeMsg[49]), unpack('v', $challengeMsg, 50)[1]];
         }
@@ -82,14 +94,19 @@ final class Ntlm
                 $this->domain = Text::fromUtf16($v);
             }
         }
+        // the MIC announced when the challenge has a timestamp (MS-NLMP 3.1.5.1.2); the channel bindings and the target name
+        // whatever it has (before, only with a timestamp: a server leaving it out got an answer bound neither to its
+        // certificate nor to its name, easier to relay to a service that checks them only when the client sends them)
         $useMic = $timestamp !== null;
-        if ($useMic) { // announce MIC, no channel binding, SPN
-            $pairs   = array_values(array_filter($pairs, static fn($p) => !in_array($p[0], [6, 9, 10], true)));
+        $pairs  = array_values(array_filter($pairs, static fn($p) => !in_array($p[0], [6, 9, 10], true)));
+        if ($useMic) {
             $pairs[] = [6, pack('V', 2)];
+        }
+        if ($useMic || strlen($this->bindings) === 16) {
             $pairs[] = [10, strlen($this->bindings) === 16 ? $this->bindings : str_repeat("\0", 16)];   // (see Gateway::bindings)
-            if ($this->spn !== '') {
-                $pairs[] = [9, Text::toUtf16($this->spn)];
-            }
+        }
+        if ($this->spn !== '') {
+            $pairs[] = [9, Text::toUtf16($this->spn)];
         }
         $info = '';
         foreach ($pairs as [$id, $v]) {
@@ -133,6 +150,7 @@ final class Ntlm
         $k              = $this->exportedKey;
         $this->sendSign = md5($k . "session key to client-to-server signing key magic constant\0", true);
         $this->recvSign = md5($k . "session key to server-to-client signing key magic constant\0", true);
+        // SEALKEY (MS-NLMP 3.4.5.3) with NEGOTIATE_128, required (see authenticate()): the whole key
         $this->sendSeal = new Rc4(md5($k . "session key to client-to-server sealing key magic constant\0", true));
         $this->recvSeal = new Rc4(md5($k . "session key to server-to-client sealing key magic constant\0", true));
         return $msg;

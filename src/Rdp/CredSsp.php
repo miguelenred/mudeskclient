@@ -4,11 +4,25 @@ declare(strict_types=1);
 
 namespace MuDesk\Rdp;
 
-use MuDesk\Text;
+use MuDesk\{Config, Text};
 
 /** Network Level Authentication (MS-CSSP) over the TLS connection, using NTLM. */
 final class CredSsp
 {
+    /**
+     * CredSSP 2 to 4 (Windows 7 and Server 2008 R2 without the updates of May 2018) bind the TLS key itself, without a nonce:
+     * someone in the middle taken for the server could have the client seal what it chose with the session's key, and use it
+     * against the real server (CVE-2018-0886, an encryption oracle). Refused before the client's NTLM answer or its binding
+     * goes, as Windows' own client does since then; 'credssp_unpatched' => true in config.php allows them (Windows'
+     * "Vulnerable"). Before, they were taken whenever the server said so.
+     */
+    private static function refuseUnpatched(int $version): void
+    {
+        if ($version < 5 && Config::get('credssp_unpatched') !== true) {
+            throw new ProtocolException("NLA: CredSSP version $version, without the CVE-2018-0886 update", 'credssp_unpatched');
+        }
+    }
+
     private const VERSION = 6;
     private const STATUS  = [
         0xC000006D => 'auth_failed', 0xC0000064 => 'auth_failed', 0xC000006A => 'auth_failed',
@@ -70,6 +84,7 @@ final class CredSsp
 
         $f       = self::response($t->recvDer());
         $version = min(self::VERSION, Der::toInt($f[0] ?? throw new ProtocolException('NLA: missing version', 'protocol')));
+        self::refuseUnpatched($version);
         $auth    = $ntlm->authenticate(self::token($f));
         $nonce   = $version >= 5 ? random_bytes(32) : null;
         $binding = $nonce === null ? $pubKey : hash('sha256', "CredSSP Client-To-Server Binding Hash\0" . $nonce . $pubKey, true);
@@ -104,7 +119,7 @@ final class CredSsp
                                          bool $delegate): void
     {
         try {
-            $t->send(self::request(self::VERSION, $krb->initToken()));
+            $t->send(self::request(self::VERSION, $krb->initToken('', Kerberos::SEQUENCED)));   // (its answer checked in order)
             $f       = self::response($t->recvDer());
             $version = min(self::VERSION, Der::toInt($f[0] ?? throw new ProtocolException('NLA: missing version', 'protocol')));
             $mic     = $krb->accept(self::token($f));
@@ -117,6 +132,7 @@ final class CredSsp
             throw in_array($e->key, ['auth_failed', 'closed', 'kerberos', 'kerberos_integrity', 'protocol'], true)
                 ? new ProtocolException('NLA: Kerberos refused by the server (' . $e->getMessage() . ')', 'kerberos') : $e;
         }
+        self::refuseUnpatched($version);
         $nonce   = $version >= 5 ? random_bytes(32) : null;
         $binding = $nonce === null ? $pubKey : hash('sha256', "CredSSP Client-To-Server Binding Hash\0" . $nonce . $pubKey, true);
         $t->send(self::request($version, $mic, null, $krb->wrap($binding), $nonce));

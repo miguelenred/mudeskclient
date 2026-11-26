@@ -180,6 +180,25 @@ const quantsOf = (s, p, n) => {
 };
 
 /** RemoteFX messages (codec id 3 of the graphics pipeline). */
+/**
+ * A region's rectangles as they are while they are few and cover the surface once at most; else their bounding box. Every
+ * tile is converted for each rectangle it meets: 65,535 copies of one full-surface rectangle (well under 1 KB compressed)
+ * took 1.2-1.6 s per tile, hours with many (as reported against other clients' decoders).
+ */
+function bounded(rects, w, h) {
+  if (rects.length <= 64) {
+    let area = 0;
+    for (const r of rects) area += r.w * r.h;
+    if (area <= w * h) return rects;
+  }
+  let x0 = Infinity, y0 = Infinity, x1 = 0, y1 = 0;
+  for (const r of rects) {
+    if (!r.w || !r.h) continue;
+    x0 = Math.min(x0, r.x); y0 = Math.min(y0, r.y); x1 = Math.max(x1, r.x + r.w); y1 = Math.max(y1, r.y + r.h);
+  }
+  return x1 > x0 && y1 > y0 ? [{ x: x0, y: y0, w: x1 - x0, h: y1 - y0 }] : [];
+}
+
 export class RfxDecoder {
   constructor() {
     this.mode = 1;
@@ -205,6 +224,7 @@ export class RfxDecoder {
             const o = b + 3 + i * 8;
             rects.push({ x: dv.getUint16(o, true), y: dv.getUint16(o + 2, true), w: dv.getUint16(o + 4, true), h: dv.getUint16(o + 6, true) });
           }
+          rects = bounded(rects, w, h);
         }
       } else if (type === 0xccc7) {
         const nq = s[b + 6], nt = dv.getUint16(b + 8, true);
@@ -367,19 +387,29 @@ class Srl {
   }
 }
 
+// tile states kept in all (24 KB each, 48 KB with the signs of a progressive pass): the tiles of the largest desktop accepted
+// (8192 x 8192); before, a server could have any number kept (thousands of 1 x 1 surfaces, or an id used again, each 3 GB)
+const TILES_MAX = 16384;
+const signs = () => [new Int16Array(4096), new Int16Array(4096), new Int16Array(4096)];
+
 export class ProgressiveDecoder {
   constructor() {
     this.surfaces = new Map();                         // surfaceId -> Map(tileKey -> tile state)
+    this.kept = new Set();                             // every tile state, oldest first: past maxTiles the oldest is dropped
+    this.maxTiles = TILES_MAX;                         // (a tile without its state is drawn whole again by its next first pass)
     this.buf = [new Int16Array(4096), new Int16Array(4096), new Int16Array(4096)];
     this.b32 = this.buf.map((b) => new Int32Array(b.buffer));   // (for idwtExtrapolate)
   }
 
-  deleteSurface(id) { this.surfaces.delete(id); }
+  deleteSurface(id) {
+    for (const t of this.surfaces.get(id)?.values() ?? []) this.kept.delete(t);
+    this.surfaces.delete(id);
+  }
 
   #component(c, data, q, t, extrapolate, diff) {
     const b = this.buf[c].fill(0);
     const m = rlgr(data, 1, b);
-    t.sign[c].set(b);
+    t.sign?.[c].set(b);
     const ll = extrapolate ? EXTRA[0][0] : PLAIN[0][0], band = extrapolate ? EXTRA_BAND : PLAIN_BAND, cur = t.current[c];
     for (let i = 0; i < 10; i++) SHIFT[i] = q[i] > 0 ? q[i] : 0;
     for (let j = ll + 1; j < 4096; j++) b[j] += b[j - 1];   // LL3, the last band, is differentially coded
@@ -398,7 +428,8 @@ export class ProgressiveDecoder {
   }
 
   #upgrade(c, srlData, rawData, shift, numBits, t, extrapolate) {
-    const srl = new Srl(srlData), cur = t.current[c], sign = t.sign[c];
+    // (signs not kept: after a pass of full quality, where an upgrade has nothing to add; made here if one does all the same)
+    const srl = new Srl(srlData), cur = t.current[c], sign = (t.sign ??= signs())[c];
     let rbit = 0;
     for (const i of UPGRADE_ORDER) {
       const nb = numBits[i];
@@ -433,12 +464,19 @@ export class ProgressiveDecoder {
       if (len < 6 || p + len > s.length) break;
       if (type === 0xccc4) {
         regions.push(p + 6);
-        for (let i = 0, r = p + 18; i < dv.getUint16(p + 7, true); i++, r += 8) {
-          const rx = dv.getUint16(r, true), ry = dv.getUint16(r + 2, true);
-          const rx1 = Math.min(w, rx + dv.getUint16(r + 4, true)), ry1 = Math.min(h, ry + dv.getUint16(r + 6, true));
-          x0 = Math.min(x0, rx); y0 = Math.min(y0, ry);
+        const rects = [];
+        for (let i = 0, r = p + 18; i < dv.getUint16(p + 7, true) && r + 8 <= p + len; i++, r += 8) {
+          rects.push({ x: dv.getUint16(r, true), y: dv.getUint16(r + 2, true), w: dv.getUint16(r + 4, true), h: dv.getUint16(r + 6, true) });
+        }
+        // what #region will allocate: the rectangles as bounded() leaves them, cut to the surface. Before, the area of the
+        // rectangles as they came: 65 of 1 x 1 in opposite corners counted 65 pixels while bounded() made a box of the whole
+        // surface of them, one for each region (a 32 KB message took 1.9 GB of a 4K surface)
+        for (const q of bounded(rects, w, h)) {
+          const rx1 = Math.min(w, q.x + q.w), ry1 = Math.min(h, q.y + q.h);
+          if (rx1 <= q.x || ry1 <= q.y) continue;
+          x0 = Math.min(x0, q.x); y0 = Math.min(y0, q.y);
           x1 = Math.max(x1, rx1); y1 = Math.max(y1, ry1);
-          if (rx1 > rx && ry1 > ry) area += (rx1 - rx) * (ry1 - ry);
+          area += (rx1 - q.x) * (ry1 - q.y);
         }
       }
       p += len;
@@ -456,8 +494,9 @@ export class ProgressiveDecoder {
     const nRects = dv.getUint16(b + 1, true), nQuant = s[b + 3], nProg = s[b + 4], extrapolate = !!(s[b + 5] & 1);
     const nTiles = dv.getUint16(b + 6, true);
     let p = b + 12;
-    const rects = [];
+    let rects = [];
     for (let i = 0; i < nRects; i++, p += 8) rects.push({ x: dv.getUint16(p, true), y: dv.getUint16(p + 2, true), w: dv.getUint16(p + 4, true), h: dv.getUint16(p + 6, true) });
+    rects = bounded(rects, w, h);
     const boxes = rects.map((r) => {                       // where the tiles go for each rectangle
       if (box) return box;
       const bw = Math.min(w, r.x + r.w) - r.x, bh = Math.min(h, r.y + r.h) - r.y;
@@ -474,13 +513,20 @@ export class ProgressiveDecoder {
       if (tx * 64 >= w || ty * 64 >= h) { p += len; continue; }   // outside the surface: never shown, so never kept
       const key = ty * 65536 + tx;
       let t = tiles.get(key);
-      if (!t) {
-        t = { current: [0, 1, 2].map(() => new Int16Array(4096)), sign: [0, 1, 2].map(() => new Int16Array(4096)), bitPos: null };
+      if (!t) {                                            // (sign: see below)
+        t = { current: [0, 1, 2].map(() => new Int16Array(4096)), sign: null, bitPos: null, home: tiles, key };
         tiles.set(key, t);
+        this.kept.add(t);
+        if (this.kept.size > this.maxTiles) {
+          const old = this.kept.values().next().value;
+          this.kept.delete(old);
+          old.home.delete(old.key);
+        }
       }
       const q = [quants[qi[0]], quants[qi[1]], quants[qi[2]]];
       if (type === 0xccc5 || type === 0xccc6) {           // simple or first pass
-        const simple = type === 0xccc5, flags = s[p + 13], prog = progQuant(progs, simple ? 0xff : s[p + 14], q);
+        const simple = type === 0xccc5, flags = s[p + 13], quality = simple ? 0xff : s[p + 14], prog = progQuant(progs, quality, q);
+        if (quality !== 0xff) t.sign ??= signs();          // the signs its upgrade passes need (a simple tile, most of them, has none)
         let d = p + (simple ? 22 : 23);
         const lens = [0, 1, 2].map((c) => dv.getUint16(p + (simple ? 14 : 15) + c * 2, true));
         t.bitPos = [qOp(q[0], prog[0], add), qOp(q[1], prog[1], add), qOp(q[2], prog[2], add)];

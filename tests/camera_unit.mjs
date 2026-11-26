@@ -40,8 +40,8 @@ check('a camera present: known from the devices\' kinds, without permission; non
 
 // started at the size and rate the server chose: the camera asked for them, its picture cut to their proportions in the
 // middle and scaled, a JPEG sent for each picture; stopped: the camera let go, no more pictures
-const sent = [], nos = [], fails = [], errors = [];
-const cam = new CamCapture({ send: (j, no) => { sent.push(j); nos.push(no); }, fail: (no) => fails.push(no), onError: (k) => errors.push(k) });
+const sent = [], nos = [], fails = [], errors = [], lives = [];
+const cam = new CamCapture({ send: (j, no) => { sent.push(j); nos.push(no); }, fail: (no) => fails.push(no), onError: (k) => errors.push(k), onLive: (on) => lives.push(on) });
 /** F_CAM: start at this size and rate, numbered `no` (each picture says it). */
 const start = (w, h, fps, no = 5) => { const d = new Uint8Array(7), v = new DataView(d.buffer); d[0] = 1; v.setUint16(1, w, true); v.setUint16(3, h, true); d[5] = fps; d[6] = no; cam.onMessage(d); };
 start(640, 480, 30);
@@ -55,6 +55,9 @@ check('started at the size and rate chosen: asked of the camera, cut to 4:3 in i
   && JSON.stringify(log.drawn[0]) === JSON.stringify([160, 0, 960, 720, 0, 0, 640, 480]) && n >= 3 && sent.every((j) => j[0] === 0xFF && j[1] === 0xD8)
   && log.quality[0]?.[0] === 'image/jpeg' && log.stopped === 1 && sent.length === n && !fails.length && nos.every((x) => x === 5),
   JSON.stringify({ c, drawn: log.drawn[0], n, after: sent.length, stopped: log.stopped }));
+// the session told when the camera is taken and let go (its own sign while it lasts)
+check('the camera taken and let go said to the session, once each', JSON.stringify(lives) === '[true,false]', JSON.stringify(lives));
+lives.length = 0;
 
 // a camera the browser does not allow, none, in use: the program there told (no picture will come) and the user too
 const why = [];
@@ -79,7 +82,8 @@ cam.onMessage(Uint8Array.of(0));
 first();
 await until(() => log.stopped > stopped0);
 await wait(20);
-check('stopped while asking for the camera: let go as soon as it comes, never sending', log.stopped === stopped0 + 1 && !cam.live, JSON.stringify({ stopped: log.stopped - stopped0 }));
+check('stopped while asking for the camera: let go as soon as it comes, never sending, never said as in use', log.stopped === stopped0 + 1 && !cam.live && !lives.length,
+  JSON.stringify({ stopped: log.stopped - stopped0, lives }));
 cam.stop();
 
 // paced by a worker's timer (a hidden page's run once a second at most): a picture at each of its ticks, none without them;

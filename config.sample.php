@@ -9,8 +9,20 @@ return [
     // 'force_https' => true,
 
     // The first connection to a computer (or gateway) never seen shows its certificate's fingerprints for the user to
-    // confirm before anything is sent; false trusts it at once, as before 1.2.
+    // confirm before anything is sent; false trusts it at once, as before 1.2: whoever answers that first connection (someone
+    // in the middle too) is taken for the computer, without asking. Keep it on (SECURITY.md, Known limits).
     // 'confirm_new_certificates' => true,
+
+    // NLA with a computer whose CredSSP lacks the May 2018 update (Windows 7 or Server 2008 R2 not updated): refused, as
+    // Windows' own client does (CVE-2018-0886); true allows it, at the risk that someone in the middle taken for that
+    // computer misuses the session's key against it. Only while such a computer cannot be updated.
+    // 'credssp_unpatched' => false,
+
+    // The optional WebSocket service (Linux: Docker starts it; on a server, tools/ws-server.php as a service behind a proxy
+    // rule for <public>/ws, see docs/HOSTING.md): the page tries it and uses it when it answers, else HTTP as always. false:
+    // never tried, and the service ends at once. websocket_listen: where the service listens (the proxy rule's destination).
+    // 'websocket' => true,
+    // 'websocket_listen' => '127.0.0.1:8091',
 
     // Reverse proxies whose X-Forwarded-For / X-Forwarded-Proto headers are trusted: only the exact addresses of your own
     // proxies, never a public range (anyone there could then pass any address and get past the allowed clients and the

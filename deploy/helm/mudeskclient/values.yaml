@@ -1,0 +1,72 @@
+# MuDeskClient - https://miguelenred.es/mudeskclient - Apache License 2.0
+# Values of the chart. One pod only: each RDP session lives in a PHP process of that pod and the data folder is read and
+# written with file locks, so the chart never runs more than one replica (an update stops the old pod before the new one).
+
+image:
+  repository: ghcr.io/miguelenred/mudeskclient
+  tag: ""                 # empty: the chart's appVersion
+  pullPolicy: IfNotPresent
+
+# MUDESK_HOSTNAME: the name in the self-signed certificate made at the first start (when no tls.existingSecret is given)
+hostname: ""
+# MUDESK_WORKERS: Apache processes at once (images from 1.3.0; empty: the image's 256). See docs/HOSTING.md, Capacity.
+workers: ""
+
+service:
+  # ClusterIP behind an ingress; LoadBalancer (or NodePort) to reach it directly. With LoadBalancer, externalTrafficPolicy
+  # Local keeps each client's own address (the sign-in locks and the allowed clients use it).
+  type: ClusterIP
+  port: 443
+  externalTrafficPolicy: ""
+
+# Your certificate: a Secret of type kubernetes.io/tls, its tls.crt and tls.key mounted as cert.pem and key.pem. Empty: a
+# self-signed one is made at the first start and kept on its own small volume.
+tls:
+  existingSecret: ""
+
+persistence:
+  data:                   # users, connections, settings, audit, the users' folders and recordings
+    size: 5Gi
+    storageClass: ""
+    existingClaim: ""
+  tls:                    # the self-signed certificate (not used with tls.existingSecret)
+    size: 16Mi
+    storageClass: ""
+
+# The contents of config.php (see config.sample.php), mounted read-only; empty: none (every key has its default).
+# Behind an ingress, list the ingress controller's addresses in trusted_proxies, or every client counts as one address.
+config: ""
+#  <?php return [
+#      'trusted_proxies' => ['10.42.0.15'],
+#      'public_url' => 'https://mudesk.example.com',
+#  ];
+
+ingress:
+  enabled: false
+  className: ""
+  host: mudesk.example.com
+  tlsSecret: ""           # the certificate the ingress serves (the pod's own one is behind it)
+  # what an RDP session needs from ingress-nginx: HTTPS to the pod, a request open for hours, nothing buffered, bodies up to
+  # 8 MB; another controller needs the same in its own terms, and to let WebSockets through (the image's WebSocket service,
+  # at /ws: ingress-nginx does; without it the page stays on HTTP)
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: HTTPS
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "86400"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "86400"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-body-size: 8m
+
+# Each session takes one PHP process (some tens of MB, more with large clipboards and recordings): size these for the
+# sessions you expect (docs/HOSTING.md, Capacity).
+resources: {}
+#  requests:
+#    cpu: 250m
+#    memory: 512Mi
+#  limits:
+#    memory: 2Gi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

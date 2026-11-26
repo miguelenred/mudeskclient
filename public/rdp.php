@@ -14,7 +14,8 @@ declare(strict_types=1);
 use MuDesk\{Access, Audit, Auth, Config, Connections, Files, Http, Recording, Sessions, Settings, Users, WakeOnLan};
 use MuDesk\Rdp\{Bulk, Client, Cliprdr, Drdynvc, Gateway, ProtocolException, Rail, Rdpdr, Rdpsnd, Redirection, Trace, Transport};
 
-require __DIR__ . '/../src/bootstrap.php';   // PHP's messages to the log only: a warning printed into the binary stream broke it
+require_once __DIR__ . '/../src/bootstrap.php';   // PHP's messages to the log only: a warning printed into the binary stream broke it
+                                                   // (once: tools/ws-session.php loads it first for the WebSocket service)
 
 /** A long binary response: nothing buffered or compressed on the way, and the request goes on to its end. */
 function stream_start(): void
@@ -62,20 +63,10 @@ if ($a === 'send') { // hot path for input: no PHP session, authorised by the pe
         http_response_code(Sessions::send($sid, pack('V', Sessions::GUEST_INPUT) . $share[1] . substr($body, 4)) ? 204 : 410);   // (whose: its share)
         exit;
     }
-    $info = Sessions::info($sid);
-    // the session's file keeps the SHA-256 of its token, never the token (a copy of the data folder gives no keyboard);
-    // a session started before that change kept the token itself (32 characters)
-    $have = (string)($_SERVER['HTTP_X_MUDESK_TOKEN'] ?? '');
-    $want = (string)($info['token'] ?? '');
-    $body = $info !== null && $have !== '' && hash_equals($want, strlen($want) === 64 ? hash('sha256', $have) : $have) ? $read(4 * 1048576) : '';
-    if (strlen($body) < 5 || ord($body[4]) === 9 || ord($body[4]) >= 0x20   // (9 and up: not the browser's)
-        // out of order (Sessions::OUT_OF_BAND): only its camera's pictures, its folder's answers and its recording's video,
-        // which no key waits behind
-        || (unpack('V', $body)[1] >= Sessions::GUEST_INPUT && (unpack('V', $body)[1] !== Sessions::OUT_OF_BAND || !in_array(ord($body[4]), [18, 20, 21, 22], true)))) {
-        http_response_code(404);
-        exit;
-    }
-    http_response_code(Sessions::send($sid, $body) ? 204 : 410);
+    // the body read only with the session's input token (see Sessions::tokenOk), and taken as Sessions::fromBrowser says
+    // (the WebSocket service takes its messages the same way)
+    $body = Sessions::tokenOk($sid, (string)($_SERVER['HTTP_X_MUDESK_TOKEN'] ?? '')) ? $read(4 * 1048576) : '';
+    http_response_code($body === '' ? 404 : Sessions::fromBrowser($sid, $body));
     exit;
 }
 
@@ -135,9 +126,7 @@ if ($a === 'clipfile') { // chunked upload of clipboard files/images: ?sid=&n=<i
         Http::fail('session', 404);
     }
     $dir = Cliprdr::tmpDir($sid);
-    if (!is_dir($dir)) {
-        mkdir($dir, 0700, true);
-    }
+    is_dir($dir) || @mkdir($dir, 0700, true);   // (made meanwhile by another of its uploads: no warning; one not made, said below)
     $path = $dir . '/' . $name;
     // one at a time with the user's uploads: copied at once, each wrote up to the room left (then given back), and two
     // with the same file wrote into it together
@@ -158,7 +147,17 @@ if ($a === 'clipfile') { // chunked upload of clipboard files/images: ?sid=&n=<i
         Http::fail('quota');
     }
     $in   = fopen('php://input', 'rb');
-    $out  = fopen($path, 'ab');
+    $out  = @fopen($path, 'ab');
+    if ($out === false) {                     // (before, a TypeError: an error 500 with a warning in the log)
+        if (Sessions::info($sid) === null) {  // its folder gone with the session meanwhile: what its end did not see goes now
+            Files::charge($user['id'], -$clipBytes($sid));
+            Files::remove($dir);
+            Http::fail('session', 404);
+        }
+        Files::charge($user['id'], -$off);    // its folder cannot be written: what came of the file before goes
+        @unlink($path);
+        Http::fail('data_dir', 500);
+    }
     $n    = (int)stream_copy_to_stream($in, $out, $left < PHP_INT_MAX ? $left + 1 : null);
     fclose($out);
     if ($n > $left || !Files::charge($user['id'], $n)) {   // charged once written: a session may have taken the room meanwhile
@@ -250,7 +249,7 @@ $token = bin2hex(random_bytes(16));
 $sess  = !Sessions::validSid($sid) || Sessions::info($sid) !== null || $conn === null ? 'invalid_request'
        : Sessions::register($sid, ['uid' => $user['id'], 'user' => $user['username'], 'conn' => $conn['name'], 'host' => $conn['host'],
                                    'ip' => Http::clientIp(), 'token' => hash('sha256', $token), 'wid' => Auth::wid(), 'app' => ($conn['app'] ?? '') !== '', 'record' => !empty($conn['record']),
-                                   'record_by' => empty($conn['record']) ? null : 'policy'], $limit, $total);
+                                   'record_by' => empty($conn['record']) ? null : 'policy', 'mem_limit' => (string)ini_get('memory_limit')], $limit, $total);
 if ($sess === 'busy') {
     Audit::log('rdp_denied', ['conn' => $conn['name'], 'reason' => 'busy', 'limit' => $total] + $occasional, null, false);
     Http::$auditFailures = false;             // logged just above
@@ -285,7 +284,7 @@ $flush   = static function () use (&$out, &$outV, &$watched, $sess): bool {
         $sess->toViewers($outV);
         $outV = '';
     }
-    return connection_aborted() === 0;
+    return !Http::aborted();                  // (the browser left: the web server says so, or the WebSocket service)
 };
 $status = static function (array $s) use ($emit, $flush): void {
     $emit(Client::F_STATUS, json_encode($s));
@@ -325,8 +324,11 @@ $cleanup = static function () use (&$cleaned, &$drive, &$rec, &$recEnd, $sess, $
 register_shutdown_function(static function () use (&$cleaned, $cleanup, $audit, $started): void {
     if (!$cleaned) {
         ini_set('memory_limit', (string)(memory_get_usage() + (16 << 20)));   // the memory of the failed request is still held
-        $cleanup();
-        Audit::log('rdp_end', $audit + ['reason' => 'fatal', 'seconds' => time() - $started], null, false);
+        try {
+            Audit::log('rdp_end', $audit + ['reason' => 'fatal', 'seconds' => time() - $started], null, false);   // (still registered: see the end)
+        } finally {
+            $cleanup();
+        }
     }
 });
 // through a Remote Desktop Gateway: the gateway must be an allowed target (it reaches the computer, by its own rules)
@@ -338,16 +340,18 @@ if ($conn['gw'] !== '' && $gw === null) {      // (one stored that is not a gate
 }
 $ip = $gw !== null ? Access::resolveTarget($gw[0]) : Access::resolveTarget($conn['host']);
 if ($ip === null) {
-    $cleanup();
     Audit::log('rdp_denied', ['conn' => $conn['name'], 'host' => $gw[0] ?? $conn['host'], 'reason' => 'target_not_allowed'] + $occasional, null, false);
+    $cleanup();
     $status(['end' => $gw !== null ? 'gateway_not_allowed' : 'target_denied']);
     exit;
 }
-// options chosen in the connect dialog override the saved ones
+// options chosen in the connect dialog override the saved ones; the redirections within what the administrator allows
+// (Connections::max: before, a user turned on here what an administrator's connection had off)
 $opts = (array)($in['opts'] ?? []);
+$max  = Connections::max($conn, Auth::createsConns($user));
 foreach (['audio', 'mic', 'clipboard', 'drive', 'printer'] as $k) {
     if (isset($opts[$k])) {
-        $conn[$k] = (bool)$opts[$k];
+        $conn[$k] = (bool)$opts[$k] && ($max[$k] ?? true);
     }
 }
 if (isset($opts['gfx'])) {
@@ -404,7 +408,7 @@ $tr = !$trace ? null : new Trace($sid, ['version' => MuDesk\VERSION, 'php' => PH
 
 // the client and its channels; made again, for the desktop as it is then, when a guest joins a shared session
 $size  = [Http::int($in['w'] ?? 1024), Http::int($in['h'] ?? 768), $monitors];
-$client = $dvc = $rail = $clip = null;
+$client = $dvc = $rail = $clip = $snd = null;
 // the certificate of another computer than the connection's (a broker's redirection target, its gateway): pinned on its first
 // use, as the connection's own; one the broker vouched for ($vouched: the target's certificate in its redirection) is the one
 // to find there, at once (another is a changed certificate, even on a first use). The broker's word never replaces a
@@ -475,7 +479,7 @@ $gwOpen = $gw === null ? null : static function (string $target, int $port) use 
         static fn(string $fp, string $sha1 = '') => $pinFor($gw[0], $fp, null, true, $sha1), $consent);
 };
 $redirect = null;                             // a connection broker's redirection being followed: [info, host, ip]
-$build = static function () use (&$client, &$dvc, &$rail, &$clip, &$drive, &$size, &$redirect, &$localDir, $tr, $conn, $ip, $gw, $gwOpen, $login, $domain, $password, $perf, $channels, $app, $in, $emit, $sid, $user): void {
+$build = static function () use (&$client, &$dvc, &$rail, &$clip, &$snd, &$drive, &$size, &$redirect, &$localDir, $tr, $conn, $ip, $gw, $gwOpen, $login, $domain, $password, $perf, $channels, $app, $in, $emit, $sid, $user): void {
     [$w, $h, $mons] = $size;
     $co = [
         'host' => $conn['host'], 'ip' => $gw === null ? $ip : '', 'port' => $conn['port'], 'lb' => $conn['lb'], 'gateway' => $gwOpen, 'user' => $login, 'domain' => $domain, 'password' => $password,
@@ -508,15 +512,14 @@ $build = static function () use (&$client, &$dvc, &$rail, &$clip, &$drive, &$siz
             ($in['lang'] ?? '') === 'en' ? 'Shared folder' : 'Carpeta compartida'));   // in the language of the page
         $localDir !== null && $drive->addLocal(...$localDir);   // (this computer's folder, shared before a connection made again)
     }
-    if ($conn['audio']) {
-        $client->addChannel(new Rdpsnd($client));
-    }
+    $snd = $conn['audio'] ? new Rdpsnd($client) : null;   // (its confirms sent as each block is played: see Rdpsnd::tick)
+    $snd && $client->addChannel($snd);
 };
 $build();
 } catch (Throwable $e) {
     error_log('MuDeskClient: ' . $e);
+    Audit::log('rdp_end', $audit + ['reason' => 'internal'], null, false);   // (still registered: see the end)
     $cleanup();
-    Audit::log('rdp_end', $audit + ['reason' => 'internal'], null, false);
     $status(['end' => 'internal']);
     exit;
 }
@@ -527,8 +530,8 @@ if (!empty($conn['record'])) {
     Recording::cleanup();
     $rec = Recording::start($sid, ['uid' => $user['id'], 'user' => $user['username'], 'conn' => $conn['name'], 'host' => $conn['host'], 'started_as' => 'policy']);
     if ($rec === null) {
-        $cleanup();
         Audit::log('rdp_denied', ['conn' => $conn['name'], 'reason' => 'record_failed'] + $occasional, null, false);
+        $cleanup();
         $status(['end' => 'record_failed']);
         exit;
     }
@@ -677,13 +680,14 @@ try {
         // an administrator who trusts it for every user (the page's box): fixed for any connection to this computer, also in
         // place of one fixed before (a certificate renewed); once (the page sends it again when it connects again)
         if (!$isFixed && ($user['role'] ?? '') === 'admin' && !empty($in['trust_all']) && ($in['trust'] ?? '') === $fp) {
-            Connections::fixCert((string)$conn['host'], (int)$conn['port'], $fp, (string)$user['username']);
+            Connections::fixCert((string)$conn['host'], (int)$conn['port'], $fp, (string)$user['username'], $gw === null ? [(string)$ip] : []);
             Audit::log('cert_fixed', $audit + ['host' => $conn['host'], 'port' => (int)$conn['port'], 'fingerprint' => $fp], null, true);
             [$fixed, $isFixed] = [$fp, true];
         }
         if ($fixed !== null) {
             if ($isFixed) {
                 $pinned !== $fp && Connections::trust($user['id'], $conn, $fp);
+                $gw === null && Connections::seenAt((string)$conn['host'], (int)$conn['port'], (string)$ip);   // (its address now)
                 return;
             }
             Audit::log('cert_mismatch', $audit + ['expected' => $fixed, 'received' => $fp, 'fixed_by_admin' => true], null, false);
@@ -767,7 +771,8 @@ try {
         $due = $client->sendInput();             // typed text goes out one character at a time
         $client->t->pump();                      // what the client wrote, into the gateway's tunnel
         $w = $client->t->writeStreams() ?: null; // (and the gateway's socket while frames wait for it)
-        @stream_select($r, $w, $e, 0, (int)(min($sess->polling() ? 0.02 : 1.0, $due ?? 1.0) * 1e6));
+        $played = $snd?->tick();                 // the sound's confirms, as each block is played
+        @stream_select($r, $w, $e, 0, (int)(min($sess->polling() ? 0.02 : 1.0, $due ?? 1.0, $played ?? 1.0) * 1e6));
         $client->t->pump();                      // what came out of the tunnel, to the client (once it ended: what came before
                                                  // the end, then the end, which poll() sees as a remote computer that closed)
         if (($g = $client->t->gw) !== null && $g->messages !== []) {   // the gateway's service messages: shown on the page
@@ -1067,10 +1072,15 @@ try {
     }
     $client->trace?->close(['reason' => $reason, 'errorInfo' => sprintf('0x%08x', $client->errorInfo), 'seconds' => time() - $started,
         'bytesIn' => $bytesIn + (isset($client->t) ? $client->t->bytesIn : 0), 'bytesOut' => $bytesOut + (isset($client->t) ? $client->t->bytesOut : 0)]);
-    $cleanup();
-    Audit::log('rdp_end', $audit + ['reason' => $reason, 'errorInfo' => $client->errorInfo, 'seconds' => time() - $started,
-                           'in' => $bytesIn + (isset($client->t) ? $client->t->bytesIn : 0), 'out' => $bytesOut + (isset($client->t) ? $client->t->bytesOut : 0)],
-               null, in_array($reason, ['user', 'browser_closed', 'disconnected', 'idle', 'closed'], true));
+    // its end written while it is still registered: a restore waits until no session is (Backup::restore). Written after,
+    // the line went into the data the restore had just put in place
+    try {
+        Audit::log('rdp_end', $audit + ['reason' => $reason, 'errorInfo' => $client->errorInfo, 'seconds' => time() - $started,
+                               'in' => $bytesIn + (isset($client->t) ? $client->t->bytesIn : 0), 'out' => $bytesOut + (isset($client->t) ? $client->t->bytesOut : 0)],
+                   null, in_array($reason, ['user', 'browser_closed', 'disconnected', 'idle', 'closed'], true));
+    } finally {
+        $cleanup();
+    }
 }
 if ($reason !== 'browser_closed') {
     $emit(Client::F_STATUS, json_encode(['end' => $reason, 'detail' => $detail, 'errorInfo' => $client->errorInfo] + ($certHost !== null ? ['host' => $certHost] : [])

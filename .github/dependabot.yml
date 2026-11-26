@@ -1,0 +1,13 @@
+# MuDeskClient - https://miguelenred.es/mudeskclient - Apache License 2.0
+# The workflows' actions and the image's base are pinned by commit and digest (a tag can be moved to other code): Dependabot
+# proposes each new version as a pull request, to be checked before it is taken.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

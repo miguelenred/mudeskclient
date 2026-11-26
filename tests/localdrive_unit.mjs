@@ -132,6 +132,18 @@ const refusals = [
 check('refused: a collision, a folder not there, a path out of the folder, a file not there, a folder as a file and the other way round, a handle not open',
   JSON.stringify(refusals) === JSON.stringify(['0xc0000035', '0xc000003a', '0xc0000033', '0xc000000f', '0xc00000ba', '0xc0000103', '0xc0000001']), JSON.stringify(refusals));
 
+// what the remote computer may not make in this computer's folder: names Explorer acts on when it only shows the folder (an
+// icon on another computer's share sends the Windows sign-in there), device names, a trailing dot or space; nor delete or
+// rename the folder itself (before, removeEntry(undefined) took an entry named "undefined")
+const risky = [];
+for (const n of ['desktop.ini', 'informe.url', 'acceso.lnk', 'x.scf', 'biblio.library-ms', 'CON.txt', 'nombre. ']) {
+  risky.push(hex((await ask(0, 0x00, create('\\docs\\' + n, 0x2, 2, 0x40))).status));
+}
+const whole = await ask(0, 0x00, create('\\', 0x10000, 1, 0x1001));
+const wholeClose = await ask(id(whole), 0x02);
+check('refused: names Explorer acts on, devices, a trailing dot or space; the folder itself never deleted',
+  JSON.stringify(risky) === JSON.stringify(Array(7).fill('0xc0000022')) && hex(wholeClose.status) === '0xc0000022', JSON.stringify([risky, hex(wholeClose.status)]));
+
 // a listing, one name at a time with "." and "..", then no more; a pattern; a folder made
 const md = await ask(0, 0x00, create('\\docs\\fotos', 0x1, 2, 0x1));
 await ask(id(md), 0x02);

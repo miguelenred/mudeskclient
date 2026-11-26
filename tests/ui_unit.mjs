@@ -412,6 +412,13 @@ await settle();
   byText(t('accept_cert'), ov)?.click();
   await settle();
   const adminSent = [sent().trust, sent().trust_all];
+  // ... for every user only when the administrator ticks it (before, ticked already: one accepted without a thought, say a
+  // computer an imported .rdp file named, was fixed for every user)
+  ov = await endWith({ end: 'cert_new', detail: sha256, sha1 });
+  if (boxOf(ov)) boxOf(ov).checked = true;
+  byText(t('accept_cert'), ov)?.click();
+  await settle();
+  adminSent.push(sent().trust_all);
   ov = await endWith({ end: 'cert_unexpected', detail: sha256, sha1 });
   const adminRenew = [boxOf(ov)?.checked, !!boxOf(ov)?.disabled, !!byText(t('accept_cert'), ov)];
   // connected, then connecting again to a computer never seen (a broker's other one): asked at once, never tried again unseen
@@ -449,9 +456,9 @@ await settle();
   answers['conns.list'] = list0;
   check('session: a password the gateway refused asked again; a changed certificate says whose it is', askedAgain && certSaid.startsWith(t('r_cert_changed_host', 'rdg.empresa.com') + t('cert_changed_text')),
     JSON.stringify({ askedAgain, certSaid }));
-  check('session: a computer never seen shows its SHA-256 and SHA-1 to compare and is trusted only when the user says so (also met when connecting again); an administrator’s box trusts it for every user (a renewed one too); a user cannot accept one other than the one fixed',
+  check('session: a computer never seen shows its SHA-256 and SHA-1 to compare and is trusted only when the user says so (also met when connecting again); an administrator’s box, unticked at first, trusts it for every user once ticked (a renewed one: ticked, fixed); a user cannot accept one other than the one fixed',
     newSaid.startsWith(t('r_cert_new') + t('cert_new_text')) && JSON.stringify(shown) === JSON.stringify(['ABAB '.repeat(16).trim(), 'CDCD '.repeat(10).trim()])
-    && JSON.stringify([adminBox, adminSent, adminRenew, lateNew, userBox, userSent, unexpected]) === JSON.stringify([[true, false], [sha256, true], [true, true, true], true, true, [sha256, false], [true, true, true, true]]),
+    && JSON.stringify([adminBox, adminSent, adminRenew, lateNew, userBox, userSent, unexpected]) === JSON.stringify([[false, false], [sha256, false, true], [true, true, true], true, true, [sha256, false], [true, true, true, true]]),
     JSON.stringify({ newSaid, shown, adminBox, adminSent, adminRenew, lateNew, userBox, userSent, unexpected }));
 }
 
@@ -974,6 +981,66 @@ await settle();
     && JSON.stringify(click) === '["0 × 0",null,true,"1024 × 768 px"]' && cancelled
     && /^PC \d{4}-\d\d-\d\d \d\d-\d\d-\d\d\.png$/.test(saved[0] || '') && JSON.stringify(copied) === '["image/png"]' && JSON.stringify(toRemote) === '["image/png"]',
     JSON.stringify({ offered, waiting, full, part, past, click, cancelled, saved, copied, toRemote }));
+  Object.assign(CONN, { clipboard: false });
+}
+
+// ------------------------------------------------------------ the session's end, its latency, its pictures
+
+{
+  // through the WebSocket service nothing answers the input, so its latency is not known: a dash, not "0 ms" (said good).
+  // The session ended: the overlay is read out as it changes (a polite live region) and the keyboard's focus goes to its
+  // Reconnect button (it stayed on the remote screen, where Tab and Esc did nothing)
+  const status = (wk, j) => wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode(JSON.stringify(j)) } });
+  Object.assign(CONN, { clipboard: false, ask: true, app: '' });
+  await go('#/conns');
+  await go('#/s/c1');
+  const form = appEl.querySelector('.overlay').querySelector('form');
+  if (form.querySelector('[name=password]')) form.querySelector('[name=password]').value = 'pw';
+  submit(form);
+  await settle();
+  const wk = workers.at(-1);
+  wk.onmessage({ data: { t: 'transport', ws: true } });
+  status(wk, { token: 't40' });
+  status(wk, { connected: true });
+  await settle();
+  clock += 1000;
+  timers.filter((x) => x.every && x.ms === 1000).at(-1)?.f();   // (the quality indicator's second)
+  const stats = appEl.querySelector('.stats')?.textContent || '';
+  const q = appEl.querySelector('.bar').getAttribute('data-q');
+  status(wk, { end: 'killed' });
+  wk.onmessage({ data: { t: 'end' } });
+  await settle();
+  const ov = appEl.querySelector('.overlay');
+  const again = byText(t('reconnect'), ov);
+  check('session: through the WebSocket service the latency a dash, not 0 ms; ended, the overlay a live region and the focus on Reconnect',
+    / {3}– ms /.test(stats) && stats.length === 29 && q === null && ov?.getAttribute('aria-live') === 'polite' && !!again && document.activeElement === again,
+    JSON.stringify({ stats, q, live: ov?.getAttribute('aria-live'), focus: document.activeElement?.textContent }));
+}
+
+{
+  // the session's view left: the pictures it kept freed with it, the screenshot and the clipboard history's images (an
+  // object URL holds its image as long as the page lasts, and the page stays for the next session)
+  Object.assign(CONN, { clipboard: true, ask: true, app: '' });
+  await go('#/conns');
+  await go('#/s/c1');
+  const form = appEl.querySelector('.overlay').querySelector('form');
+  if (form.querySelector('[name=password]')) form.querySelector('[name=password]').value = 'pw';
+  submit(form);
+  await settle();
+  const wk = workers.at(-1);
+  wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode('{"token":"t41"}') } });
+  wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode('{"connected":true}') } });
+  await settle();
+  const n0 = blobs.size;
+  appEl.querySelector('.bar').querySelectorAll('button').find((b) => b.getAttribute('title') === t('shot'))?.click();
+  byText(t('shot_full'), appEl.querySelector('.panel'))?.click();
+  await settle();
+  byText(t('shot_remote'), appEl.querySelector('.panel'))?.click();   // the screenshot in the clipboard history too
+  await settle();
+  const urls = [...blobs.keys()].slice(n0);
+  await go('#/conns');
+  check('session: its view left, the screenshot and the clipboard history\'s images are freed', urls.length === 2 && urls.every((u) => revoked.includes(u)),
+    JSON.stringify({ urls, freed: urls.map((u) => revoked.includes(u)) }));
   Object.assign(CONN, { clipboard: false });
 }
 
@@ -1625,6 +1692,46 @@ await settle();
     JSON.stringify({ type: box0?.getAttribute('type'), role0, ticked1, saves }));
   check('admin: sign-in hours of a user, off by default (sent as none), sent with the days ticked and the times',
     hoursOff && JSON.stringify(hoursSent) === JSON.stringify([null, { days: [1, 2, 3, 4, 5, 6], from: '08:00', to: '18:00' }]), JSON.stringify({ hoursOff, hoursSent }));
+  // a local user linked to the company account: the administrator undoes it after yes (a wrong account linked: before, nobody
+  // could), the row then gone; not offered for one not linked, nor for one the provider made (it has no other sign-in)
+  const users0 = answers['admin.users'], unlinks = [];
+  const plain = { role: 'user', enabled: true, totp: false, passkeys: [], max_sessions: 0, last_login: null };
+  answers['admin.users'] = () => ({ users: [{ ...plain, id: 'u7', username: 'ana', oidc_linked: true },
+    { ...plain, id: 'u8', username: 'eva@empresa.com', source: 'oidc', oidc_linked: true }, { ...plain, id: 'u9', username: 'jefa', role: 'admin' }] });
+  answers['admin.user.oidc_unlink'] = (b) => { unlinks.push(b.id); return { user: {} }; };
+  await go('#/admin/users');
+  const editBtns = () => appEl.querySelectorAll('button').filter((b) => b.getAttribute('title') === t('edit'));
+  const lastModal = () => document.body.querySelectorAll('.modal').at(-1);
+  const offered = [];
+  for (const i of [1, 2]) {                               // eva (made by the provider), jefa (not linked)
+    editBtns()[i]?.click();
+    await settle();
+    offered.push(!!byText(t('oidc_unlink'), lastModal()));
+    byText(t('cancel'), lastModal())?.click();
+    await settle();
+  }
+  editBtns()[0]?.click();
+  await settle();
+  const ed = lastModal();
+  const linkShown = !!ed?.textContent.includes(t('oidc_user_linked'));
+  byText(t('oidc_unlink'), ed)?.click();
+  await settle();
+  const asked = !!lastModal()?.textContent.includes(t('oidc_unlink_q', 'ana'));
+  byText(t('cancel'), lastModal())?.click();               // No: nothing sent
+  await settle();
+  const afterNo = unlinks.length;
+  byText(t('oidc_unlink'), ed)?.click();
+  await settle();
+  byText(t('yes'), lastModal())?.click();
+  await settle();
+  const rowGone = !byText(t('oidc_unlink'), ed) && !ed.textContent.includes(t('oidc_user_linked'));
+  byText(t('cancel'), ed)?.click();
+  await settle();
+  answers['admin.users'] = users0;
+  delete answers['admin.user.oidc_unlink'];
+  check('admin: a company account linked by a local user undone after yes, the row then gone; not offered for one not linked nor one the provider made',
+    JSON.stringify([offered, linkShown, asked, afterNo, unlinks, rowGone]) === JSON.stringify([[false, false], true, true, 0, ['u7'], true]),
+    JSON.stringify({ offered, linkShown, asked, afterNo, unlinks, rowGone }));
   await go('#/admin/settings');
   const total = appEl.querySelector('input[name=max_sessions_total]');
   check('admin: RDP sessions of all users, with its help', total?.value === 20 && appEl.textContent.includes(t('s_max_sessions_total_help')));
@@ -2824,6 +2931,51 @@ await settle();
   await go('#/conns');
 }
 {
+  // this computer's microphone in use by the remote computer: said by the session itself while it lasts, with its icon (before,
+  // only by the browser's own sign, hidden by a full screen or another window); gone when it is let go
+  const nav0 = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const media = { enumerateDevices: async () => [], getUserMedia: async () => ({ getTracks: () => [{ stop() {} }] }) };
+  Object.defineProperty(globalThis, 'navigator', { value: { ...globalThis.navigator, mediaDevices: media }, configurable: true });
+  const audio0 = [globalThis.AudioContext, globalThis.AudioWorkletNode];
+  globalThis.AudioContext = class {
+    constructor() { this.state = 'running'; this.destination = {}; this.audioWorklet = { addModule: async () => {} }; }
+    close() { return Promise.resolve(); }
+    resume() { return Promise.resolve(); }
+    createMediaStreamSource() { return { connect() {} }; }
+  };
+  globalThis.AudioWorkletNode = class { constructor() { this.port = {}; } connect() {} };
+  CONN.mic = true;
+  await go('#/s/c1');
+  const form = appEl.querySelector('.overlay')?.querySelector('form');
+  const pw = form?.querySelector('[name=password]');
+  if (pw) pw.value = 'pw';
+  submit(form);
+  await settle();
+  const wk = workers.at(-1);
+  wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode('{"token":"t6"}') } });
+  wk.onmessage({ data: { t: 'frame', type: 3, d: new TextEncoder().encode('{"connected":true}') } });
+  await settle();
+  const badge = () => appEl.querySelector('.cap-badge');
+  const before = [!!badge(), badge()?.classList.contains('hidden')];
+  const fmt = new Uint8Array(6);
+  fmt[0] = 1;
+  new DataView(fmt.buffer).setUint32(1, 44100, true);
+  fmt[5] = 1;
+  wk.onmessage({ data: { t: 'frame', type: 13, d: fmt } });   // a program there records: the microphone taken
+  await settle();
+  const using = [badge()?.classList.contains('hidden'), badge()?.textContent.trim() === t('cap_mic'), badge()?.querySelectorAll('svg').length, badge()?.getAttribute('role')];
+  wk.onmessage({ data: { t: 'frame', type: 13, d: new Uint8Array([0]) } });   // ... and stops: let go
+  await settle();
+  const after = badge()?.classList.contains('hidden');
+  CONN.mic = false;
+  [globalThis.AudioContext, globalThis.AudioWorkletNode] = audio0;
+  if (nav0) Object.defineProperty(globalThis, 'navigator', nav0);
+  else delete globalThis.navigator;
+  check('microphone in use: the session says so itself with its icon while the remote computer uses it; gone when let go',
+    JSON.stringify([before, using, after]) === JSON.stringify([[true, true], [false, true, 1, 'status'], true]), JSON.stringify({ before, using, after }));
+  await go('#/conns');
+}
+{
   // recording started and stopped in a session: the toolbar's button for whoever may (administrators; users when the settings
   // allow it), following what the session says; one recorded by the connection or an administrator not stopped by a user
   // (its button hidden for them); the active sessions: recorded or not, started and stopped by an administrator; the setting;
@@ -3121,10 +3273,53 @@ await settle();
   Object.assign(STATE.user, { source: 'ad', save_passwords: true, no_key: false });
   await go('#/profile');
   const adProfile = appEl.textContent.includes(t('twofa')) && appEl.textContent.includes(t('password_external_ad'));
-  // signed out: the provider's button; back from it without signing in, the reason said once and the address cleaned
   delete STATE.user.source;
   delete STATE.user.no_key;
   Object.assign(STATE.user, user0);
+  {
+    // linking a local user to the company account from the profile (never by its name alone: see oidc.php): the card with the
+    // provider's name and its button to the provider; back from it, said once: linked, or why not, also an error at the
+    // provider while signed in (before, lost: only the sign-in screen said it), in the profile where it was asked; a user linked
+    // is told so, without the button
+    const toasts = () => document.body.querySelector('.toasts')?.textContent || '';
+    let at = timers.length;                              // (the notices come in a timer: those since `at` run)
+    const tick = async () => { timers.slice(at).filter((x) => !x.ms).forEach((x) => x.f()); at = timers.length; await settle(); };
+    const hist0 = globalThis.history, href0 = location.href, linkCleaned = [];
+    globalThis.history = { replaceState: (s, n, url) => { linkCleaned.push(url); location.search = ''; location.hash = url.includes('#') ? url.slice(url.indexOf('#')) : ''; } };
+    const u0 = { ...STATE.user };
+    Object.assign(STATE.user, { oidc_link: 'Prueba', oidc_linked: false });
+    let asked = 0;
+    answers['oidc.link'] = () => { asked++; return { url: 'https://idp.test/authorize?state=s' }; };
+    await go('#/profile');
+    const card = appEl.textContent.includes(t('oidc_account')) && appEl.textContent.includes(t('oidc_account_help', 'Prueba'));
+    byText(t('oidc_account_link', 'Prueba'))?.click();
+    await settle();
+    const sent = [asked, location.href];
+    Object.assign(location, { search: '?oidc_link=ok', pathname: '/mudesk/' });
+    await go('#/profile');
+    await tick();
+    const ok = toasts().includes(t('oidc_link_ok'));
+    location.search = '?oidc_error=oidc_denied';             // cancelled at the provider: back to the page, not the profile
+    await go('#/conns');
+    await tick();
+    const denied = [location.hash, toasts().includes(t('e_oidc_denied')), appEl.textContent.includes(t('oidc_account_help', 'Prueba')), linkCleaned.at(-1)];
+    location.search = '?oidc_error=' + encodeURIComponent('Llame al 900 000 000');   // made up: never shown as given
+    await go('#/conns');
+    await tick();
+    const madeUp = toasts().includes('900') ? 'shown' : toasts().includes(t('e_oidc_provider'));
+    Object.assign(STATE.user, { oidc_link: null, oidc_linked: true });
+    await go('#/profile');
+    const linked = appEl.textContent.includes(t('oidc_account_linked')) && !byText(t('oidc_account_link', 'Prueba'));
+    for (const k of Object.keys(STATE.user)) if (!(k in u0)) delete STATE.user[k];
+    Object.assign(STATE.user, u0);
+    delete answers['oidc.link'];
+    globalThis.history = hist0;
+    Object.assign(location, { search: '', href: href0 });
+    check('company account: linked from the profile (its card, to the provider and back, said once); an error at the provider while signed in said in the profile, never as given; a linked user told so',
+      JSON.stringify([card, sent, ok, denied, madeUp, linked]) === JSON.stringify([true, [1, 'https://idp.test/authorize?state=s'], true, ['#/profile', true, true, '/mudesk/#/profile'], true, true]),
+      JSON.stringify({ card, sent, ok, denied, madeUp, linked }));
+  }
+  // signed out: the provider's button; back from it without signing in, the reason said once and the address cleaned
   Object.defineProperty(El.prototype, 'lang', { get() { return this.querySelector('[name=lang]'); }, configurable: true });   // (form.lang)
   answers.state = answers.logout = () => ({ ...STATE, user: null, oidc: 'Prueba' });
   byText(t('logout')).click();
@@ -3146,6 +3341,116 @@ await settle();
   check('company account: the provider button on the sign-in screen, its error said once; an OIDC or Windows profile without a password of its own; no saved password without the key',
     button?.textContent === t('oidc_signin', 'Prueba') && said === t('e_oidc_unknown_user') && cleaned[0] === '/mudesk/#/' && madeUp === t('e_oidc_provider')
     && oidcProfile.every(Boolean) && noKeyText && adProfile, JSON.stringify({ button: button?.textContent, said, cleaned, oidcProfile, noKeyText, adProfile }));
+}
+
+{
+  // the hosting diagnostics (tools/check.php), PHP processes at once: requests the server refuses without running them (508:
+  // CloudLinux's limit of entry processes; 503, 429) are its limit, and a session needs up to 5 at once: max_sessions_total
+  // at most a fifth of those served at once (before, the check ended in an error, with no figure); none refused: as before
+  const vm = await import('node:vm');
+  const fs = await import('node:fs');
+  const page = fs.readFileSync(new URL('../tools/check.php', import.meta.url), 'utf8');
+  const code = page.slice(page.indexOf('<script>') + 8, page.lastIndexOf('</script>')) + '\nglobalThis.checks = tests;';
+  const run = async (served, other = 508) => {
+    const els = {}, el = (id) => (els[id] ??= { id, value: id === 'n' ? '20' : '', textContent: '', items: [], replaceChildren(...c) { this.items = c.map((x) => x.textContent); } });
+    let asked = 0;
+    const fetch = async () => {
+      const i = asked++;
+      if (i < served) return { ok: true, status: 200, json: async () => ({ inicio: 0, fin: 1, pid: i, protocolo: 'HTTP/2.0' }) };
+      return { ok: false, status: other, text: async () => 'busy' };
+    };
+    const ctx = { document: { getElementById: el, querySelectorAll: () => [], createElement: () => ({}) }, fetch, performance, TextDecoder, AbortController };
+    vm.runInNewContext(code, ctx);
+    const error = await ctx.checks.procesos().then(() => '', (e) => e.message);
+    return [els.avisos?.items.join(' | ') ?? '', els.out.textContent, error];
+  };
+  const [w12, o12] = await run(12), [w3] = await run(3, 503), [w20, o20] = await run(20), [, , e500] = await run(12, 500);
+  check('hosting diagnostics: PHP processes at once, refused ones (508, 503) taken as the limit, max_sessions_total a fifth of those served; none refused, as before; another error said',
+    w12.includes('(HTTP 508) al pasar de 12 a la vez') && w12.includes('como mucho en 2') && o12.includes('rechazadas sin ejecutarse: 8 (HTTP 508)')
+      && w3.includes('(HTTP 503) al pasar de 3 a la vez') && w3.includes('no alcanza ni para una sesión') && w20 === '' && o20.includes('Todas a la vez')
+      && e500.startsWith('HTTP 500'), JSON.stringify({ w12, o12, w3, w20, o20, e500 }));
+}
+
+{
+  // the first run, guided: the setup code unlocks the server's checks (each with what to do in its state: amber, red); the
+  // page adds a long request (a line a second: 12 that came) and 20 requests at once (8 taken together, the rest refused
+  // with 508: a fifth of 8 sessions at most, offered and ticked), no WebSocket service (said with its advantages: not a
+  // fault), and a remote computer when asked (one that answers, one
+  // that does not); then the administrator, the limit set with it; a wrong code said and nothing checked
+  // (from the sign-in screen the test before left: the server answers as a new installation)
+  answers.login = () => ({ setup: true, csrf: 'x', second: null, user: null });
+  const signIn = appEl.querySelector('form');
+  signIn.querySelector('[name=username]').value = 'x';
+  signIn.querySelector('[name=password]').value = 'x';
+  submit(signIn);
+  await settle();
+  delete answers.login;
+  const checks = [{ id: 'php', state: 'ok', value: '8.4.1' }, { id: 'memory', state: 'warn', value: '128M' }, { id: 'data_protected', state: 'fail', value: '' }];
+  answers['setup.check'] = (b) => (b.setup_code === 'ABCDE-12345' ? { checks } : { error: 'setup_code' });
+  answers['setup.rdp'] = (b) => (b.host === 'pc.test' && b.port === 3390 ? { ok: true, protocol: 'nla', ms: 12, tls: 'TLSv1.3', cn: 'PC' } : { ok: false, problem: 'tcp' });
+  const setupCalls = [];
+  answers.setup = (b) => { setupCalls.push(['setup', b.setup_code, b.username]); return STATE; };
+  answers['admin.settings'] = (b) => { setupCalls.push(['settings', JSON.stringify(b.settings)]); return {}; };
+  const fetch1 = globalThis.fetch;
+  let waits = 0;
+  globalThis.fetch = async (url, o = {}) => {
+    const b = typeof o.body === 'string' ? JSON.parse(o.body) : {};
+    if (b.action === 'setup.stream') {
+      const lines = [' '.repeat(10) + '\n', ...Array.from({ length: 12 }, (_, i) => `${i + 1}\n`)];
+      return { ok: true, status: 200, body: { getReader: () => ({ read: async () => (lines.length ? { value: new TextEncoder().encode(lines.shift()), done: false } : { done: true }) }) } };
+    }
+    if (b.action === 'setup.wait') {
+      return waits++ < 8 ? { ok: true, status: 200, json: async () => ({ start: 100, end: 101 }) } : { ok: false, status: 508, json: async () => ({}) };
+    }
+    return fetch1(url, o);
+  };
+  const codeForm = appEl.querySelector('form');
+  codeForm.querySelector('[name=setup_code]').value = 'WRONG';
+  submit(codeForm);
+  await settle();
+  const wrong = [(appEl.querySelector('.error')?.textContent || ''), appEl.querySelectorAll('.setup-check').length];
+  codeForm.querySelector('[name=setup_code]').value = 'ABCDE-12345';
+  submit(codeForm);
+  for (let i = 0; i < 6; i++) await settle();
+  const rows = [...appEl.querySelectorAll('.setup-check')].map((r) => r.className.replace('setup-check ', ''));
+  const rowText = [...appEl.querySelectorAll('.setup-check')].map((r) => r.textContent);
+  const texts = [rowText[1].includes(t('chk_memory_fix')), rowText[2].includes(t('chk_data_protected_fail')), !rowText[0].includes(t('chk_php_fix')),
+    rowText[4].includes(t('setup_procs_refused', 8, 1)), (appEl.querySelector('p.warn')?.textContent || '') === t('setup_fails'), rowText[5].includes(t('chk_websocket_info'))];
+  const rdpForm = [...appEl.querySelectorAll('form')].find((f) => f.querySelector('[name=host]'));
+  const rdpOut = rdpForm.parentNode.querySelector('p.muted:not(.x)') && [...rdpForm.parentNode.children].find((c, i, all) => all[i - 1] === rdpForm);
+  rdpForm.querySelector('[name=host]').value = 'pc.test';
+  rdpForm.querySelector('[name=port]').value = '3390';
+  submit(rdpForm);
+  await settle();
+  const rdpOk = rdpOut.textContent;
+  rdpForm.querySelector('[name=host]').value = 'otro.test';
+  submit(rdpForm);
+  await settle();
+  const rdpNo = rdpOut.textContent;
+  // (the texts expected, in the page's language now: signed in, it takes the administrator's)
+  const want = [t('e_setup_code'), t('setup_rdp_ok', t('setup_proto_nla'), 12, ' (TLSv1.3, PC)'), t('setup_rdp_tcp')];
+  const next = byText(t('setup_continue'));
+  const nextOn = next && !next.disabled;
+  next.click();
+  await settle();
+  const admin = appEl.querySelector('form');
+  const limitBox = admin.querySelector('[name=limit]');
+  const offered = [limitBox?.checked, admin.textContent.includes(t('setup_limit', 1))];
+  admin.querySelector('[name=username]').value = 'jefa';
+  admin.querySelector('[name=password]').value = 'Clave-larga-12';
+  admin.querySelector('[name=password2]').value = 'Clave-larga-12';
+  submit(admin);
+  for (let i = 0; i < 3; i++) await settle();
+  globalThis.fetch = fetch1;
+  delete answers['setup.check'];
+  delete answers['setup.rdp'];
+  delete answers.setup;
+  delete answers['admin.settings'];
+  check('the first run, guided: the code unlocks the checks (a wrong one said), each with what to do in its state; a long request and requests at once from the page (the refused ones: a fifth of those taken); a remote computer tried; the administrator, with the limit found set',
+    wrong[0] === want[0] && wrong[1] === 0 && JSON.stringify(rows) === JSON.stringify(['ok', 'warn', 'fail', 'ok', 'warn', 'info']) && texts.every(Boolean)
+      && rdpOk === want[1] && rdpNo === want[2] && nextOn && offered.every(Boolean)
+      && JSON.stringify(setupCalls) === JSON.stringify([['setup', 'ABCDE-12345', 'jefa'], ['settings', '{"max_sessions_total":1}']]),
+    JSON.stringify({ wrong, rows, texts, rdpOk, rdpNo, nextOn, offered, setupCalls }));
 }
 
 console.log(failed ? `\n${failed} failed` : '\nAll tests passed');

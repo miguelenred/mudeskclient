@@ -480,27 +480,18 @@ final class Audit
      */
     private static function signingKey(): \OpenSSLAsymmetricKey
     {
-        $file = Config::dir('audit-key.php');
-        if (!is_file($file)) {
+        // made as the server key (Crypto::keyFile: never seen empty or cut); one found damaged is made again (only exports
+        // signed before depend on it, and they can no longer be checked with it anyway)
+        $parse = static fn(string $c) => openssl_pkey_get_private(substr($c, strlen(self::KEY_HEAD)));
+        $c     = Crypto::keyFile(Config::dir('audit-key.php'), static function (): string {
             $cnf = (string)tempnam(Config::dir('tmp'), 'cnf');
             $opt = ['private_key_type' => OPENSSL_KEYTYPE_RSA, 'private_key_bits' => 3072, 'config' => $cnf];
             $key = openssl_pkey_new($opt);
             $ok  = $key !== false && openssl_pkey_export($key, $pem, null, $opt);
             @unlink($cnf);
-            if (!$ok) {
-                throw new \RuntimeException('Cannot create the audit signing key (OpenSSL): ' . openssl_error_string());
-            }
-            $h = @fopen($file, 'x');                         // first writer wins
-            if ($h !== false) {
-                fwrite($h, self::KEY_HEAD . $pem);
-                fclose($h);
-                @chmod($file, 0600);
-            }
-        }
-        for ($i = 0; !str_contains($c = (string)@file_get_contents($file), '-----END') && $i < 100; $i++) {
-            usleep(1000);                                     // another request is still writing it
-        }
-        return openssl_pkey_get_private(substr($c, strlen(self::KEY_HEAD))) ?: throw new \RuntimeException('Invalid audit-key.php');
+            return $ok ? self::KEY_HEAD . $pem : throw new \RuntimeException('Cannot create the audit signing key (OpenSSL): ' . openssl_error_string());
+        }, static fn(string $c): bool => $parse($c) !== false);
+        return $parse($c) ?: throw new \RuntimeException('Invalid audit-key.php');
     }
 
     /** Public key of the export signatures (PEM), for whoever checks an exported file. */

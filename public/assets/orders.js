@@ -1,5 +1,5 @@
 // MuDeskClient - https://miguelenred.es/mudeskclient - Apache License 2.0
-// Drawing orders (MS-RDPEGDI): DstBlt, PatBlt, ScrBlt, OpaqueRect and MemBlt, plus the bitmap cache (revision 2), and
+// Drawing orders (MS-RDPEGDI): DstBlt, PatBlt, ScrBlt, OpaqueRect, MemBlt and Mem3Blt, plus the bitmap cache (revision 2), and
 // text: GlyphIndex, FastIndex and FastGlyph with the glyph cache (Cache Glyph revision 2) and the fragment cache.
 // They turn scrolling, window moves, plain fills, repeated pictures and text into tiny commands instead of full bitmaps.
 'use strict';
@@ -10,7 +10,7 @@ const CACHE_CELLS = [600, 600, 1024], CACHE_PIXELS = [256, 1024, 4096];
 
 import { decodeBitmap } from './gfx.js';
 
-const FIELD_BYTES = { 0x00: 1, 0x01: 2, 0x02: 1, 0x0a: 1, 0x0d: 2, 0x13: 2, 0x18: 2, 0x1b: 3 };
+const FIELD_BYTES = { 0x00: 1, 0x01: 2, 0x02: 1, 0x0a: 1, 0x0d: 2, 0x0e: 3, 0x13: 2, 0x18: 2, 0x1b: 3 };
 const HATCHES = [[0xff, 0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0xff], [0xf7, 0xf7, 0xf7, 0xf7, 0xf7, 0xf7, 0xf7, 0xf7],
   [0xfe, 0xfd, 0xfb, 0xf7, 0xef, 0xdf, 0xbf, 0x7f], [0x7f, 0xbf, 0xdf, 0xef, 0xf7, 0xfb, 0xfd, 0xfe],
   [0xf7, 0xf7, 0xf7, 0x00, 0xf7, 0xf7, 0xf7, 0xf7], [0x7e, 0xbd, 0xdb, 0xe7, 0xe7, 0xdb, 0xbd, 0x7e]];   // hatched brushes (8 rows)
@@ -19,6 +19,8 @@ const TEXT = () => ({ cacheId: 0, flAccel: 0, ulCharInc: 0, fOpRedundant: 0, bac
   opl: 0, opt: 0, opr: 0, opb: 0, x: 0, y: 0, data: new Uint8Array(0) });
 const CBR2_BPP = { 3: 8, 4: 16, 5: 24, 6: 32 };
 const GLYPH_MAX = 2048;                                    // largest glyph cache cell the client offers (bytes of bitmap)
+// the glyph caches as the gateway offers them (Client.php, capability 16): [entries, bytes of bitmap a cell holds]
+const GLYPH_CACHES = [[254, 4], [254, 4], [254, 8], [254, 8], [254, 16], [254, 32], [254, 64], [254, 128], [254, 256], [64, 2048]];
 const SOLID = [0, 0, 0, 0, 0, 0, 0, 0];                   // solid brush as a pattern: all in the clear colour (foreground field)
 const WHITE = new Uint32Array(64).fill(0xffffffff);
 
@@ -54,6 +56,15 @@ export function glyphPath(o) {
   return path;
 }
 
+/**
+ * An 8x8 pattern brush's rows from the top: sent as a Windows bitmap is kept, from the bottom up (its hatch field the bottom
+ * row, then the 7 bytes of its extra field upwards). Taken as the top row, every pattern came one row lower than Windows
+ * draws it: the 50 % grey of scroll bars and of the dotted focus rectangle inverted, seen against Server 2003's own pixels.
+ */
+function patternRows(f) {
+  return [...[...f.extra].reverse(), f.hatch];
+}
+
 /** The 8x8 brush of a 'pattern' operation (rows, set/clear colours) as 64 pixels. */
 function brushTile(o) {
   const px = new Uint32Array(64);
@@ -64,11 +75,12 @@ function brushTile(o) {
 /**
  * Any raster operation (ROP3) of a 'mem' (src: the pixels of its bitmap) or 'pattern' operation (src: null) on the w x h
  * pixels at x0, y0 of the screen, held in dst (0xAABBGGRR words, changed in place): each result bit is bit (P << 2 | S << 1
- * | D) of o.rop. MemBlt carries no brush (Windows sends the ROPs that use one as Mem3Blt, not negotiated): P is then the
+ * | D) of o.rop. A Mem3Blt carries its brush (rows, colours and origin, as a PatBlt's); a MemBlt none: P is then the
  * default brush of a GDI device context, white. PatBlt has no source: S is the destination (its ROPs do not use it).
  */
 export function rop3(o, dst, src, x0, y0, w, h) {
-  const brush = src ? WHITE : brushTile(o), bx = src ? 0 : o.ox - x0, by = src ? 0 : o.oy - y0, m = (i) => -((o.rop >> i) & 1);
+  const pat = o.rows !== undefined, brush = pat ? brushTile(o) : WHITE, bx = pat ? o.ox - x0 : 0, by = pat ? o.oy - y0 : 0;
+  const m = (i) => -((o.rop >> i) & 1);
   const m0 = m(0), m1 = m(1), m2 = m(2), m3 = m(3), m4 = m(4), m5 = m(5), m6 = m(6), m7 = m(7);
   src ||= dst;
   for (let y = 0, i = 0; y < h; y++) {
@@ -185,6 +197,18 @@ function windowOrder(dv, draw) {
 
 export class OrderParser {
   constructor() {
+    this.resetState();
+    this.glyphs = new Map();                             // cacheId * 256 + index -> {x, y, w, h} (the bitmaps live on the main thread)
+    this.frags = new Map();                              // fragment cache: index -> glyph bytes
+  }
+
+  /**
+   * The orders' history as at the start (the last order type PatBlt, bounds and every field 0): the server starts it anew
+   * with each Demand Active, also a reactivation (Windows Server 2003 going back to a disconnected session, a resize),
+   * and each field after it is sent as a change from that. Kept, the coordinates sent as deltas landed on old values: text
+   * drawn far from its place, fills clipped to stale bounds (parts of the desktop left unpainted). The caches stay.
+   */
+  resetState() {
     this.type = 0x01;                                    // initial order type is PatBlt
     this.bounds = { l: 0, t: 0, r: 0, b: 0 };
     this.f = {
@@ -193,14 +217,17 @@ export class OrderParser {
       0x02: { x: 0, y: 0, w: 0, h: 0, rop: 0, sx: 0, sy: 0 },
       0x0a: { x: 0, y: 0, w: 0, h: 0, color: 0 },
       0x0d: { id: 0, x: 0, y: 0, w: 0, h: 0, rop: 0, sx: 0, sy: 0, idx: 0 },
+      0x0e: { id: 0, x: 0, y: 0, w: 0, h: 0, rop: 0, sx: 0, sy: 0, back: 0, fore: 0, bx: 0, by: 0, style: 0, hatch: 0, extra: new Uint8Array(7), idx: 0 },
       0x13: TEXT(), 0x18: TEXT(), 0x1b: TEXT(),
     };
-    this.glyphs = new Map();                             // cacheId * 256 + index -> {x, y, w, h} (the bitmaps live on the main thread)
-    this.frags = new Map();                              // fragment cache: index -> glyph bytes
   }
 
   /** Stores a glyph (origin offset x, y, size w x h, 1 bpp rows of (w + 7) >> 3 bytes, MSB first) and tells the main thread. */
   #glyph(draw, cacheId, idx, x, y, w, h, bits) {
+    // only within the caches offered: a cache, an index and a size past them left out (before, FastGlyph took any cache of
+    // 256 and any size up to 2 KB: 65,536 glyphs of checkerboard bits made millions of rectangles on the page)
+    const c = GLYPH_CACHES[cacheId];
+    if (!c || idx >= c[0] || bits.length > c[1]) return;
     this.glyphs.set(cacheId * 256 + idx, { x, y, w, h });
     draw({ op: 'glyph', key: cacheId * 256 + idx, w, h, bits: bits.slice() });
   }
@@ -243,17 +270,19 @@ export class OrderParser {
         else if (t.ulCharInc) x += t.ulCharInc;
       }
     };
-    if (fill) draw({ op: 'fill', x: fill.l, y: fill.t, w: fill.r - fill.l + 1, h: fill.b - fill.t + 1, color: orderColor(t.fore, bpp, this.pal), clip });
+    // (both rectangles end before their right and bottom values, as Windows draws them: one pixel more covered the next
+    // row's first line, the selected line of a list one pixel taller and a frame's line under it gone, seen on Server 2003)
+    if (fill) draw({ op: 'fill', x: fill.l, y: fill.t, w: fill.r - fill.l, h: fill.b - fill.t, color: orderColor(t.fore, bpp, this.pal), clip });
     place(data);
-    if (!run.length || t.bkr < t.bkl || t.bkb < t.bkt) return;
-    const box = { l: t.bkl, t: t.bkt, r: t.bkr, b: t.bkb };
+    if (!run.length || t.bkr <= t.bkl || t.bkb <= t.bkt) return;
+    const box = { l: t.bkl, t: t.bkt, r: t.bkr - 1, b: t.bkb - 1 };
     if (clip) Object.assign(box, { l: Math.max(box.l, clip.l), t: Math.max(box.t, clip.t), r: Math.min(box.r, clip.r), b: Math.min(box.b, clip.b) });
     if (box.r >= box.l && box.b >= box.t) draw({ op: 'text', color: orderColor(t.back, bpp, this.pal), glyphs: run, x: box.l, y: box.t, w: box.r - box.l + 1, h: box.b - box.t + 1 });
   }
 
   /** Secondary order at p (after the control byte): bitmap cache entries; other caches are skipped. Returns the next p. */
   #secondary(u8, dv, p, palette, draw, max) {
-    const len = dv.getInt16(p, true), extra = dv.getUint16(p + 2, true), type = u8[p + 4];
+    const len = dv.getUint16(p, true), extra = dv.getUint16(p + 2, true), type = u8[p + 4];   // (unsigned: a negative one went back)
     const start = p + 5, end = start + len + 7;
     const two = (q) => u8[q] & 0x80 ? [((u8[q] & 0x7f) << 8) | u8[q + 1], q + 2] : [u8[q], q + 1];   // 2-byte unsigned encoding
     const twoS = (q) => { const [v, n] = two(q); const neg = u8[q] & 0x40; const m = u8[q] & 0x80 ? v & 0x3fff : v & 0x3f; return [neg ? -m : m, n]; };
@@ -294,7 +323,8 @@ export class OrderParser {
   /**
    * Parses TS_FP_UPDATE_ORDERS data (u16 count + orders) and calls draw(cmd) for each order:
    * {op: 'fill', x, y, w, h, color, clip} | {op: 'copy', x, y, w, h, sx, sy, clip} | {op: 'invert', ...}
-   * | {op: 'cache', id, idx, w, h, px} (store a bitmap) | {op: 'mem', id, idx, x, y, w, h, sx, sy, rop, clip} (draw a stored one)
+   * | {op: 'cache', id, idx, w, h, px} (store a bitmap) | {op: 'mem', id, idx, x, y, w, h, sx, sy, rop, clip} (draw a stored one;
+   * from a Mem3Blt also its brush: rows, ox, oy, set, clear)
    * | {op: 'pattern', x, y, w, h, rows, ox, oy, set, clear, rop, clip} (brush) | {op: 'glyph' | 'text', ...} (see #text)
    * max: the most pixels of a cached bitmap (see decodeBitmap). Returns false when an order it does not know, or corrupt
    * data, is found (the rest of the update is skipped).
@@ -418,6 +448,28 @@ export class OrderParser {
         this.#text({ ...t, x, y }, bpp, draw, c, opr > opl && opb > opt ? { l: opl, t: opt, r: opr, b: opb } : null);
         continue;
       }
+      if (type === 0x0e) {                                 // Mem3Blt: a rectangle of a cached bitmap with a brush, any ROP3
+        if (has(1)) { f.id = dv.getUint16(p, true); p += 2; }
+        if (has(2)) f.x = coord(f.x);
+        if (has(3)) f.y = coord(f.y);
+        if (has(4)) f.w = coord(f.w);
+        if (has(5)) f.h = coord(f.h);
+        if (has(6)) f.rop = byte();
+        if (has(7)) f.sx = coord(f.sx);
+        if (has(8)) f.sy = coord(f.sy);
+        if (has(9)) f.back = color();
+        if (has(10)) f.fore = color();
+        if (has(11)) f.bx = byte();                       // brush: origin, style, hatch (a pattern's bottom row), 7 more rows
+        if (has(12)) f.by = byte();
+        if (has(13)) f.style = byte();
+        if (has(14)) f.hatch = byte();
+        if (has(15)) { f.extra = u8.slice(p, p + 7); p += 7; }
+        if (has(16)) { f.idx = dv.getUint16(p, true); p += 2; }
+        const rows = f.style === 3 ? patternRows(f) : f.style === 2 && f.hatch < 6 ? HATCHES[f.hatch] : SOLID;
+        draw({ op: 'mem', id: f.id & 0xff, idx: f.idx, x: f.x, y: f.y, w: f.w, h: f.h, sx: f.sx, sy: f.sy, rop: f.rop, clip: c,
+          rows, ox: f.bx, oy: f.by, set: orderColor(f.back, bpp, this.pal), clear: orderColor(f.fore, bpp, this.pal) });
+        continue;
+      }
       if (type === 0x0d) {                                 // MemBlt: a rectangle of a cached bitmap
         if (has(1)) { f.id = dv.getUint16(p, true); p += 2; }
         if (has(2)) f.x = coord(f.x);
@@ -452,12 +504,12 @@ export class OrderParser {
       if (type === 0x01) {
         if (has(6)) f.back = color();
         if (has(7)) f.fore = color();
-        if (has(8)) f.bx = byte();                        // brush: origin, style, hatch (first row of a pattern), 7 more rows
+        if (has(8)) f.bx = byte();                        // brush: origin, style, hatch (a pattern's bottom row), 7 more rows
         if (has(9)) f.by = byte();
         if (has(10)) f.style = byte();
         if (has(11)) f.hatch = byte();
         if (has(12)) { f.extra = u8.slice(p, p + 7); p += 7; }
-        const rows = f.style === 3 ? [f.hatch, ...[...f.extra].reverse()] : f.style === 2 && f.hatch < 6 ? HATCHES[f.hatch] : null;
+        const rows = f.style === 3 ? patternRows(f) : f.style === 2 && f.hatch < 6 ? HATCHES[f.hatch] : null;
         // PATCOPY with an 8x8 brush (set bits in the background colour), or another ROP that uses the brush (PATINVERT...)
         if (f.rop === 0xf0 ? rows : f.rop !== 0x00 && f.rop !== 0xff && f.rop !== 0x55) {
           draw({ op: 'pattern', x: f.x, y: f.y, w: f.w, h: f.h, rows: rows || SOLID, ox: f.bx, oy: f.by,

@@ -19,7 +19,13 @@ final class Config
             // a computer or gateway never seen confirmed by the user (its fingerprints shown) before anything is sent to it;
             // false: trusted on its first use, as before 1.2 (a man in the middle of that first connection is not noticed)
             'confirm_new_certificates' => true,
-            'ipc'              => 'auto', // 'auto' (Unix socket if possible) or 'file' (queue file, for restricted hostings)
+            // CredSSP 2 to 4 (no 2018 update: CVE-2018-0886) refused, as Windows does; true allows them (see CredSsp)
+            // the optional WebSocket service (tools/ws-server.php): the page tries it at <public>/ws and uses it when it answers;
+            // false: never tried. Where the service listens, behind the web server
+            'websocket'        => true,
+            'websocket_listen' => '127.0.0.1:8091',
+            'credssp_unpatched' => false,
+            'ipc'            => 'auto', // 'auto' (Unix socket if possible) or 'file' (queue file, for restricted hostings)
             'drawing_orders'   => true,   // copy/fill commands and caches instead of bitmaps (less bandwidth); validated with xrdp and Windows 11
             'bulk_compression' => 'rdp61', // highest bulk compression offered: 'rdp61' (XCRUSH), 'rdp6' (NCRUSH), 'mppc' or false
         ];

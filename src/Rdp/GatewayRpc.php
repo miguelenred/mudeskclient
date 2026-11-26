@@ -581,7 +581,7 @@ trait GatewayRpc
             } elseif ($t === 11 && $o + 8 <= strlen($p)) {
                 $size = 4 + (unpack('V', $p, $o + 4)[1] === 0 ? 4 : 16) + 12;
             }
-            if ($size === null) {
+            if ($size === null || $o + 4 + $size > strlen($p)) {   // (a command cut short is none: its value was read past the end)
                 break;
             }
             $cmds[] = $t;

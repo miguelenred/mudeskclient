@@ -99,8 +99,8 @@ const { MicCapture } = await import('../public/assets/mic.js');
 const open = (rate, ch) => { const d = new Uint8Array(6); d[0] = 1; new DataView(d.buffer).setUint32(1, rate, true); d[5] = ch; return d; };
 
 {
-  const sent = [], errors = [];
-  const m = new MicCapture({ send: (p, max, frame) => sent.push([p, max, frame]), onError: (k) => errors.push(k) });
+  const sent = [], errors = [], lives = [];
+  const m = new MicCapture({ send: (p, max, frame) => sent.push([p, max, frame]), onError: (k) => errors.push(k), onLive: (on) => lives.push(on) });
   log.length = 0;
   m.onMessage(open(44100, 1));
   for (let i = 0; i < 5; i++) await tick();
@@ -126,7 +126,10 @@ const open = (rate, ch) => { const d = new Uint8Array(6); d[0] = 1; new DataView
   for (let i = 0; i < 5; i++) await tick();
   check('capture: a new format (48 kHz, two channels) given to the worklet', log.at(-2) === 'node connected true' && lastNode.o.processorOptions.channels === 2 && lastNode.o.processorOptions.rate === 48000, log.at(-4));
   m.stop();
+  m.stop();
   check('capture: no error said', errors.length === 0, errors.join());
+  // the session told each time the microphone is taken and let go (its own sign while it lasts), once each
+  check('capture: the microphone taken and let go said, once each', JSON.stringify(lives) === '[true,false,true,false]', JSON.stringify(lives));
 }
 { // refused (said once, not each time a program records), none there, not a secure page, stopped while the browser asks
   const errors = [], m = new MicCapture({ send() {}, onError: (k) => errors.push(k) });
@@ -150,14 +153,15 @@ const open = (rate, ch) => { const d = new Uint8Array(6); d[0] = 1; new DataView
     errors.join() === 'mic_denied,mic_none,mic_https', errors.join());
   allow = 'later';
   log.length = 0;
-  const l = new MicCapture({ send() {}, onError: (k) => errors.push(k) });
+  const lLives = [];
+  const l = new MicCapture({ send() {}, onError: (k) => errors.push(k), onLive: (on) => lLives.push(on) });
   l.onMessage(open(44100, 1));
   await tick();
   l.onMessage(new Uint8Array([0]));                       // the program stopped while the browser was asking
   pending();
   for (let i = 0; i < 5; i++) await tick();
   check('capture: stopped while the browser asked, the microphone given back when it answers, nothing started',
-    log.includes('track stop') && !log.some((x) => x.startsWith('node ') || x.startsWith('module ')) && l.live === null, log.join(' | '));
+    log.includes('track stop') && !log.some((x) => x.startsWith('node ') || x.startsWith('module ')) && l.live === null && !lLives.length, log.join(' | ') + ' ' + lLives);
   allow = 'yes';
   log.length = 0;
   new MicCapture({ send() {}, onError: (k) => errors.push(k) }).onMessage(open(96000, 1));

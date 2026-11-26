@@ -21,14 +21,14 @@ const mstsc = ['screen mode id:i:2', 'use multimon:i:0', 'desktopwidth:i:1920', 
   'loadbalanceinfo:s:tsv://MS Terminal Services Plugin.1.Escritorios',
   'username:s:EJEMPLO\\maría', 'password 51:b:01000000D08C9DDF0115D1118C7A00C04FC297EB0100000034ABCD'].join('\r\n') + '\r\n';
 const a = parseRdp(decodeRdp(utf16(mstsc)), 'Oficina María.rdp');
-check('.rdp from Remote Desktop Connection (UTF-16 LE): address and port, DOMAIN\\user, colours, redirections, appearance',
+check('.rdp from Remote Desktop Connection (UTF-16 LE): address and port, DOMAIN\\user, colours, appearance; nothing of this computer shared',
   JSON.stringify(a.conn) === JSON.stringify({ name: 'Oficina María', group: '', host: 'pc-oficina.ejemplo.local', port: 3390, user: 'maría',
-    domain: 'EJEMPLO', kbd: 0x040A, bpp: 32, gfx: 'auto', security: 'auto', resize: 'dynamic', clipboard: true, paste: 'auto', printer: false,
-    drive: true, audio: true, mic: false, ask: true, app: '', app_args: '', perf: { wallpaper: true, themes: true, smoothing: true, animations: false, drag: false },
+    domain: 'EJEMPLO', kbd: 0x040A, bpp: 32, gfx: 'auto', security: 'nla', resize: 'dynamic', clipboard: false, paste: 'auto', printer: false,
+    drive: false, audio: true, mic: false, ask: true, app: '', app_args: '', perf: { wallpaper: true, themes: true, smoothing: true, animations: false, drag: false },
     gw: 'rdg.ejemplo.com', lb: 'tsv://MS Terminal Services Plugin.1.Escritorios' }),
   JSON.stringify(a.conn));
-check('.rdp: what MuDesk does not take is said (the saved password); the password is never read; the gateway and the broker\'s load balance info taken and written back',
-  JSON.stringify(a.notes) === JSON.stringify([['rdp_file_password', '']]) && !JSON.stringify(a).includes('D08C9DDF')
+check('.rdp: what MuDesk does not take is said (what it asks to share, its gateway, the saved password); the password is never read; the gateway and the broker\'s load balance info taken and written back',
+  JSON.stringify(a.notes) === JSON.stringify([['rdp_asked', ['clipboard', 'drive']], ['rdp_gateway', 'rdg.ejemplo.com'], ['rdp_file_password', '']]) && !JSON.stringify(a).includes('D08C9DDF')
     && toRdp(a.conn).includes('gatewayhostname:s:rdg.ejemplo.com\r\ngatewayusagemethod:i:1') && toRdp(a.conn).includes('loadbalanceinfo:s:tsv://MS Terminal Services Plugin.1.Escritorios'),
   JSON.stringify(a.notes));
 
@@ -42,23 +42,24 @@ const forms = [one(new TextEncoder().encode('\ufefffull address:s:[fe80::1]:3391
   one(latin1), one(noBom)];
 check('.rdp: UTF-8, Windows-1252 and UTF-16 without BOM; IPv6 with and without brackets; server port; user@domain; TLS; smart sizing',
   JSON.stringify(forms.map((c) => [c.host, c.port, c.user, c.domain, c.security, c.resize, c.bpp])) === JSON.stringify([
-    ['fe80::1', 3391, 'ana@ejemplo.com', '', 'auto', 'dynamic', 16], ['2001:db8::5', 3392, '', '', 'tls', 'fit', 16],
-    ['equipo', 3389, 'José', '', 'auto', 'dynamic', 16], ['sin-bom', 3389, '', '', 'auto', 'dynamic', 16]]), JSON.stringify(forms));
+    ['fe80::1', 3391, 'ana@ejemplo.com', '', 'nla', 'dynamic', 16], ['2001:db8::5', 3392, '', '', 'tls', 'fit', 16],
+    ['equipo', 3389, 'José', '', 'nla', 'dynamic', 16], ['sin-bom', 3389, '', '', 'nla', 'dynamic', 16]]), JSON.stringify(forms));
 const app = parseRdp('full address:s:rds\r\nremoteapplicationmode:i:1\r\nremoteapplicationname:s:Excel\r\nremoteapplicationprogram:s:||excel\r\nremoteapplicationcmdline:s:/r informe.xlsx\r\n', 'a');
 const noProgram = parseRdp('full address:s:rds\r\nremoteapplicationmode:i:1\r\nremoteapplicationname:s:Excel\r\n', 'c');
 const shell = parseRdp('full address:s:rds\r\nalternate shell:s:C:\\app\\inicio.exe\r\n', 'b');
 let missing = '';
 try { parseRdp('screen mode id:i:2\r\nusername:s:x\r\n'); } catch (e) { missing = e.message; }
 check('.rdp: a RemoteApp taken with its program and arguments (said when it has none); a start program said; a file without address refused',
-  app.conn.app === '||excel' && app.conn.app_args === '/r informe.xlsx' && app.notes.length === 0 && noProgram.conn.app === ''
-  && JSON.stringify([...noProgram.notes, ...shell.notes]) === JSON.stringify([['rdp_remoteapp', 'Excel'], ['rdp_shell', 'C:\\app\\inicio.exe']]) && missing === 'rdp_no_address',
+  app.conn.app === '||excel' && app.conn.app_args === '/r informe.xlsx' && JSON.stringify(app.notes) === JSON.stringify([['rdp_asked', ['clipboard', 'printer']]])
+  && noProgram.conn.app === '' && JSON.stringify([...noProgram.notes, ...shell.notes].filter(([k]) => k !== 'rdp_asked')) === JSON.stringify([['rdp_remoteapp', 'Excel'], ['rdp_shell', 'C:\\app\\inicio.exe']]) && missing === 'rdp_no_address',
   JSON.stringify({ app: app.conn.app, args: app.conn.app_args, notes: [app.notes, noProgram.notes, shell.notes], missing }));
 const out = decodeRdp(encodeRdp(toRdp({ ...app.conn, name: 'Excel remoto' })));
 check('.rdp written: a RemoteApp with its program, name and arguments, read back the same',
   out.includes('\r\nremoteapplicationmode:i:1\r\nremoteapplicationprogram:s:||excel\r\nremoteapplicationname:s:Excel remoto\r\nremoteapplicationcmdline:s:/r informe.xlsx\r\n')
   && parseRdp(out, 'x').conn.app === '||excel' && !toRdp({ ...app.conn, app: '' }).includes('remoteapplication'), out.slice(-160));
 
-// written: UTF-16 LE with BOM and CRLF, read back as the same connection; IPv6 in brackets; the user with its domain; no
+// written: UTF-16 LE with BOM and CRLF, read back as the same connection (Automatic security, CredSSP on in the file, read
+// back as NLA only, as every imported connection); IPv6 in brackets; the user with its domain; no
 // password and no drives of the computer (the shared folder is MuDesk's own)
 const conns = [
   { name: 'PC', host: 'pc.local', port: 3389, user: 'ana', domain: 'CASA', bpp: 24, security: 'tls', resize: 'fit', clipboard: false, printer: true,
@@ -72,17 +73,29 @@ check('.rdp written: UTF-16 LE with BOM and CRLF, read back the same (drives nev
   written.every((b) => b[0] === 0xff && b[1] === 0xfe) && text0.includes('\r\nusername:s:CASA\\ana\r\n') && text0.includes('drivestoredirect:s:\r\n')
   && !/password/i.test(text0) && decodeRdp(written[1]).startsWith('full address:s:[fe80::2]:3390\r\n')
   && JSON.stringify(back.map((c) => [c.host, c.port, c.user, c.domain, c.bpp, c.security, c.resize, c.clipboard, c.printer, c.drive, c.audio, c.mic, c.perf]))
-    === JSON.stringify([['pc.local', 3389, 'ana', 'CASA', 24, 'tls', 'fit', false, true, false, false, true, { wallpaper: true, themes: false, smoothing: true, animations: true, drag: false }],
-      ['fe80::2', 3390, 'luis@ejemplo.com', '', 32, 'auto', 'dynamic', true, false, false, true, false, { wallpaper: false, themes: false, smoothing: false, animations: false, drag: false }]]),
+    === JSON.stringify([['pc.local', 3389, 'ana', 'CASA', 24, 'tls', 'fit', false, false, false, false, false, { wallpaper: true, themes: false, smoothing: true, animations: true, drag: false }],
+      ['fe80::2', 3390, 'luis@ejemplo.com', '', 32, 'nla', 'dynamic', false, false, false, true, false, { wallpaper: false, themes: false, smoothing: false, animations: false, drag: false }]])
+  && JSON.stringify(written.map((b, i) => parseRdp(decodeRdp(b), conns[i].name).notes)) === JSON.stringify([[['rdp_asked', ['mic', 'printer']]], [['rdp_asked', ['clipboard']]]]),
   JSON.stringify(back));
 
 // the camera: one box with the microphone, taken from either (a camera redirected: `camerastoredirect` with a device, "*"
 // for all), and written to both
-const camOnly = parseRdp('full address:s:pc\r\naudiocapturemode:i:0\r\ncamerastoredirect:s:*\r\n', 'c').conn;
-const camNone = parseRdp('full address:s:pc\r\naudiocapturemode:i:0\r\ncamerastoredirect:s:\r\n', 'c').conn;
-check('.rdp: the camera taken with the microphone\'s box (camerastoredirect), and written with it',
-  camOnly.mic === true && camNone.mic === false && text0.includes('\r\ncamerastoredirect:s:*\r\n') && text0.includes('\r\naudiocapturemode:i:1\r\n')
-  && decodeRdp(written[1]).includes('\r\ncamerastoredirect:s:\r\n'), JSON.stringify([camOnly.mic, camNone.mic]));
+const camOnly = parseRdp('full address:s:pc\r\naudiocapturemode:i:0\r\ncamerastoredirect:s:*\r\nredirectclipboard:i:0\r\nredirectprinters:i:0\r\n', 'c').notes;
+const camNone = parseRdp('full address:s:pc\r\naudiocapturemode:i:0\r\ncamerastoredirect:s:\r\nredirectclipboard:i:0\r\nredirectprinters:i:0\r\n', 'c').notes;
+check('.rdp: the camera asked with the microphone\'s box (camerastoredirect), and written with it',
+  JSON.stringify([camOnly, camNone]) === JSON.stringify([[['rdp_asked', ['mic']]], []]) && text0.includes('\r\ncamerastoredirect:s:*\r\n') && text0.includes('\r\naudiocapturemode:i:1\r\n')
+  && decodeRdp(written[1]).includes('\r\ncamerastoredirect:s:\r\n'), JSON.stringify([camOnly, camNone]));
+
+// a file as those sent in October 2024 (CERT-UA, CISA): an outside computer through its own gateway, every redirection asked
+// for. Imported, nothing of this computer is shared (as Windows since April 2026 with a file it cannot verify), and what it
+// asks for and its gateway are said; before, all of it turned on silently
+const lure = parseRdp(['full address:s:203.0.113.5', 'gatewayhostname:s:gw.example.net', 'gatewayusagemethod:i:1', 'redirectclipboard:i:1',
+  'redirectprinters:i:1', 'drivestoredirect:s:*', 'redirectdrives:i:1', 'audiocapturemode:i:1', 'camerastoredirect:s:*', 'redirectsmartcards:i:1',
+  'redirectwebauthn:i:1', 'username:s:'].join('\r\n'), 'AWS Secure Storage Connection Stability Test.rdp');
+check('.rdp: a lure file shares nothing of this computer when imported; what it asks for and its gateway said',
+  JSON.stringify([lure.conn.clipboard, lure.conn.printer, lure.conn.drive, lure.conn.mic, lure.conn.gw, lure.notes])
+    === JSON.stringify([false, false, false, false, 'gw.example.net', [['rdp_asked', ['clipboard', 'drive', 'mic', 'printer']], ['rdp_gateway', 'gw.example.net']]]),
+  JSON.stringify(lure));
 
 // a line break in a value (a name or user with one, from a CSV cell or a direct call) never makes a line of its own in the file
 const injected = toRdp({ host: 'pc', port: 3389, user: 'ana\r\nfull address:s:otro', name: 'N', app: 'C:\\a.exe', app_args: '-x\r\nalternate shell:s:cmd' });

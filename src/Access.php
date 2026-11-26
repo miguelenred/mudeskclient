@@ -129,11 +129,15 @@ final class Access
         return @inet_pton($host) !== false ? [$host] : self::resolve($host);
     }
 
+    /** Names looked up so far (the tests count them). */
+    public static int $lookups = 0;
+
     private static function resolve(string $host): array
     {
         if (!preg_match('~^[a-z0-9.-]+$~', $host)) {
             return [];
         }
+        self::$lookups++;
         $ips = gethostbynamel($host) ?: [];
         if ($ips === []) {
             foreach (@dns_get_record($host, DNS_AAAA) ?: [] as $r) {

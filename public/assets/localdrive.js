@@ -40,6 +40,15 @@ function statusOf(e) {
 }
 const fail = (status) => Object.assign(new Error('status'), { name: 'Status', status });
 
+/**
+ * A name the remote computer may not create in this computer's folder: one Windows' Explorer acts on when it only shows the
+ * folder (desktop.ini, autorun.inf, a shortcut .lnk, .url, .scf, .library-ms, .searchconnector-ms: an icon or target on
+ * another computer's share sends this computer's Windows sign-in to it), a device name, or one Windows trims (a trailing dot
+ * or space). Existing files are read and written as before.
+ */
+const risky = (name) => /^(desktop\.ini|autorun\.inf)$|\.(lnk|url|scf|library-ms|searchconnector-ms|website)$|[. ]$/i.test(name)
+  || /^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$|clock\$)(\..*)?$/i.test(name);
+
 /** A folder by its handle (File System Access: Chrome, Edge): read and write. Folders have no times there: when it was chosen. */
 class HandleFs {
   constructor(root) { Object.assign(this, { root, name: root.name, readonly: false, at: Date.now() }); }
@@ -67,18 +76,23 @@ class HandleFs {
     return out;
   }
   async create(parts, dir) {
+    if (!parts.length || risky(parts[parts.length - 1])) throw fail(ST.ACCESS_DENIED);
     const parent = await this.#dir(parts.slice(0, -1)), name = parts[parts.length - 1];
     return dir ? parent.getDirectoryHandle(name, { create: true }) : parent.getFileHandle(name, { create: true });
   }
   async read(st, off, len) { const f = await st.handle.getFile(); return new Uint8Array(await f.slice(off, off + len).arrayBuffer()); }
   /** Its writer (what it writes saved when closed; `keep` false: it starts empty, the old file not copied first). */
   writer(st, keep = true) { return st.handle.createWritable({ keepExistingData: keep }); }
-  async remove(parts) { await (await this.#dir(parts.slice(0, -1))).removeEntry(parts[parts.length - 1]); }
+  async remove(parts) {
+    if (!parts.length) throw fail(ST.ACCESS_DENIED);   // (the folder itself: before, removeEntry(undefined) took one named "undefined")
+    await (await this.#dir(parts.slice(0, -1))).removeEntry(parts[parts.length - 1]);
+  }
   /**
    * Moved or renamed: by move() where the browser has it, else (a file) copied and the old one removed; not then a change
    * of letter case only (the copy would be the same file, removed after).
    */
   async rename(from, to, st) {
+    if (!from.length || !to.length || risky(to[to.length - 1])) throw fail(ST.ACCESS_DENIED);
     const dest = await this.#dir(to.slice(0, -1)), name = to[to.length - 1];
     if (typeof st.handle.move === 'function') { await st.handle.move(dest, name); return; }
     if (st.dir || from.join('\\').toLowerCase() === to.join('\\').toLowerCase()) throw fail(ST.NOT_SUPPORTED);

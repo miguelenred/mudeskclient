@@ -62,15 +62,16 @@ eq('secondary order skipped', r.ok && r.out.length === 1 && r.out[0].op, 'fill')
 
 // 10) glyphs: Cache Glyph (revision 2, sent as order type 3 for glyph support level "encode", as xrdp does: cache 2,
 // index 5: 3x2 at offset 0,-8 in the 1-2 byte encodings, rows padded to 4 bytes), then GlyphIndex with
-// variable pitch (two glyphs 10 px apart), an opaque rectangle (foreground colour field) and text in the background field
+// variable pitch (two glyphs 10 px apart), an opaque rectangle (foreground colour field) and text in the background field;
+// both rectangles end before their right and bottom values (as Windows Server 2003 draws them: compared with its bitmaps)
 const g = new OrderParser();
 r = run({ count: 1, data: [0x03, ...i16(9 - 7), ...i16(2 | (1 << 8)), 3, 5, 0x00, 0x48, 3, 2, 0xa0, 0x40, 0, 0] }, 32, g);
 eq('cache glyph', r.out.map((o) => [o.op, o.key, o.w, o.h, [...o.bits]]), [['glyph', 517, 3, 2, [0xa0, 0x40]]]);
 const gi = (data, more = []) => [0x09, 0x1b, 0xff, 0x3f, 0x38, 2, 0x02, 0, 0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
   ...i16(100), ...i16(40), ...i16(140), ...i16(52), ...i16(98), ...i16(40), ...i16(150), ...i16(52), ...i16(100), ...i16(50), data.length, ...data, ...more];
 r = run({ count: 1, data: gi([5, 0, 5, 10]) }, 32, g);
-eq('GlyphIndex', r.out, [{ op: 'fill', x: 98, y: 40, w: 53, h: 13, color: orderColor(0x665544, 32), clip: null },
-  { op: 'text', color: orderColor(0x332211, 32), glyphs: [517, 100, 42, 517, 110, 42], x: 100, y: 40, w: 41, h: 13 }]);
+eq('GlyphIndex', r.out, [{ op: 'fill', x: 98, y: 40, w: 52, h: 12, color: orderColor(0x665544, 32), clip: null },
+  { op: 'text', color: orderColor(0x332211, 32), glyphs: [517, 100, 42, 517, 110, 42], x: 100, y: 40, w: 40, h: 12 }]);
 
 // 11) fragments: add the bytes "5 0 5 10" as fragment 1, then use it 30 px further (its own first delta is 0)
 r = run({ count: 1, data: gi([5, 0, 5, 10, 0xff, 1, 4, 0xfe, 1, 30]) }, 32, g);
@@ -80,7 +81,7 @@ eq('fragment add and use', r.out[1].glyphs, [517, 100, 42, 517, 110, 42, 517, 14
 r = run({ count: 1, data: [0x09, 0x18, 0xff, 0x7f, 2, 0, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, ...i16(10), ...i16(20), ...i16(30), ...i16(29),
   ...i16(0), ...i16(0x0f), ...i16(0), ...i16(-32768), ...i16(12), ...i16(28), 7, 7, 1, 0x44, 2, 1, 0xc0] }, 32, g);
 eq('FastGlyph', r.out.map((o) => o.op === 'glyph' ? [o.key, o.w, o.h, [...o.bits]] : o.op === 'fill' ? [o.x, o.y, o.w, o.h] : o.glyphs),
-  [[519, 2, 1, [0xc0]], [10, 20, 21, 10], [519, 13, 24]]);
+  [[519, 2, 1, [0xc0]], [10, 20, 20, 9], [519, 13, 24]]);
 
 // 12b) FastGlyph with fixed pitch (ulCharInc 8) draws its one glyph only: index 5 of cache 0 at 10,10, not also glyph 0 at 18,10
 const fg = new OrderParser();
@@ -90,15 +91,29 @@ run({ count: 1, data: fastGlyph(0, 0) }, 32, fg);                               
 r = run({ count: 1, data: fastGlyph(5, 8) }, 32, fg);
 eq('FastGlyph with fixed pitch: one glyph', r.out.find((o) => o.op === 'text')?.glyphs, [5, 10, 10]);
 
+// 12c) glyphs kept only within the caches offered (Client.php: 10 caches, their entries and cell sizes): a cache past 9, an
+// index past its entries or a bitmap larger than its cell left out (before, any cache of 256 and up to 2 KB: 65,536 glyphs
+// of checkerboard bits made millions of rectangles on the page)
+const fgx = (cache, idx, w, h) => {
+  const cb = ((w + 7) >> 3) * h;
+  return [0x09, 0x18, 0xff, 0x7f, cache, 0, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, ...i16(0), ...i16(0), ...i16(100), ...i16(100),
+    ...i16(0), ...i16(0), ...i16(0), ...i16(0), ...i16(10), ...i16(10), 5 + cb, idx, 0, 0, w, h, ...Array(cb).fill(0xaa)];
+};
+const keysOf = (d) => run({ count: 1, data: d }, 32, new OrderParser()).out.filter((o) => o.op === 'glyph').map((o) => o.key);
+eq('glyph caches: only within those offered', [keysOf(fgx(12, 1, 1, 1)), keysOf(fgx(0, 1, 16, 4)), keysOf(fgx(9, 70, 8, 8)), keysOf(fgx(9, 3, 8, 8))],
+  [[], [], [], [9 * 256 + 3]]);
+
 // 13) FastIndex with fixed pitch (ulCharInc 6) using glyphs 5 and 7; cache glyph (cache 2, index 9) first
 r = run({ count: 2, data: [0x03, ...i16(9 - 7), ...i16(2 | (1 << 8)), 3, 9, 0x41, 0x02, 1, 1, 0x80, 0, 0, 0,
   0x09, 0x13, 0xff, 0x7f, 2, 6, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, ...i16(0), ...i16(0), ...i16(99), ...i16(99),
   ...i16(1), ...i16(1), ...i16(2), ...i16(2), ...i16(50), ...i16(60), 3, 5, 7, 9] }, 32, g);
 eq('cache glyph + FastIndex', [r.out[0].key, r.out[0].w, r.out[0].h, r.out[2].glyphs], [521, 1, 1, [517, 50, 52, 519, 57, 56, 521, 61, 62]]);
 
-// 14) PatBlt PATCOPY with an 8x8 pattern brush (style 3): first row in the hatch field, the other 7 in reverse order
+// 14) PatBlt PATCOPY with an 8x8 pattern brush (style 3), sent from the bottom up as a Windows bitmap: the hatch field the
+// bottom row, the extra field's 7 bytes upwards (taken as the top row, Server 2003's 50 % grey came out inverted against its
+// own pixels)
 r = run({ count: 1, data: [0x09, 0x01, 0xff, 0x0f, ...i16(5), ...i16(6), ...i16(7), ...i16(8), 0xf0, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 2, 3, 3, 0xaa, 1, 2, 3, 4, 5, 6, 7] });
-eq('PatBlt pattern brush', r.out, [{ op: 'pattern', x: 5, y: 6, w: 7, h: 8, rows: [0xaa, 7, 6, 5, 4, 3, 2, 1], ox: 2, oy: 3,
+eq('PatBlt pattern brush', r.out, [{ op: 'pattern', x: 5, y: 6, w: 7, h: 8, rows: [7, 6, 5, 4, 3, 2, 1, 0xaa], ox: 2, oy: 3,
   set: orderColor(0x111111, 32), clear: orderColor(0x222222, 32), rop: 0xf0, clip: null }]);
 
 // 14b) PatBlt PATINVERT XORs the brush, that pattern and then a solid one (style 0: the foreground field), instead of
@@ -106,7 +121,7 @@ eq('PatBlt pattern brush', r.out, [{ op: 'pattern', x: 5, y: 6, w: 7, h: 8, rows
 r = run({ count: 3, data: [0x09, 0x01, 0xff, 0x0f, ...i16(5), ...i16(6), ...i16(7), ...i16(8), 0x5a, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 2, 3, 3, 0xaa, 1, 2, 3, 4, 5, 6, 7,
   0x01, 0x00, 0x02, 0,                                                                 // field 10: brush style 0
   0x09, 0x0d, 0xff, 0x01, ...i16(1), ...i16(100), ...i16(50), ...i16(2), ...i16(2), 0x88, ...i16(0), ...i16(0), ...i16(5)] });
-const patinvert = { op: 'pattern', x: 5, y: 6, w: 7, h: 8, rows: [0xaa, 7, 6, 5, 4, 3, 2, 1], ox: 2, oy: 3, set: orderColor(0x111111, 32), clear: orderColor(0x222222, 32), rop: 0x5a, clip: null };
+const patinvert = { op: 'pattern', x: 5, y: 6, w: 7, h: 8, rows: [7, 6, 5, 4, 3, 2, 1, 0xaa], ox: 2, oy: 3, set: orderColor(0x111111, 32), clear: orderColor(0x222222, 32), rop: 0x5a, clip: null };
 eq('PatBlt PATINVERT with a pattern and a solid brush, MemBlt SRCAND', r.out, [patinvert, { ...patinvert, rows: [0, 0, 0, 0, 0, 0, 0, 0] },
   { op: 'mem', id: 1, idx: 5, x: 100, y: 50, w: 2, h: 2, sx: 0, sy: 0, rop: 0x88, clip: null }]);
 
@@ -119,6 +134,22 @@ eq('MemBlt ROPs', memRops.map(([rop]) => { const d = Uint32Array.of(D); rop3({ r
 const dst = new Uint32Array(8).fill(0xff102030);                                      // 8x1 at 3,5; brush origin 1,0: row 5, column 0 at x = 9
 rop3({ rop: 0x5a, rows: [0, 0, 0, 0, 0, 0x80, 0, 0], set: 0xff0000ff, clear: 0xff00ff00, ox: 1, oy: 0 }, dst, null, 3, 5, 8, 1);
 eq('PATINVERT pixel by pixel', [...dst].map((v) => v.toString(16)), [...Array(8)].map((_, i) => ((0xff102030 ^ (i === 6 ? 0xff : 0xff00)) | 0xff000000) >>> 0).map((v) => v.toString(16)));
+
+// 14d) Mem3Blt (offered now: Windows drew what needs it as bitmaps): its 16 fields, the brush as a PatBlt's; through any ROP3
+// with that brush, the cached bitmap and the screen (PSDPxax, MERGECOPY); truncated: the update ends
+r = run({ count: 1, data: [0x09, 0x0e, 0xff, 0xff, 0x00, ...i16(0x0101), ...i16(100), ...i16(50), ...i16(8), ...i16(1), 0xb8, ...i16(0), ...i16(0),
+  0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 2, 3, 3, 0xaa, 1, 2, 3, 4, 5, 6, 7, ...i16(5)] });
+eq('Mem3Blt', r.out, [{ op: 'mem', id: 1, idx: 5, x: 100, y: 50, w: 8, h: 1, sx: 0, sy: 0, rop: 0xb8, clip: null, rows: [7, 6, 5, 4, 3, 2, 1, 0xaa], ox: 2, oy: 3,
+  set: orderColor(0x111111, 32), clear: orderColor(0x222222, 32) }]);
+const m3src = Uint32Array.from([0, 1, 2, 3, 4, 5, 6, 7], (i) => 0xff000000 | (0x0f0f0f * (i + 1)));
+const m3brush = { rows: [0, 0, 0, 0, 0, 0x80, 0, 0], set: 0xff0000ff, clear: 0xff00ff00, ox: 1, oy: 0 };   // set at x = 9 (row 5, 8x1 at 3,5)
+const m3 = [[0xb8, (p, s, d) => ((p ^ d) & s) ^ p], [0xc0, (p, s) => p & s]].map(([rop, f]) => {
+  const d = new Uint32Array(8).fill(0xff102030);
+  rop3({ rop, ...m3brush }, d, m3src, 3, 5, 8, 1);
+  return [...d].every((v, i) => v === ((f(i === 6 ? 0xff0000ff : 0xff00ff00, m3src[i], 0xff102030) | 0xff000000) >>> 0));
+});
+eq('Mem3Blt ROPs with its brush, the bitmap and the screen', m3, [true, true]);
+eq('truncated Mem3Blt', (() => { try { return run({ count: 1, data: [0x09, 0x0e, 0xff, 0xff] }).ok; } catch (e) { return 'threw ' + e.message; } })(), false);
 
 // 15) corrupt data ends the update (parse returns false) instead of throwing: it closed the whole session
 const safe = (bytes, bpp) => { try { return run(bytes, bpp).ok; } catch (e) { return 'threw ' + e.message; } };
@@ -183,5 +214,36 @@ eq('colour 24 bpp (R,G,B bytes, as xrdp sends them)', orderColor(0x0000ff, 24).t
   const out8 = [];
   new OrderParser().parse(Uint8Array.of(1, 0, 0x09, 0x0a, 0x7f, 10, 0, 20, 0, 30, 0, 40, 0, 5, 0, 0), 8, (o) => out8.push(o), pal8, 1 << 20);
   eq('colour 8 bpp: the palette entry', out8.map((o) => o.color.toString(16)), ['ffff8000']);
+}
+
+// a Demand Active, also a reactivation (Windows Server 2003 going back to a disconnected session, a reconnection for a new
+// size): the orders' history starts anew, as the server's does. Kept, what the server leaves out as unchanged from the start
+// took an old value: the desktop's fill clipped from x 390 instead of 0 (strips of it left grey) and text sent with delta
+// coordinates drawn hundreds of pixels from its place (seen on Server 2003). Here a bound left out, and an order without a type
+const desk = (bf, bounds) => [0x0d, 0x0a, 0x7f, bf, ...bounds.flatMap(i16), ...i16(0), ...i16(0), ...i16(1024), ...i16(738), 0x39, 0x6d, 0xa5];
+const patBlt = [0x01, 0x0f, ...i16(1), ...i16(2), ...i16(3), ...i16(4)];   // no type change: PatBlt at the start
+{
+  const p = new OrderParser(), out = [];
+  p.parse(Uint8Array.of(1, 0, ...desk(0x0f, [390, 0, 1023, 22])), 32, (o) => out.push(o));
+  p.resetState();
+  p.parse(Uint8Array.of(2, 0, ...desk(0x0e, [23, 22, 348]), ...patBlt), 32, (o) => out.push(o));
+  eq('a Demand Active: the orders\' history anew (bounds, type, fields)', out.map((o) => [o.op, o.x, o.y, o.w, o.h, o.clip]),
+    [['fill', 0, 0, 1024, 738, { l: 390, t: 0, r: 1023, b: 22 }], ['fill', 0, 0, 1024, 738, { l: 0, t: 23, r: 22, b: 348 }], ['fill', 1, 2, 3, 4, null]]);
+}
+// ... and the stream worker starts it anew at each Demand Active it is told of (frame 2)
+{
+  const posted = [], fetch0 = globalThis.fetch;
+  globalThis.postMessage = (m) => posted.push(m);
+  globalThis.onmessage = null;
+  await import('../public/assets/stream-worker.js');
+  const frame = (type, d) => { const b = Buffer.alloc(5); b[0] = type; b.writeUInt32LE(d.length, 1); return new Uint8Array(Buffer.concat([b, Buffer.from(d)])); };
+  const active = [...i16(1024), ...i16(768), 32];
+  const reads = [frame(2, active), frame(1, [0, 1, 0, ...desk(0x0f, [390, 0, 1023, 22])]), frame(2, active), frame(1, [0, 1, 0, ...desk(0x0e, [23, 22, 348])])];
+  globalThis.fetch = async () => ({ ok: true, body: { getReader: () => ({ read: async () => (reads.length ? { value: reads.shift(), done: false } : { done: true }) }) } });
+  await globalThis.onmessage({ data: { url: 'https://gateway.test/rdp.php?a=stream', headers: {}, body: '' } });
+  globalThis.onmessage({ data: { cmd: 'stop' } });
+  globalThis.fetch = fetch0;
+  eq('stream worker: the orders\' history anew at a Demand Active (frame 2)', posted.filter((m) => m.t === 'op').map((m) => m.cmd.clip),
+    [{ l: 390, t: 0, r: 1023, b: 22 }, { l: 0, t: 23, r: 22, b: 348 }]);
 }
 process.exit(fail ? 1 : 0);

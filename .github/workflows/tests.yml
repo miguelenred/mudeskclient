@@ -23,8 +23,8 @@ jobs:
         php: ['8.1', '8.2', '8.3', '8.4', '8.5']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: shivammathur/setup-php@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
         with:
           php-version: ${{ matrix.php }}
           extensions: openssl
@@ -44,7 +44,7 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Image built and started; it answers over HTTPS with the setup screen, keeps the private folders out of reach, refuses a body over 8 MB and has no local files
         run: |
           docker build -t mudesk .
@@ -60,6 +60,38 @@ jobs:
           docker exec mudesk test ! -e /var/www/mudesk/tests
           docker exec mudesk sh -c 'test "$(stat -c %U /var/www/mudesk/data)" = www-data'
           docker logs mudesk 2>&1 | grep -q 'self-signed certificate made'
+      - name: Its health (health.php from inside) becomes healthy; Apache's processes at once from MUDESK_WORKERS, 256 when missing or out of range
+        run: |
+          for i in $(seq 1 60); do test "$(docker inspect -f '{{.State.Health.Status}}' mudesk)" = healthy && break; sleep 2; done
+          test "$(docker inspect -f '{{.State.Health.Status}}' mudesk)" = healthy
+          docker logs mudesk 2>&1 | grep -q 'up to 256 Apache processes at once'
+          docker run -d --name mudesk-w300 -e MUDESK_WORKERS=300 -p 8444:443 mudesk
+          docker run -d --name mudesk-w5 -e MUDESK_WORKERS=5 -p 8445:443 mudesk
+          for p in 8444 8445; do for i in $(seq 1 30); do curl -sk -o /dev/null https://localhost:$p/ && break; sleep 1; done; done
+          curl -sk https://localhost:8444/ | grep -q '<title>MuDeskClient</title>'
+          curl -sk https://localhost:8445/ | grep -q '<title>MuDeskClient</title>'
+          docker logs mudesk-w300 2>&1 | grep -q 'up to 300 Apache processes at once'
+          docker logs mudesk-w5 2>&1 | grep -q 'MUDESK_WORKERS must be from 10 to 20000; 256 taken'
+          docker rm -f mudesk-w300 mudesk-w5
+      - name: The WebSocket service answers through Apache (/ws), only to the site's own pages; config.php's websocket => false turns it off
+        run: |
+          # the opening request's answer: 101 when it is taken (curl then waits until --max-time), 403 another site, 503 none
+          ws() { curl -sk --http1.1 -o /dev/null -w '%{http_code}' --max-time 3 -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+            -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H "Origin: $2" "$1" || true; }
+          for i in $(seq 1 20); do test "$(ws https://localhost:8443/ws https://localhost:8443)" = 101 && break; sleep 1; done
+          test "$(ws https://localhost:8443/ws https://localhost:8443)" = 101
+          test "$(ws https://localhost:8443/ws https://evil.example)" = 403
+          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost:8443/api.php | grep -q '"ws":"ws"'
+          docker logs mudesk 2>&1 | grep -q 'MuDeskClient WebSocket: listening on 127.0.0.1:8091'
+          docker exec mudesk php -r 'exit(function_exists("pcntl_fork") && function_exists("posix_kill") ? 0 : 1);'   # (each session a copy of the service)
+          printf '%s\n' '<?php return ["websocket" => false];' > nows.php
+          docker run -d --name mudesk-nows -v "$PWD/nows.php:/var/www/mudesk/config.php:ro" -p 8446:443 mudesk
+          for i in $(seq 1 30); do curl -sk -o /dev/null https://localhost:8446/ && break; sleep 1; done
+          sleep 2
+          test "$(ws https://localhost:8446/ws https://localhost:8446)" = 503
+          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost:8446/api.php | grep -q '"ws":null'
+          docker logs mudesk-nows 2>&1 | grep -q 'MuDeskClient WebSocket: off'
+          docker rm -f mudesk-nows
       - name: The same with Docker Compose (compose.yaml, its image built from this code)
         run: |
           docker rm -f mudesk
@@ -72,10 +104,94 @@ jobs:
           docker compose exec -T mudesk test -s /var/www/mudesk/data/setup-code.php
           docker compose exec -T mudesk test ! -e /var/www/mudesk/compose.yaml
           docker volume ls --format '{{.Name}}' | grep -q 'mudesk-data$'
+          # healthy, its logs rotated, no privilege gained inside
+          for i in $(seq 1 60); do test "$(docker inspect -f '{{.State.Health.Status}}' mudesk)" = healthy && break; sleep 2; done
+          test "$(docker inspect -f '{{.State.Health.Status}}' mudesk)" = healthy
+          docker inspect -f '{{json .HostConfig.LogConfig}}' mudesk | grep -q '"max-size":"10m"'
+          docker inspect -f '{{json .HostConfig.SecurityOpt}}' mudesk | grep -q 'no-new-privileges:true'
           docker compose down
       - name: Container log
         if: always()
         run: docker logs mudesk || true
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - name: The chart lints and renders (as it comes; with an ingress, your certificate, a config.php, a load balancer and MUDESK_WORKERS)
+        run: |
+          helm lint deploy/helm/mudeskclient
+          helm template m deploy/helm/mudeskclient > plain.yaml
+          grep -q 'claimName: m-mudeskclient-tls' plain.yaml
+          if grep -q 'kind: Ingress' plain.yaml; then exit 1; fi
+          helm template m deploy/helm/mudeskclient --set ingress.enabled=true --set ingress.tlsSecret=web-cert --set tls.existingSecret=pod-cert \
+            --set-string config='<?php return ["public_url" => "https://mudesk.example.com"];' --set service.type=LoadBalancer \
+            --set service.externalTrafficPolicy=Local --set-string workers=300 > all.yaml
+          grep -q 'kind: Ingress' all.yaml
+          grep -q 'secretName: pod-cert' all.yaml
+          if grep -q 'claimName: m-mudeskclient-tls' all.yaml; then exit 1; fi
+          grep -q 'subPath: config.php' all.yaml
+          grep -q 'externalTrafficPolicy: Local' all.yaml
+          grep -A1 'name: MUDESK_WORKERS' all.yaml | grep -q '"300"'
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
+      - name: Installed in a cluster from the image of this code; the pod becomes ready (health.php) and answers with the setup screen
+        run: |
+          docker build -t mudesk:ci .
+          kind load docker-image mudesk:ci --name chart-testing
+          helm install m deploy/helm/mudeskclient --set image.repository=mudesk --set image.tag=ci --set image.pullPolicy=Never --wait --timeout 5m
+          kubectl port-forward svc/m-mudeskclient 8443:443 > /dev/null 2>&1 &
+          for i in $(seq 1 30); do curl -sk -o /dev/null https://localhost:8443/ && break; sleep 1; done
+          curl -sk https://localhost:8443/ | grep -q '<title>MuDeskClient</title>'
+          test "$(curl -sk https://localhost:8443/health.php)" = '{"status":"ok"}'
+          kubectl exec deploy/m-mudeskclient -- test -s /var/www/mudesk/data/setup-code.php
+      - name: Pod log
+        if: always()
+        run: kubectl logs deploy/m-mudeskclient --tail=100 || true
+
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: deploy/lxc/install.sh on Ubuntu (systemd) answers over HTTPS with the setup screen, serves only public/, sends plain HTTP to HTTPS; run again, it keeps the data
+        run: |
+          sudo bash deploy/lxc/install.sh --from "$PWD" --hostname ci.test --workers 300
+          curl -sk https://localhost/ | grep -q '<title>MuDeskClient</title>'
+          curl -sk -H 'Content-Type: application/json' -d '{"action":"state"}' https://localhost/api.php | grep -q '"setup":true'
+          test "$(curl -sk -o /dev/null -w '%{http_code}' https://localhost/src/bootstrap.php)" = 404
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost/)" = 301
+          test "$(curl -sk https://localhost/health.php)" = '{"status":"ok"}'
+          test "$(sudo stat -c %U /var/www/mudesk/data)" = www-data
+          sudo grep -q 'MaxRequestWorkers 300' /etc/apache2/sites-available/mudesk.conf
+          # the WebSocket service: the systemd service mudesk-ws, behind Apache's /ws (101 taken, 403 another site)
+          ws() { curl -sk --http1.1 -o /dev/null -w '%{http_code}' --max-time 3 -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+            -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H "Origin: $1" https://localhost/ws || true; }
+          systemctl is-active --quiet mudesk-ws
+          php -r 'exit(function_exists("pcntl_fork") && function_exists("posix_kill") ? 0 : 1);'   # (each session a copy of the service)
+          test "$(systemctl show -p User --value mudesk-ws)" = www-data
+          for i in $(seq 1 20); do test "$(ws https://localhost)" = 101 && break; sleep 1; done
+          test "$(ws https://localhost)" = 101
+          test "$(ws https://evil.example)" = 403
+          code="$(sudo sed -n 2p /var/www/mudesk/data/setup-code.php)"
+          test -n "$code"
+          sudo bash deploy/lxc/install.sh --from "$PWD" --hostname ci.test
+          test "$(sudo sed -n 2p /var/www/mudesk/data/setup-code.php)" = "$code"
+          curl -sk https://localhost/ | grep -q '<title>MuDeskClient</title>'
+          for i in $(seq 1 20); do test "$(ws https://localhost)" = 101 && break; sleep 1; done
+          test "$(ws https://localhost)" = 101
+      - name: The same in Debian 12 without systemd
+        run: |
+          docker run --rm -v "$PWD:/src:ro" debian:12 bash -c 'set -e; bash /src/deploy/lxc/install.sh --from /src --hostname ci.test
+            curl -sk https://127.0.0.1/ | grep -q "<title>MuDeskClient</title>"
+            test -s /var/www/mudesk/data/setup-code.php
+            test "$(curl -sk https://127.0.0.1/health.php)" = "{\"status\":\"ok\"}"
+            ws() { curl -sk --http1.1 -o /dev/null -w "%{http_code}" --max-time 3 -H "Connection: Upgrade" -H "Upgrade: websocket" \
+              -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" -H "Origin: https://127.0.0.1" https://127.0.0.1/ws || true; }
+            for i in $(seq 1 20); do test "$(ws)" = 101 && break; sleep 1; done
+            test "$(ws)" = 101
+            bash /src/deploy/lxc/install.sh --from /src --hostname ci.test
+            for i in $(seq 1 20); do test "$(ws)" = 101 && break; sleep 1; done
+            test "$(ws)" = 101'
 
   js:
     strategy:
@@ -85,8 +201,8 @@ jobs:
         node: ['lts/-1', 'lts/*']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ matrix.node }}
       - name: Unit tests (bitmaps, compression, drawing orders, graphics pipeline, input, clipboard, session, interface, microphone, .rdp files)

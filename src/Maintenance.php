@@ -7,8 +7,9 @@ namespace MuDesk;
 /**
  * Housekeeping without a scheduled task (a shared hosting has none): a request runs it at most once an hour. It removes what
  * the normal paths leave only when a process is killed half way (the hosting's time limit, a restart, a power cut) or when
- * a hosting turns PHP's own session cleanup off: the temporary files of unfinished writes, the files of sessions no longer
- * running (their uploads, print jobs and socket, also one in the system's temporary folder), web sessions past their life,
+ * a hosting turns PHP's own session cleanup off: the temporary files of unfinished writes, the part of a file an upload was
+ * replacing left half way, the files of sessions no longer running (their uploads, print jobs and socket, also one in the
+ * system's temporary folder), web sessions past their life,
  * the lock files of deleted users, and what the retention settings let go (traces, recordings, audit days).
  */
 final class Maintenance
@@ -140,6 +141,41 @@ final class Maintenance
                     $gone[] = $f;
                 }
             }
+        }
+        // the part of a file being replaced by an upload, left half way a day ago (the browser closed, the network gone): removed,
+        // and the file it was to replace counts in the quota again (as files.php does with one it drops). Found through the
+        // notes files.php keeps (Files::notePart): the users' folders are not walked. Not while that user uploads (its lock)
+        foreach (glob(Config::dir('tmp/upload-*.parts')) ?: [] as $f) {
+            $uid = substr(basename($f), 7, -6);
+            if (!isset($users[$uid])) {
+                @unlink($f);
+                continue;
+            }
+            $l = @fopen(Config::dir("tmp/upload-$uid.lock"), 'c');
+            if ($l === false || !flock($l, LOCK_EX | LOCK_NB)) {
+                $l && fclose($l);
+                continue;
+            }
+            $keep = [];
+            foreach (array_filter(explode("\n", (string)@file_get_contents($f)), 'strlen') as $rel) {
+                $path = Files::path($uid, $rel);
+                $part = $path === null ? null : Files::partOf($path);
+                if ($part === null || !is_file($part)) {
+                    continue;                    // put in its place, or dropped: nothing left
+                }
+                if (self::older($part, $now - 86400)) {
+                    Files::delete($uid, $part);
+                    clearstatcache();
+                    is_file($path) && Files::charge($uid, (int)filesize($path));
+                    $out['tmp']++;
+                }
+                if (is_file($part)) {
+                    $keep[] = $rel;              // being written, or not removed: looked at again
+                }
+            }
+            $keep === [] ? @unlink($f) : file_put_contents($f, implode("\n", $keep) . "\n");
+            flock($l, LOCK_UN);
+            fclose($l);
         }
         foreach ($gone as $f) {
             $h = @fopen($f, 'r');

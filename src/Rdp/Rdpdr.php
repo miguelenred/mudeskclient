@@ -23,6 +23,7 @@ final class Rdpdr implements Channel
     private const NO_SUCH_DEVICE = 0xC000000E;
     private const NO_SUCH_FILE = 0xC000000F;
     private const ACCESS_DENIED = 0xC0000022;
+    private const OBJECT_NAME_INVALID = 0xC0000033;
     private const COLLISION = 0xC0000035;
     private const PATH_NOT_FOUND = 0xC000003A;
     private const DISK_FULL = 0xC000007F;
@@ -41,6 +42,8 @@ final class Rdpdr implements Channel
     private const BATCH = 8 * 1048576;
 
     private string $root;
+    /** @var array{0: float, 1: int}|null when the folder's bytes were counted, and how many (volumeInfo()) */
+    private ?array $usage = null;
     private array $handles = [];
     private int $nextId = 1;
     private int $created = 0;                     // files and folders created by this session
@@ -48,6 +51,7 @@ final class Rdpdr implements Channel
     private const MAX_HANDLES = 1024, MAX_STREAMS = 64, MAX_CREATED = 20000, MAX_AUDIT = 2000;
     private const TOO_MANY_FILES = 0xC000011F;    // STATUS_TOO_MANY_OPENED_FILES
     private bool $announced = false;
+    private int $minor = 0x000C;             // the protocol's minor version in use: ours (1.12), or the server's when older
     private int $quota;                  // bytes this session took in advance and may still write (PHP_INT_MAX: no quota)
     private int $device = self::DRIVE;
     private array $jobs = [];
@@ -75,6 +79,11 @@ final class Rdpdr implements Channel
     private const LIST_BYTES_MAX = 32 * 1048576;
     /** A path kept for the audit (bytes of UTF-16): it cuts them to 512 characters; a server's 64 KB paths held hundreds of MB */
     private const LOCAL_PATH_MAX = 2048;
+    /**
+     * A server's path or pattern (bytes of UTF-16): at most 32,767 characters, Windows' longest path; one longer, or of an odd
+     * length, is refused before it is read (a 256 KB path took 27 s of CPU to check)
+     */
+    private const PATH_MAX = 65534;
     /** Each request to the browser numbered (in this process: also across the connections made again); its answer must say it */
     private static int $localNo = 0;
 
@@ -127,15 +136,20 @@ final class Rdpdr implements Channel
             case 0x496E: // server announce
                 $this->drive   = $this->drive && !in_array('drive', $this->c->denied, true);       // (forbidden by the
                 $this->printer = $this->printer && !in_array('printer', $this->c->denied, true);   // gateway's policy)
-                $r->skip(4);
+                // answered in the server's version when it is older than ours (1.10: Windows XP, Server 2003), with an id
+                // the client makes up there: such a server gives none of its own (0xFFFFFFFF) and confirms only one the
+                // client made. Before, 1.12 and their 0xFFFFFFFF: never confirmed, no device announced, no shared drive
+                $r->skip(2);
+                $this->minor = min(0x000C, $r->u16());
                 $clientId = $r->u32();
-                $this->send(0x4343, pack('vvV', 1, 0x000C, $clientId));
+                $clientId = $this->minor < 0x000C ? random_int(1, 0x7FFF) : $clientId;
+                $this->send(0x4343, pack('vvV', 1, $this->minor, $clientId));
                 $name = Text::toUtf16(self::CLIENT_NAME) . "\0\0";
                 $this->send(0x434E, pack('VVV', 1, 0, strlen($name)) . $name);
                 break;
             case 0x5350: // server capabilities
                 $this->send(0x4350, pack('vv', $this->printer ? 3 : 2, 0)
-                    . pack('vvVVVvvVVVVVV', 1, 44, 2, 0, 0, 1, 0x000C, 0xFFFF, 0, 0x7, 0, 0, 0)
+                    . pack('vvVVVvvVVVVVV', 1, 44, 2, 0, 0, 1, $this->minor, 0xFFFF, 0, 0x7, 0, 0, 0)
                     . ($this->printer ? pack('vvV', 2, 8, 1) : '')        // printer capability, version 1
                     . pack('vvV', 4, 8, 2));
                 break;
@@ -535,9 +549,14 @@ final class Rdpdr implements Channel
         $r->skip(4);
         $disposition = $r->u32();
         $options     = $r->u32();
-        $path        = Text::fromUtf16($r->bytes($r->u32()));
-        $p           = $this->local($path);
+        $len         = $r->u32();
         $fail        = pack('VC', 0, 0);
+        if ($len > self::PATH_MAX || $len % 2) {
+            $this->reply($cid, self::OBJECT_NAME_INVALID, $fail);
+            return;
+        }
+        $path        = Text::fromUtf16($r->bytes($len));
+        $p           = $this->local($path);
         if ($p === null) {
             $this->reply($cid, self::ACCESS_DENIED, $fail);
             return;
@@ -590,7 +609,7 @@ final class Rdpdr implements Channel
             $info = 3;
         }
         $id                 = $this->nextId++;
-        $this->handles[$id] = ['path' => $p, 'fh' => null, 'write' => (bool)($access & 0x40000006), 'delete' => (bool)($options & 0x1000), 'list' => null,
+        $this->handles[$id] = ['path' => $p, 'fh' => null, 'write' => (bool)($access & 0x40000006), 'delete' => (bool)($options & 0x1000) && !$this->isRoot($p), 'list' => null,
                                'new' => !$exists && !$wantDir, 'truncated' => $info === 3, 'read' => 0, 'written' => 0];
         $this->reply($cid, self::OK, pack('VC', $id, $info));
     }
@@ -752,7 +771,9 @@ final class Rdpdr implements Channel
                 break;
             case 13: // disposition (delete)
                 $del = $len === 0 || $r->u8() !== 0;
-                if ($del && is_dir($h['path']) && count(@scandir($h['path']) ?: []) > 2) {
+                if ($del && $this->isRoot($h['path'])) {
+                    $status = self::ACCESS_DENIED;
+                } elseif ($del && is_dir($h['path']) && count(@scandir($h['path']) ?: []) > 2) {
                     $status = self::NOT_EMPTY;
                 } else {
                     $this->handles[$id]['delete'] = $del;
@@ -761,11 +782,16 @@ final class Rdpdr implements Channel
             case 10: // rename
                 $replace = $r->u8() !== 0;
                 $r->skip(1);
-                $target = $this->local(Text::fromUtf16($r->bytes($r->u32())));
+                $nameLen = $r->u32();
+                if ($nameLen > self::PATH_MAX || $nameLen % 2) {
+                    $status = self::OBJECT_NAME_INVALID;
+                    break;
+                }
+                $target = $this->local(Text::fromUtf16($r->bytes($nameLen)));
                 // the target may be the file itself under another name: another case (accents too: strcasecmp knows ASCII
                 // only) or its 8.3 short name; giving its size back made the quota endless
                 $same = $target !== null && file_exists($target) && realpath($target) === realpath($h['path']);
-                if ($target === null) {
+                if ($target === null || $this->isRoot($h['path'])) {
                     $status = self::ACCESS_DENIED;
                 } elseif (file_exists($target) && !$same && !$replace) {
                     $status = self::COLLISION;
@@ -789,12 +815,27 @@ final class Rdpdr implements Channel
         $this->reply($cid, $status, pack('V', $len));
     }
 
+    /**
+     * Whether $path is the shared folder itself: never deleted nor renamed (the server asked for it with an empty path, or
+     * "\", and delete-on-close; the folder went for the rest of the session).
+     */
+    private function isRoot(string $path): bool
+    {
+        $real = realpath($path);
+        return $real !== false && $real === realpath($this->root);
+    }
+
     private function volumeInfo(Reader $r, int $cid): void
     {
         $class = $r->u32();
         $limit = $this->quota === PHP_INT_MAX ? 0 : Settings::get('files_quota_mb') * 1048576;
         $free  = max(0, (int)min($limit === 0 ? (int)@disk_free_space($this->root) : $this->quota + Files::quotaLeft($this->uid), 1 << 50));
-        $total = $limit === 0 ? $free + Files::usage($this->uid) : max($limit, $free);
+        // the folder's bytes counted again at most every 30 s (each count walks it: 7-17 s with 20,000 files, and the server
+        // asks for the volume's size as often as it likes)
+        if ($limit === 0 && ($this->usage === null || microtime(true) - $this->usage[0] > 30)) {
+            $this->usage = [microtime(true), Files::usage($this->uid)];
+        }
+        $total = $limit === 0 ? $free + $this->usage[1] : max($limit, $free);
         $label = Text::toUtf16($this->driveName);       // the volume label (the drive's properties)
         $fs    = Text::toUtf16('NTFS');
         $buf   = match ($class) {
@@ -814,6 +855,10 @@ final class Rdpdr implements Channel
         $initial = $r->u8() !== 0;
         $plen    = $r->u32();
         $r->skip(23);
+        if ($plen > self::PATH_MAX || $plen % 2) {
+            $this->reply($cid, self::OBJECT_NAME_INVALID, pack('VC', 0, 0));
+            return;
+        }
         $pattern = Text::fromUtf16($r->bytes($plen));
         if (!isset($this->handles[$id])) {
             $this->reply($cid, self::UNSUCCESSFUL, pack('VC', 0, 0));

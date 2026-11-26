@@ -13,6 +13,7 @@ declare(strict_types=1);
 // encrypted with a salted MAC, without SEC_ENCRYPT). none: encryption method and level 0 (noblock: no security data at
 // all): nothing encrypted. plain, plainfast: the Demand Active, or the fast-path update, in the clear at a level that
 // encrypts what the server sends. nocert: TLS refused as SSL_CERT_NOT_ON_SERVER (no certificate), then as xp. licnocert: a License Request without the server's certificate (its blob empty).
+// joinother: as xp, each channel join confirmed for another channel than the one asked for.
 // twice: as xp, then up to two more whole connections (the session's connection made again: a guest came, a recording starts).
 // twicemic: as twice, the client's static channels given their ids and, on its dynamic channel, the microphone opened as
 // Windows does when a program records (MS-RDPEAI: 44.1 kHz mono, 441 frames a packet); then what the client sends is read
@@ -133,8 +134,11 @@ for ($conn = 0; $conn < 3 && ($c = @stream_socket_accept($srv, 30)); $conn++) { 
         fwrite($c, $tpkt("\x02\xf0\x80\x2e\x00\x00\x06"));  // its confirm: user 1007
         for ($i = 0; $i < 2 + count($ids); $i++) {           // the user's, the I/O channel's and the static channels' joins
             $j  = $pdu($c);
+            if (strlen($j) < 12) {                           // (the client's disconnection: a confirm refused)
+                throw new RuntimeException('not a join: ' . bin2hex($j));
+            }
             $ch = unpack('n', $j, 10)[1];
-            fwrite($c, $tpkt("\x02\xf0\x80\x3e\x00\x00\x06" . pack('nn', $ch, $ch)));
+            fwrite($c, $tpkt("\x02\xf0\x80\x3e\x00\x00\x06" . pack('nn', $ch, $mode === 'joinother' ? $ch + 1 : $ch)));
         }
         // Security Exchange PDU: the client random, decrypted with the private key
         [, $x] = $sdrq($pdu($c));

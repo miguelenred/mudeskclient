@@ -26,7 +26,11 @@ export class Screen {
   /** One frame of the stream: [type, payload]. */
   feed(type, data) {
     if (type === 10 || type === 11) { data = type === 10 ? this.bulk.update(data) : this.bulk.slow(data); type = data ? 1 : 0; }   // bulk compression
-    if (type === 2) { this.W = data[0] | data[1] << 8; this.H = data[2] | data[3] << 8; this.bpp = data[4]; if (!this.fb || this.fb.length !== this.W * this.H) this.fb = new Uint32Array(this.W * this.H); }
+    if (type === 2) {                              // a Demand Active: the orders' history starts anew (as stream-worker.js)
+      this.W = data[0] | data[1] << 8; this.H = data[2] | data[3] << 8; this.bpp = data[4];
+      if (!this.fb || this.fb.length !== this.W * this.H) this.fb = new Uint32Array(this.W * this.H);
+      this.parser.resetState();
+    }
     if (type === 9) this.gfx.onData(data.slice());
     if (type !== 1) return;
     const code = data[0], body = data.subarray(1), { W, H } = this, max = ((W + 63) & ~63) * ((H + 63) & ~63);   // as stream-worker.js
@@ -51,6 +55,20 @@ export class Screen {
     const { W, H, fb } = this;
     this.ops++;
     if (o.op === 'cache') { this.bcache.set(o.id * 65536 + o.idx, o); return; }
+    if (o.op === 'glyph') { (this.glyphBits ||= new Map()).set(o.key, o); return; }   // (as session.js's glyph cache)
+    if (o.op === 'text') {                               // each glyph's set bits in the colour, within the text's box (drawText)
+      const r = Math.min(W, o.x + o.w), b = Math.min(H, o.y + o.h);
+      for (let i = 0; i < o.glyphs.length; i += 3) {
+        const g = this.glyphBits?.get(o.glyphs[i]), gx = o.glyphs[i + 1], gy = o.glyphs[i + 2];
+        if (!g) continue;
+        const stride = (g.w + 7) >> 3;
+        for (let y = 0; y < g.h; y++) for (let x = 0; x < g.w; x++) {
+          const px = gx + x, py = gy + y;
+          if (px >= Math.max(0, o.x) && px < r && py >= Math.max(0, o.y) && py < b && g.bits[y * stride + (x >> 3)] & (0x80 >> (x & 7))) fb[py * W + px] = o.color;
+        }
+      }
+      return;
+    }
     let x0 = Math.max(0, o.x), y0 = Math.max(0, o.y), x1 = Math.min(W, o.x + o.w), y1 = Math.min(H, o.y + o.h);
     if (o.clip) { x0 = Math.max(x0, o.clip.l); y0 = Math.max(y0, o.clip.t); x1 = Math.min(x1, o.clip.r + 1); y1 = Math.min(y1, o.clip.b + 1); }
     if (x1 <= x0 || y1 <= y0) return;

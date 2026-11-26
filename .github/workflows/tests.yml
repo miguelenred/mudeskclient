@@ -23,7 +23,7 @@ jobs:
         php: ['8.1', '8.2', '8.3', '8.4', '8.5']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
         with:
           php-version: ${{ matrix.php }}
@@ -44,7 +44,7 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Image built and started; it answers over HTTPS with the setup screen, keeps the private folders out of reach, refuses a body over 8 MB and has no local files
         run: |
           docker build -t mudesk .
@@ -119,7 +119,7 @@ jobs:
   helm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
       - name: The chart lints and renders (as it comes; with an ingress, your certificate, a config.php, a load balancer and MUDESK_WORKERS)
         run: |
@@ -155,7 +155,7 @@ jobs:
   install:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: deploy/lxc/install.sh on Ubuntu (systemd) answers over HTTPS with the setup screen, serves only public/, sends plain HTTP to HTTPS; run again, it keeps the data
         run: |
           sudo bash deploy/lxc/install.sh --from "$PWD" --hostname ci.test --workers 300
@@ -204,7 +204,7 @@ jobs:
         node: ['lts/-1', 'lts/*']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ matrix.node }}

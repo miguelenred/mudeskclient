@@ -71,7 +71,7 @@ Solo `public/` se puede servir. Compruébalo tras desplegar: `data/web-check.txt
   ```
 
   Sin el prefijo `/mudesk` si el proyecto está en la raíz del sitio.
-- **IIS**: el `web.config` de la raíz oculta `data`, `src`, `tests`, `tools`, `docs`, `config.php`, `config.sample.php`, `LICENSE`, `NOTICE` y los ficheros `.md`/`.json`/`.lock`/`.log` con el *filtrado de solicitudes*, y cada carpeta privada tiene un `web.config` que rechaza cualquier fichero (la aplicación lo vuelve a escribir en `data/` si falta). Solo usa funciones básicas de IIS, sin el módulo URL Rewrite. Abre la aplicación en `.../public/` o apunta el sitio a `public/`. Aún no probado en un IIS real.
+- **IIS**: el `web.config` de la raíz oculta `data`, `src`, `tests`, `tools`, `docs`, `config.php`, `config.sample.php`, `LICENSE`, `NOTICE` y los ficheros `.md`/`.json`/`.lock`/`.log` con el *filtrado de solicitudes*, y cada carpeta privada tiene un `web.config` que rechaza cualquier fichero (la aplicación lo vuelve a escribir en `data/` si falta). Solo usa funciones básicas de IIS, sin el módulo URL Rewrite. Abre la aplicación en `.../public/` o apunta el sitio a `public/`. Probado en el IIS de Windows Server 2022 (su manejador de PHP no debe usar búfer: ver *Servidor web* más abajo).
 
 ### Permisos de escritura
 

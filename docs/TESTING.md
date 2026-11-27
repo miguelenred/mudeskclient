@@ -106,10 +106,10 @@ Server, gateway (PHP 8.3 for Windows; the session's input through a local TCP po
 
 | Area | Result |
 |---|---|
-| Standard RDP Security | xrdp at its four encryption levels and the FreeRDP server: connected, licensed, the screen decrypted and the input sent encrypted, past 4096 packets each way (the keys renewed). Not yet against Windows XP or Server 2003 themselves |
-| TLS 1.0, CredSSP 3 | against test servers that speak them as Windows 7 and Server 2008 R2 without updates (TLS 1.0 with AES128-SHA; CredSSP version 3: refused, with NTLM and with Kerberos, and with `credssp_unpatched` the public key itself bound); not yet against those Windows |
-| Kerberos | the MIT test realm: NLA through the CredSSP acceptor with AES keys and with RC4 keys only (RC4 allowed in the settings; off, as by default, the KDC refuses the request and NTLM is sent instead), the RD Gateway through the open-source gateway; with `tests/fixtures/kdc_server.php` the errors Active Directory gives. Not yet against a real domain controller |
-| RD Gateway, RPC over HTTP (Windows Server 2008, 2008 R2) | against `tests/fixtures/rpc_gateway.php`, written from MS-TSGU, MS-RPCH and MS-RPCE, which an independent client also went through; both channels made again with 300 KB each way. Not yet against a real Windows Server gateway |
+| Standard RDP Security | xrdp at its four encryption levels and the FreeRDP server: connected, licensed, the screen decrypted and the input sent encrypted, past 4096 packets each way (the keys renewed). Against Windows Server 2003 itself since: below |
+| TLS 1.0, CredSSP 3 | against test servers that speak them as Windows 7 and Server 2008 R2 without updates (TLS 1.0 with AES128-SHA; CredSSP version 3: refused, with NTLM and with Kerberos, and with `credssp_unpatched` the public key itself bound); against Windows Server 2008 R2 itself since: below |
+| Kerberos | the MIT test realm: NLA through the CredSSP acceptor with AES keys and with RC4 keys only (RC4 allowed in the settings; off, as by default, the KDC refuses the request and NTLM is sent instead), the RD Gateway through the open-source gateway; with `tests/fixtures/kdc_server.php` the errors Active Directory gives. Against a real domain controller since: Windows Server 2022's, below |
+| RD Gateway, RPC over HTTP (Windows Server 2008, 2008 R2) | against `tests/fixtures/rpc_gateway.php`, written from MS-TSGU, MS-RPCH and MS-RPCE, which an independent client also went through; both channels made again with 300 KB each way. Against a real one since: Windows Server 2022's, with this transport forced, below |
 
 ## Windows Server 2022 Standard (after 1.2.0)
 
@@ -229,7 +229,7 @@ A session of the test computer (Windows 11, its pictures with H.264) through six
 | Traffic with H.264 | same animated screen: 21 KB/s with H.264, 4.2 MB/s with 32-bit bitmaps (FreeRDP server) |
 | Sign-in security | all checks pass on PHP 8.1–8.5; answers 1.00 s for unknown user, wrong password and success |
 | Passkeys | Chrome virtual authenticator (CTAP 2.1, with and without PRF): every check passes |
-| Private folders | Apache with `.htaccess`: `data/`, `src/`, `tests/`, `tools/`, `docs/`, `config.php`, `README` → 403 and the app works; with `AllowOverride None` the data folder is readable and the red warning appeared (1.1; since 1.2 the application stops instead, tested in the suite with PHP's own servers). Nginx rules of HOSTING: all → 403. IIS `web.config`: not tested |
+| Private folders | Apache with `.htaccess`: `data/`, `src/`, `tests/`, `tools/`, `docs/`, `config.php`, `README` → 403 and the app works; with `AllowOverride None` the data folder is readable and the red warning appeared (1.1; since 1.2 the application stops instead, tested in the suite with PHP's own servers). Nginx rules of HOSTING: all → 403. IIS `web.config`: on Windows Server 2022, below (404) |
 | Compression and bitmap cache (xrdp, 20 s of scrolling text and pictures, 16-bit) | bitmaps 10.9 MB; compressed 3.2 MB; orders + cache 3.9 MB; both 1.6 MB. Gateway CPU 0.07 / 0.50 / 0.04 / 0.30 s. Pixel-identical in Chrome and Firefox at 16 and 32 bits; keyboard, clipboard, files and resize unchanged |
 | User names | `DOMAIN\user`, `HOST\user`, `.\user` (NTLM message identical to typing the server name), `user@domain` (empty domain) |
 | Compression types | NCRUSH and XCRUSH: vectors identical in PHP and JS; Chrome against FreeRDP pixel-identical with each type and no errors with a changing screen (XCRUSH history wrapped many times in 140 MB); xrdp answers an RDP 6.1 offer with MPPC. Same 11.1 MB of xrdp updates compressed by FreeRDP: MPPC 3.05 MB / 0.53 s gateway CPU, NCRUSH 4.85 MB / 0.93 s, XCRUSH 2.08 MB / 0.32 s; MPPC path cost unchanged (0.50–0.52 s) |

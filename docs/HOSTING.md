@@ -71,7 +71,7 @@ Only `public/` may be served. Check after deploying: `data/web-check.txt`, `conf
   ```
 
   Without the `/mudesk` prefix when the project is at the root of the site.
-- **IIS**: the root `web.config` hides `data`, `src`, `tests`, `tools`, `docs`, `config.php`, `config.sample.php`, `LICENSE`, `NOTICE` and `.md`/`.json`/`.lock`/`.log` files with *request filtering*, and each private folder has a `web.config` that refuses every file (the application writes it again in `data/` if it is missing). Only core IIS features are used, no URL Rewrite module. Open the application at `.../public/` or point the site to `public/`. Not tested on a real IIS yet.
+- **IIS**: the root `web.config` hides `data`, `src`, `tests`, `tools`, `docs`, `config.php`, `config.sample.php`, `LICENSE`, `NOTICE` and `.md`/`.json`/`.lock`/`.log` files with *request filtering*, and each private folder has a `web.config` that refuses every file (the application writes it again in `data/` if it is missing). Only core IIS features are used, no URL Rewrite module. Open the application at `.../public/` or point the site to `public/`. Tested on Windows Server 2022's IIS (its PHP handler must not buffer: see *Web server notes* below).
 
 ### Write permissions
 

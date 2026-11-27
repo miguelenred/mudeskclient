@@ -189,7 +189,7 @@ La revisión de velocidad de la 1.1 hizo la descompresión de la pasarela de 1,2
 - `tests/gfx_render.mjs`, `tests/audio_check.mjs`: decodifican los volcados de `rdp_probe.php` (`DUMP=fichero`, `AUDIO=1`).
 - `tests/e2e.mjs`, `tests/e2e_clip.mjs`, `tests/e2e_gfx.mjs` (H.264: compara el canvas con una captura del remoto), `tests/e2e_passkey.mjs`, `tests/e2e_lang.mjs`, `tests/e2e_glyphs.mjs`: pruebas en Chrome (Node.js + Playwright); `tests/e2e_firefox.py`: pruebas en Firefox (Selenium). Solo desarrollo.
 
-En GitHub, cada envío pasa `tests/run.php` y `tests/fuzz.php` en Linux y Windows con PHP 8.1, 8.2, 8.3, 8.4 y 8.5 (cualquier aviso, notice o deprecación hace fallar), y todas las `tests/*_unit.mjs` y `tests/fuzz.mjs` con la LTS actual y la anterior de Node.js.
+En GitHub, cada envío (salvo uno solo de documentación) pasa `tests/run.php` y `tests/fuzz.php` en Linux y Windows con PHP 8.1, 8.2, 8.3, 8.4 y 8.5 (cualquier aviso, notice o deprecación hace fallar), y todas las `tests/*_unit.mjs` y `tests/fuzz.mjs` con la LTS actual y la anterior de Node.js.
 
 ## Documentación
 

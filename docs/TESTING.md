@@ -4,7 +4,7 @@
 
 ## Test suites
 
-On GitHub, `.github/workflows/tests.yml` runs on every push and pull request, on Linux and Windows (no RDP server needed):
+On GitHub, `.github/workflows/tests.yml` runs on every push and pull request (not on one that changes only documentation: Markdown files, screenshots, `LICENSE`, `NOTICE`), on Linux and Windows (no RDP server needed):
 
 - `tests/run.php` and `tests/fuzz.php --strict` with PHP 8.1, 8.2, 8.3, 8.4 and 8.5; any PHP warning, notice or deprecation fails the run. One exception, said in the output: with PHP 8.1 there, PHP's built-in web server (a development server, used only by the tests) stops on the request that runs out of memory before any page is sent, so that page is not checkable there; it is checked with 8.2 to 8.5 there and with 8.1 on the Windows test computer.
 - Every `tests/*_unit.mjs` and `tests/fuzz.mjs --strict` with the current and the previous Node.js LTS (Node.js 22 or later: the tests use the browser's global `navigator`, which Node has since version 21).

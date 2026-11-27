@@ -3,9 +3,13 @@
 # any PHP warning, notice or deprecation fails the run; the browser code with the current and the previous Node LTS.
 name: tests
 
+# (not for a change of documentation alone: the Markdown files, the screenshots, LICENSE and NOTICE; no test reads them. The
+# web.config and .htaccess of docs/ do protect it, so a change to them runs the tests)
 on:
   push:
+    paths-ignore: ['**.md', 'docs/images/**', 'LICENSE', 'NOTICE']
   pull_request:
+    paths-ignore: ['**.md', 'docs/images/**', 'LICENSE', 'NOTICE']
 
 permissions:
   contents: read

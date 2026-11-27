@@ -4,7 +4,7 @@
 
 ## Baterías de pruebas
 
-En GitHub, `.github/workflows/tests.yml` se ejecuta en cada envío y pull request, en Linux y Windows (no necesita servidor RDP):
+En GitHub, `.github/workflows/tests.yml` se ejecuta en cada envío y pull request (no en uno que solo cambia documentación: ficheros Markdown, capturas, `LICENSE`, `NOTICE`), en Linux y Windows (no necesita servidor RDP):
 
 - `tests/run.php` y `tests/fuzz.php --strict` con PHP 8.1, 8.2, 8.3, 8.4 y 8.5; cualquier aviso, notice o deprecación de PHP hace fallar. Una excepción, avisada en la salida: con PHP 8.1 allí, el servidor web integrado de PHP (de desarrollo, solo lo usan las pruebas) se detiene con la petición que agota la memoria antes de enviar ninguna página, así que esa página no se puede comprobar allí; se comprueba con 8.2 a 8.5 allí y con 8.1 en el equipo de pruebas con Windows.
 - Todas las `tests/*_unit.mjs` y `tests/fuzz.mjs --strict` con la LTS actual y la anterior de Node.js (Node.js 22 o posterior: las pruebas usan el `navigator` global del navegador, que Node tiene desde la versión 21).

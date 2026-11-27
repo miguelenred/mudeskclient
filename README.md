@@ -189,7 +189,7 @@ The speed review of 1.1 made the gateway's decompression 1.2 to 2.5 times faster
 - `tests/gfx_render.mjs`, `tests/audio_check.mjs` — decode dumps written by `rdp_probe.php` (`DUMP=file`, `AUDIO=1`).
 - `tests/e2e.mjs`, `tests/e2e_clip.mjs`, `tests/e2e_gfx.mjs` (H.264: compares the canvas with a capture of the remote), `tests/e2e_passkey.mjs`, `tests/e2e_lang.mjs`, `tests/e2e_glyphs.mjs` — Chrome tests (Node.js + Playwright); `tests/e2e_firefox.py` — Firefox tests (Selenium). Development only.
 
-On GitHub every push runs `tests/run.php` and `tests/fuzz.php` on Linux and Windows with PHP 8.1, 8.2, 8.3, 8.4 and 8.5 (any warning, notice or deprecation fails the run), and every `tests/*_unit.mjs` and `tests/fuzz.mjs` with the current and the previous Node.js LTS.
+On GitHub every push (but one of documentation alone) runs `tests/run.php` and `tests/fuzz.php` on Linux and Windows with PHP 8.1, 8.2, 8.3, 8.4 and 8.5 (any warning, notice or deprecation fails the run), and every `tests/*_unit.mjs` and `tests/fuzz.mjs` with the current and the previous Node.js LTS.
 
 ## Documentation
 
